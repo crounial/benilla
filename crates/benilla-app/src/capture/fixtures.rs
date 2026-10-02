@@ -915,7 +915,7 @@ pub(super) fn seed_ui_fixture(
         }
         UiFixture::VPlates => {
             use benilla_protocol::messages::ObjectFields;
-            // The self player at the camera eye (the 20 yd plate gate measures from here): a
+            // The self player at the camera eye (the plate-range gate measures from here): a
             // level-2 human, so the wolf cons yellow as in the reference screenshot.
             const PLAYER_GUID: u64 = 0x51;
             names.insert_player(PLAYER_GUID, "Benilla".into(), None);

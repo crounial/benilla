@@ -450,7 +450,8 @@ pub(crate) fn drive_nameplates(
             continue;
         }
         // No distance cull: the name's update, cull and build (`0x6c6d40`, `0x6c6e00`,
-        // `0x6c6e90`) compare none; the 20-yard cap (`0x60f600`) is the V-key frame's.
+        // `0x6c6e90`) compare none. The reference's 20-yard cap (`0x60f600`) belongs to the
+        // V-key frame; this fork draws those plates out to 41 yd.
         // ShouldShowName's order: own unit by its CVar, the target (`[0xb4e2d8]`), the kind CVar.
         // A V-key plate or chat bubble (`+0xe64`) suppresses the name (`0x6070a0`). A dead
         // creature shows only as the target, as in the reference; that gate leg is untraced.
