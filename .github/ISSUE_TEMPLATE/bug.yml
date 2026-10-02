@@ -1,5 +1,5 @@
 name: Bug report
-description: Something benilla gets wrong, or does differently from 1.12.1.
+description: Something this fork gets wrong, against stock 1.12.1 or against a modification of this fork.
 body:
   - type: textarea
     id: what
@@ -11,7 +11,8 @@ body:
   - type: textarea
     id: expected
     attributes:
-      label: What 1.12.1 does instead
+      label: What should have happened
+      description: Stock 1.12.1 behaviour, or the modification of this fork you expected.
   - type: textarea
     id: steps
     attributes:

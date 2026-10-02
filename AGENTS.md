@@ -1,7 +1,9 @@
 # benilla
 
-A from-scratch World of Warcraft 1.12.1 client in Rust and Bevy. The reference client is the
-spec: benilla is a faithful, modern implementation of it, not a place to get creative.
+A fork of the from-scratch World of Warcraft 1.12.1 client in Rust and Bevy (upstream:
+<https://github.com/samwhosung/benilla>). Upstream benilla is the baseline. This tree is where
+significant client-side modifications are made. A surface keeps stock 1.12.1 behaviour until a
+change here replaces it on purpose.
 
 Read, in this order:
 
