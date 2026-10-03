@@ -61,6 +61,10 @@ const KNOWN_COMBOS: [(u8, &[u8]); 8] = [
 /// literal `race == 3 && class == 8` (Dwarf-Mage), though the row and its outfit are populated.
 const UNUSED_COMBOS: [(u8, u8); 1] = [(3, 8)];
 
+/// Pairs 1.12.1 does not offer that this fork does. `CharBaseInfo` has no Gnome Paladin (race 7,
+/// class 2); paladin is human and dwarf only, and the create screen lists the pair from here.
+const FORK_COMBOS: [(u8, u8); 1] = [(7, 2)];
+
 /// The `CharBaseInfo` misparse guard: every shipped pair is present; a patch's extra pairs pass.
 fn shipped_combos_present(combos: &HashSet<(u8, u8)>) -> Result<()> {
     for (race, classes) in KNOWN_COMBOS {
@@ -118,7 +122,8 @@ impl CharCreateCatalog {
             .map(|&(m, f)| if sex == 0 { m } else { f })
     }
 
-    /// Whether a race may be created as a class (CharBaseInfo less `UNUSED_COMBOS`).
+    /// Whether a race may be created as a class (`CharBaseInfo` less [`UNUSED_COMBOS`], plus
+    /// [`FORK_COMBOS`]).
     pub fn allows(&self, race: u8, class: u8) -> bool {
         self.combos.contains(&(race, class))
     }
@@ -142,7 +147,7 @@ impl CharCreateCatalog {
     }
 
     /// The classes a race may be created as, ascending by id: the client lists them in CharBaseInfo
-    /// row order (`0x4706b0`), which is ascending class id in the shipped file.
+    /// row order (`0x4706b0`), which is ascending class id in the shipped file, plus [`FORK_COMBOS`].
     pub fn classes_for_race(&self, race: u8) -> Vec<u8> {
         let mut cs: Vec<u8> = self
             .combos
@@ -167,7 +172,7 @@ impl CharCreateCatalog {
     }
 
     /// Load the catalog from the patch chain. The misparse guards compare the raw combos, so they
-    /// run before `UNUSED_COMBOS` are stripped.
+    /// run before `UNUSED_COMBOS` are stripped and before [`FORK_COMBOS`] are added.
     pub fn load(chain: &mut Chain) -> Result<Self> {
         let (displays, files, custom_tokens) = load_races(chain)?;
         let combos = load_combos(chain)?;
@@ -198,7 +203,48 @@ impl CharCreateCatalog {
         for combo in UNUSED_COMBOS {
             catalog.combos.remove(&combo);
         }
+        catalog.apply_fork();
         Ok(catalog)
+    }
+
+    /// Record this fork's race/class pairs and, where 1.12.1 has no outfit row, a preview outfit.
+    fn apply_fork(&mut self) {
+        for (race, class) in FORK_COMBOS {
+            self.combos.insert((race, class));
+        }
+        // 1.12.1 has no Gnome Paladin `CharStartOutfit` row. Shirt, pants and boots are the gnome
+        // warrior's (authored for that body); the hammer is the dwarf paladin's. A DBC row is kept.
+        for sex in [0u8, 1] {
+            if self.start_outfits.contains_key(&(7, 2, sex)) {
+                continue;
+            }
+            let body: Vec<StartOutfitItem> = self
+                .start_outfits
+                .get(&(7, 1, sex))
+                .map(|items| {
+                    items
+                        .iter()
+                        .copied()
+                        .filter(|it| matches!(it.inv_type, 4 | 7 | 8))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let hammer: Vec<StartOutfitItem> = self
+                .start_outfits
+                .get(&(3, 2, sex))
+                .map(|items| {
+                    items
+                        .iter()
+                        .copied()
+                        .filter(|it| it.inv_type == 17)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let items: Vec<StartOutfitItem> = body.into_iter().chain(hammer).collect();
+            if !items.is_empty() {
+                self.start_outfits.insert((7, 2, sex), items);
+            }
+        }
     }
 
     fn self_check(&self) -> Result<()> {
@@ -568,19 +614,31 @@ mod tests {
             }
         }
 
-        // The playable sets are the raw table less the dead pairs.
+        // The playable sets are the raw table less the dead pairs, plus this fork's Gnome Paladin.
         for (race, classes) in KNOWN_COMBOS {
-            let playable: Vec<u8> = classes
+            let mut playable: Vec<u8> = classes
                 .iter()
                 .copied()
                 .filter(|&c| !UNUSED_COMBOS.contains(&(race, c)))
                 .collect();
+            for (r, c) in FORK_COMBOS {
+                if r == race && !playable.contains(&c) {
+                    playable.push(c);
+                }
+            }
+            playable.sort_unstable();
             assert_eq!(
                 cat.classes_for_race(race),
                 playable,
                 "combos for race {race}"
             );
         }
+        assert_eq!(
+            cat.classes_for_race(7),
+            vec![1, 2, 4, 8, 9],
+            "Gnome offers Warrior/Paladin/Rogue/Mage/Warlock — 1.12.1 has no paladin; this fork \
+             adds it"
+        );
         assert_eq!(
             cat.classes_for_race(3),
             vec![1, 2, 3, 4, 5],
@@ -638,6 +696,39 @@ mod tests {
                 .any(|it| it.inv_type == 20 && it.display_id == 12647),
             "Human Mage male should wear a robe (inv 20, disp 12647): {mage:?}"
         );
+
+        // Gnome Paladin is not in the shipped file. The preview wears the gnome body kit and the
+        // paladin hammer, and nothing from the warrior's sword and shield.
+        for sex in [0u8, 1] {
+            let out = cat.start_outfit(7, 2, sex);
+            let mut invs: Vec<u8> = out.iter().map(|it| it.inv_type).collect();
+            invs.sort_unstable();
+            assert_eq!(
+                invs,
+                vec![4, 7, 8, 17],
+                "gnome paladin sex {sex} outfit slots: {out:?}"
+            );
+            assert!(
+                out.iter()
+                    .any(|it| it.inv_type == 4 && it.display_id == 9891),
+                "gnome paladin shirt: {out:?}"
+            );
+            assert!(
+                out.iter()
+                    .any(|it| it.inv_type == 7 && it.display_id == 9892),
+                "gnome paladin pants: {out:?}"
+            );
+            assert!(
+                out.iter()
+                    .any(|it| it.inv_type == 8 && it.display_id == 10141),
+                "gnome paladin boots: {out:?}"
+            );
+            assert!(
+                out.iter()
+                    .any(|it| it.inv_type == 17 && it.display_id == 8690),
+                "gnome paladin hammer: {out:?}"
+            );
+        }
 
         // Every tuple in the dial ranges passes ValidateAppearance.
         let avail = load_available_sections(&mut chain).expect("sections");
