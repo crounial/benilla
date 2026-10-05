@@ -1,22 +1,40 @@
-# Runs the release benilla client with a login identity from the caller.
-# Usage: .\run-benilla.ps1 -User <account> -Pass <password> -Char <character> [extra benilla args...]
+# Runs the release benilla client.
+# Every parameter is optional. -Password is required when -User is passed.
+# Usage: .\run-benilla.ps1 [-User <account> -Password <password>] [-Char <character>] [-DataFolder <path>] [extra benilla args...]
 param(
-    [Parameter(Mandatory = $true)]
     [string]$User,
 
-    [Parameter(Mandatory = $true)]
-    [string]$Pass,
+    [Alias('Pass')]
+    [string]$Password,
 
-    [Parameter(Mandatory = $true)]
     [string]$Char,
+
+    [string]$DataFolder,
 
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$BenillaArgs
 )
 
-$env:WOW_USER = $User
-$env:WOW_PASS = $Pass
-$env:WOW_CHAR = $Char
+if ($PSBoundParameters.ContainsKey('User') -and -not $PSBoundParameters.ContainsKey('Password')) {
+    Write-Error "-Password is required when -User is passed."
+    exit 1
+}
+
+if ($PSBoundParameters.ContainsKey('User')) {
+    $env:WOW_USER = $User
+}
+
+if ($PSBoundParameters.ContainsKey('Password')) {
+    $env:WOW_PASS = $Password
+}
+
+if ($PSBoundParameters.ContainsKey('Char')) {
+    $env:WOW_CHAR = $Char
+}
+
+if ($PSBoundParameters.ContainsKey('DataFolder')) {
+    $env:WOW_DATA = $DataFolder
+}
 
 $exe = Join-Path $PSScriptRoot 'target\release\benilla.exe'
 if (-not (Test-Path $exe)) {

@@ -14,7 +14,7 @@ interface and with your addons. It connects to a 1.12.1 server over the original
 reads the game's data from your own 1.12.1 install. Every file format, the network protocol and
 the interface engine are written from scratch, with no original client code, no third-party WoW
 crates and no bundled game assets. This fork keeps that client as the baseline for significant
-client-side modifications.
+client-side modifications. [`docs/FORK.md`](docs/FORK.md) lists the departures from upstream.
 
 ## What's inside
 

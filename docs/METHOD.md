@@ -81,6 +81,8 @@ crate or a fork. This repository is that fork, so the modification belongs in th
 - `docs/METHOD.md`, this file: rules and method. Never state, never a log.
 - `docs/MAP.md`: what is built, generated from the code by `scripts/genmap.sh` at every land.
   Read it to orient; never edit or commit it by hand.
+- `docs/FORK.md`: the current departures from upstream benilla. A modification updates its
+  row in the same change. It is the list, not a narrative of the work.
 - git: the history. No changelogs, no status docs, no "what we did" narratives.
 - The code: a comment says what the code does and the 1.12 fact behind it, in a line. When
   this fork departs from that fact, the same comment names the departure. No history, no

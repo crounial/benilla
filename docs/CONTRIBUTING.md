@@ -8,8 +8,10 @@ one small piece, with the gates green.
 
 ## Where to start
 
-Read `docs/METHOD.md`, then `docs/MAP.md`. The baseline is this tree and the 1.12.1 facts under
-`reference/`. A modification begins by naming the stock behaviour it changes. Upstream's
+Read `docs/METHOD.md`, then `docs/MAP.md`, then `docs/FORK.md`. The baseline is this tree and
+the 1.12.1 facts under `reference/`. `docs/FORK.md` is what this tree already changes from
+upstream. A modification begins by naming the stock behaviour it changes, and updates its row
+there in the same change. Upstream's
 [issues](https://github.com/samwhosung/benilla/issues) describe gaps between upstream benilla and
 1.12.1. They map the baseline. This fork's modifications are decided here.
 
@@ -62,7 +64,8 @@ reads. That path has no stable API: a crate pins the revision it builds on.
    tracks.
 3. A modification also states what this fork does instead. The departure is recorded where it
    lives: a CVar's `Deviates` or `Ours` row, or a comment naming the reference fact and the
-   fork's choice. `the_layer_does_not_grow` names the interface layer's files; a new layer file
+   fork's choice, and a row in `docs/FORK.md`. `the_layer_does_not_grow` names the interface
+   layer's files; a new layer file
    updates that list in the same change. A new `Deviates` row updates
    `the_options_that_leave_the_reference_are_this_list_and_no_other` in the same change.
 4. A comment where it matters, one line, saying what the code does, the 1.12 fact behind it,

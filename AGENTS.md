@@ -10,7 +10,9 @@ Read, in this order:
 1. `docs/METHOD.md` — the rules and how we work. Binding for every session.
 2. `docs/MAP.md` — what is built right now, generated from the code. Orient here before
    touching anything.
-3. `docs/CONTRIBUTING.md` — what gets in and how a change is judged.
+3. `docs/FORK.md` — what this tree changes from upstream benilla. Update its row in the
+   same change as a modification.
+4. `docs/CONTRIBUTING.md` — what gets in and how a change is judged.
 
 The rest of the root is code and data: `crates/` the workspace, `reference/` the 1.12 name
 catalogues the tests check against, `scripts/` the gates and instruments, `third_party/`
