@@ -48,7 +48,12 @@ tree.
 `run_with` remains the path when a piece should stay a plugin outside the client. A client
 started through `run_with` says `extended` in its build line, so its reports read apart from
 this fork's. The crate keeps its own settings, never rows in the CVar table, which every addon
-reads. That path has no stable API: a crate pins the revision it builds on.
+reads, and its files go under `benilla_app::config_dir()`, its own `benilla-config/`: an addon
+it ships is written into that folder's `AddOns/` and loads as any addon does.
+
+Past `run_with` and that folder, the client opens a piece of itself to such a crate only when
+its own 1.12.1 work creates that piece, never for the crate alone, and promises no stable API:
+a crate pins the revision it builds on. What a crate cannot reach is written in this tree.
 
 ## How a change is judged
 

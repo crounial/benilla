@@ -5,8 +5,8 @@ does that upstream does not. It is the current set, read by people and by agents
 before they change behaviour. Git holds the history. A modification adds, edits, or
 removes its row in the same change.
 
-The pin is `upstream/main` at `ffdc206a` (World-enter queries wait for the player's
-create, as 1.12.1 sends them). When this tree takes new upstream commits, update the
+The pin is `upstream/main` at `2e82d34c` (The meeting-stone query runs at every world
+entry, as 1.12.1 sends it). When this tree takes new upstream commits, update the
 pin. Leave out any commit that is already on `upstream/main`.
 
 A row states what 1.12.1 does, what upstream does when that differs, what this fork
