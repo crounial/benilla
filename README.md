@@ -1,6 +1,6 @@
 <div align="center">
   <h1>benilla</h1>
-  <p><b>A complete World of Warcraft 1.12.1 client, written from scratch in Rust and <a href="https://bevy.org">Bevy</a></b></p>
+  <p><b>A fork of benilla, the World of Warcraft 1.12.1 client written from scratch in Rust and <a href="https://bevy.org">Bevy</a></b></p>
   <p>
     <a href="https://discord.gg/wJSJx467G4"><img src="https://img.shields.io/discord/1529280129518538922?style=for-the-badge&logo=discord&logoColor=white&label=discord&color=5865F2" alt="Discord"></a>
     <a href="https://www.youtube.com/playlist?list=PLdCnpZNKxyb8"><img src="https://img.shields.io/badge/devlog-youtube-FF0000?style=for-the-badge&logo=youtube&logoColor=white" alt="YouTube devlog"></a>
@@ -13,7 +13,8 @@ battlegrounds and honor, groups, guilds, trade, mail and the auction house, on t
 interface and with your addons. It connects to a 1.12.1 server over the original protocol and
 reads the game's data from your own 1.12.1 install. Every file format, the network protocol and
 the interface engine are written from scratch, with no original client code, no third-party WoW
-crates and no bundled game assets.
+crates and no bundled game assets. This fork keeps that client as the baseline for significant
+client-side modifications. [`docs/FORK.md`](docs/FORK.md) lists the departures from upstream.
 
 ## What's inside
 
@@ -43,18 +44,16 @@ generated from the code.
 
 ## Status
 
-Complete and fully playable. What is left:
+This tree is a fork of [benilla](https://github.com/samwhosung/benilla). Upstream is a complete,
+playable 1.12.1 client. This fork keeps that client as the baseline and is where significant
+client-side modifications are made. A surface keeps stock 1.12.1 behaviour until a change here
+replaces it on purpose.
 
-- The long tail of small features that separates a working client from a finished one, tracked
-  as [issues](https://github.com/samwhosung/benilla/issues).
-- Addons, options and performance, ongoing.
+The client still reads your own 1.12.1 install and speaks the 1.12.1 protocol. There are no
+prebuilt downloads. Other expansions, other client versions, and Warden stay out of scope.
 
-benilla is a faithful 1.12.1 client and the foundation people build on. There are no prebuilt
-downloads: a packaged build, a particular server's changes or anything 1.12.1 never had belongs
-in a fork, and forks are welcome. GitHub lists
-[every public fork](https://github.com/samwhosung/benilla/forks).
-
-Not planned: other expansions or client versions, Warden (anticheat).
+Upstream's remaining fidelity work is tracked as
+[issues](https://github.com/samwhosung/benilla/issues).
 
 ## Running it
 
@@ -78,8 +77,8 @@ On Windows, in PowerShell:
 $env:WOW_DATA="C:\path\to\WoW\Data"; cargo run --release -p benilla
 ```
 
-Each release is a tag on the [Releases page](https://github.com/samwhosung/benilla/releases):
-`git checkout <tag>` first runs that release, and `main` is the development tip.
+Upstream releases are tags on the [Releases page](https://github.com/samwhosung/benilla/releases).
+`git checkout <tag>` runs that upstream release. `main` is this fork's development tip.
 
 `WOW_DATA` names the install's `Data` folder; a link to the install named `WoW` at the repo root
 does the same (`ln -s /path/to/WoW WoW`, or on Windows a junction, which needs no admin rights:
@@ -95,9 +94,11 @@ player build to the tests.
 
 ## Contributing
 
-Issues and pull requests are open. [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) says where to
-start, what gets in, how a change is judged and what happens to a pull request once it is open.
-Bugs, questions and ideas are welcome on the [Discord](https://discord.gg/wJSJx467G4) too.
+Issues and pull requests are open. [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) says what gets
+in and how a change is judged. A client-side modification names the stock 1.12.1 behaviour, what
+this fork does instead, and where the departure is recorded.
+
+The [Discord](https://discord.gg/wJSJx467G4) is the upstream project's.
 
 ---
 

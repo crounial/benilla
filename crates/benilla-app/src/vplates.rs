@@ -5,7 +5,9 @@
 //! - Toggles: the `[0xc4da34]` bitmask, bit 0 enemy and bit 3 friendly, both off at boot.
 //! - Gate: never the own unit or a `NOT_SELECTABLE` one; enemy or friendly by `CanAttack` from the
 //!   player (`0x606980`), and a player subject must also pass `CanCooperate` (equal faction-group
-//!   masks); 20 yd; no occlusion; a unit not projected into view loses its plate (`0x60f600`).
+//!   masks); 41 yd; no occlusion; a unit not projected into view loses its plate (`0x60f600`).
+//!   Deviation: the reference hardcodes 20 yd there; this fork draws plates out to the modern
+//!   41 yd nameplate distance.
 //! - Anchor: the overhead head point (`0x608640`) plus 2/3 yd (`[0x80abfc]`), projected every
 //!   frame (`0x483ee0`), the plate's top centre on it (`0x509ec0`), sized in gx units of the
 //!   screen diagonal (`0x41ad10`), outside uiScale. Deviation: the basis is damped past
@@ -102,8 +104,16 @@ const SKULL_SIZE: f32 = 0.01;
 const RAID_ICON_SIZE: f32 = 0.02;
 /// `[0x80abfc]`.
 const PLATE_LIFT: f32 = 2.0 / 3.0;
-/// 20 yd, hardcoded in the reference.
-const MAX_DIST_SQ: f32 = 20.0 * 20.0;
+/// Deviation: 1.12 hardcodes 20 yd (`0x60f600`). This fork draws plates out to 41 yd, the
+/// modern nameplate distance. The cap is inclusive, as the reference's `>` test is.
+const MAX_DIST_YD: f32 = 41.0;
+const MAX_DIST_SQ: f32 = MAX_DIST_YD * MAX_DIST_YD;
+
+/// Whether `unit` is near enough to `from` for a plate. Distance is in yards.
+fn in_plate_range(from: Vec3, unit: Vec3) -> bool {
+    (unit - from).length_squared() <= MAX_DIST_SQ
+}
+
 /// Deviation: the reference dims non-target plates to `0x7F`; raised because that fades them too
 /// far to read.
 const DIM_ALPHA: f32 = 178.0 / 255.0;
@@ -406,7 +416,7 @@ fn drive_vplates(
         if store.is_some_and(|s| s.0.unit_is_ghost_visual()) {
             continue;
         }
-        if (tf.translation - self_tf.translation).length_squared() > MAX_DIST_SQ {
+        if !in_plate_range(self_tf.translation, tf.translation) {
             continue;
         }
         // A CREATEDBY owner, no SUMMONEDBY owner and flags bit 9 (`0x200`): no plate in either
@@ -659,6 +669,18 @@ impl Plugin for VPlatesPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 1.12 stops at 20 yd. This fork keeps a plate at 41 yd and drops it on the next yard.
+    #[test]
+    fn plates_reach_41_yd() {
+        let here = Vec3::ZERO;
+        assert!(in_plate_range(here, Vec3::new(20.0, 0.0, 0.0)));
+        assert!(in_plate_range(here, Vec3::new(MAX_DIST_YD, 0.0, 0.0)));
+        assert!(!in_plate_range(
+            here,
+            Vec3::new(MAX_DIST_YD + 1.0, 0.0, 0.0)
+        ));
+    }
 
     /// `0x7cbd50` at level 30 (grayband[6] = 7: green down to 23, gray at 22) and the low edge.
     #[test]

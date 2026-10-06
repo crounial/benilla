@@ -63,7 +63,8 @@ const TAIL_TEXTURE: &str = "Interface\\Tooltips\\ChatBubble-Tail";
 
 /// The 0.7 yd lift over the anchor height (`[0x7ffd7c]`).
 const LIFT: f32 = 0.7;
-/// The spawn and per-frame range gate, 20 yd squared (`[0x806798]`, the plates' too).
+/// The spawn and per-frame range gate, 20 yd squared (`[0x806798]`). The reference's plates
+/// share that cap; this fork's plates are 41 yd.
 const MAX_DIST_SQ: f32 = 400.0;
 /// The 250 ms linear fade, in and out (`0x4b0ea0`/`0x4b0ee0`).
 const FADE_SECS: f32 = 0.25;

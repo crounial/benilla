@@ -1,24 +1,35 @@
-# METHOD — how benilla is built
+# METHOD — how this fork of benilla is built
 
-benilla is a from-scratch World of Warcraft 1.12.1 client in Rust and Bevy. It reads the game's
-data from the player's own install, speaks the original protocol to any 1.12.1 server, and does
-not build a server or simulate the game. The reference client is the spec: benilla does what
-1.12.1 does, as a modern, idiomatic client.
+This tree is a fork of benilla, the from-scratch World of Warcraft 1.12.1 client in Rust and
+Bevy (upstream: <https://github.com/samwhosung/benilla>). It reads the game's data from the
+player's own install and speaks the original protocol to any 1.12.1 server. Upstream benilla
+is the baseline. The reference client is how stock behaviour is known.
+
+This fork is the baseline for significant client-side modifications. A surface keeps stock
+1.12.1 behaviour until a change in this tree replaces it on purpose. The modification stays on
+the client: the protocol stays the 1.12.1 protocol, and the game's data stays the player's
+install.
 
 ## The rule for every change
 
-A change is right when it makes benilla more like 1.12.1 or fixes a bug, with evidence from the
-reference, in one small piece, with the gates green. A deviation from the reference is the
-maintainer's call alone, and each one is written down where it lives: a CVar's `Deviates` row, a
-comment naming the reference fact and why we differ. Anything else lives on top of benilla, in a
-crate of its own or a fork, and benilla opens a piece of itself to such a crate only when its own
-1.12.1 work creates that piece (`docs/CONTRIBUTING.md`, "Building on top").
+A change is right when it does one of these, in one small piece, with the gates green:
+
+- It makes an unmodified surface more like 1.12.1, or fixes a bug there, with evidence from the
+  reference.
+- It is a client-side modification. It names what 1.12.1 does, what this fork does instead, and
+  why, and it records that departure where it lives: a CVar's `Deviates` or `Ours` row, or a
+  comment naming the reference fact and the fork's choice.
+
+Upstream records a departure as the maintainer's call and sends a new client feature to another
+crate or a fork. This repository is that fork, so the modification belongs in this tree
+(`docs/CONTRIBUTING.md`, "Modifications live in this tree").
 
 ## The loop
 
-1. **The reference first.** For anything fidelity-defining, get the mechanism from the real
-   client before building: its behaviour, a DBC field, a FrameXML line, a packet capture. The
-   names and shapes under `reference/` are the surface benilla tracks.
+1. **The baseline first.** For anything that touches behaviour the stock client has, get the
+   mechanism before changing it: its behaviour, a DBC field, a FrameXML line, a packet capture.
+   The names and shapes under `reference/` are the 1.12.1 surface this fork tracks. A
+   modification starts from that fact and then records the departure.
 2. **Build it idiomatically.** Modern Bevy and Rust, performance woven in from the start.
    Implement the mechanism well; do not ape a quirk that is a bug.
 3. **Measure, never eyeball.** Timing, delay, ordering and feel are settled with instruments:
@@ -46,17 +57,22 @@ crate of its own or a fork, and benilla opens a piece of itself to such a crate 
 - **Local state lives in one folder**, `benilla-config/`, at the repo root in a dev build and
   beside the binary in the player build; every path to it resolves through `crate::local_state`.
   Player settings are CVars persisted as a diff in `benilla-config/config.toml`.
-- **The core UI is the stock UI; benilla's own is one layer on top.** The core loads the stock
-  1.12 FrameXML off the player's own chain, byte for byte, and builds the engine verbs those
-  files call, never stubbing one to make a file load. benilla's own interface (its options
-  window, its game-menu look, its fixes to the stock Lua) is one layer that loads after the
-  stock files and before third-party addons, the way an addon does: written against the 1.12 API
-  alone, listed in no addon list and always on, and offering nothing another addon can build on.
-  Anything that changes what the stock UI does or shows lives in the layer, and the layer does
-  not grow: a test names its files and fails on a new one.
-- **A setting's default is the reference's default.** Every option boots at the stock 1.12
-  value. Shipping another value costs an explicit `Deviates` row with the reason, and a test
-  fails a row that drifts either way.
+- **The stock UI is the baseline; this fork's interface loads on top of it.** The core loads
+  the stock 1.12 FrameXML off the player's own chain, byte for byte, and builds the engine
+  verbs those files call, never stubbing one to make a file load. This fork's own interface
+  (its options window, its game-menu look, its fixes to the stock Lua, and further client-side
+  interface) is a layer that loads after the stock files and before third-party addons, the way
+  an addon does. It is written against the 1.12 API unless a modification deliberately extends
+  that API, listed in no addon list, and always on. Anything that changes what the stock UI
+  does or shows lives in the layer. The layer may gain a file when a modification needs one.
+  `the_layer_does_not_grow` names those files; update that list in the same change. A new Lua
+  surface other addons can call is a modification and is recorded as one.
+- **An unmodified setting's default is the reference's default.** Every option boots at the
+  stock 1.12 value unless its row says otherwise. A modification that ships another value uses
+  an explicit `Deviates` row with the reason. A CVar the reference lacks uses an `Ours` row
+  with the reason. `defaults_stand_where_the_reference_column_says` fails a row that drifts
+  from its claim. `the_options_that_leave_the_reference_are_this_list_and_no_other` names the
+  `Deviates` rows; a new one updates that list in the same change.
 - **Our code is MIT OR Apache-2.0**, which is a claim about provenance: no original client
   code, no bundled assets.
 
@@ -65,9 +81,12 @@ crate of its own or a fork, and benilla opens a piece of itself to such a crate 
 - `docs/METHOD.md`, this file: rules and method. Never state, never a log.
 - `docs/MAP.md`: what is built, generated from the code by `scripts/genmap.sh` at every land.
   Read it to orient; never edit or commit it by hand.
+- `docs/FORK.md`: the current departures from upstream benilla. A modification updates its
+  row in the same change. It is the list, not a narrative of the work.
 - git: the history. No changelogs, no status docs, no "what we did" narratives.
-- The code: a comment says what the code does and the 1.12 fact behind it, in a line. No
-  history, no stories.
+- The code: a comment says what the code does and the 1.12 fact behind it, in a line. When
+  this fork departs from that fact, the same comment names the departure. No history, no
+  stories.
 
 ## Gates
 

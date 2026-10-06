@@ -1,75 +1,88 @@
 # Contributing
 
-benilla is a faithful 1.12.1 client. It is the foundation people build on, not the place to get
-creative: a change is accepted when it makes benilla more like 1.12.1 or fixes a bug, with
-evidence from the reference, in one small piece, with the gates green. Everything else lives on
-top of benilla, in a crate of its own or a fork, and both are welcome.
+This tree is a fork of [benilla](https://github.com/samwhosung/benilla). Upstream is a faithful
+1.12.1 client and the baseline. This fork is where significant client-side modifications are
+made. A change is accepted when it modifies the client on purpose, or when it makes an
+unmodified surface more like 1.12.1 or fixes a bug there, with the evidence the change needs, in
+one small piece, with the gates green.
 
 ## Where to start
 
-The [issues](https://github.com/samwhosung/benilla/issues) the maintainers file are checked
-against 1.12.1 first: each says what 1.12.1 does, what benilla does instead, and where in the
-code, and any of them is a place to start. One labelled `in progress` is taken: someone is
-working on it or a pull request is open for it, so pick another. Once you start one, open a draft
-pull request that says `Fixes #N` as soon as you have a first commit, so the issue shows it is
-taken.
+Read `docs/METHOD.md`, then `docs/MAP.md`, then `docs/FORK.md`. The baseline is this tree and
+the 1.12.1 facts under `reference/`. `docs/FORK.md` is what this tree already changes from
+upstream. A modification begins by naming the stock behaviour it changes, and updates its row
+there in the same change. Upstream's
+[issues](https://github.com/samwhosung/benilla/issues) describe gaps between upstream benilla and
+1.12.1. They map the baseline. This fork's modifications are decided here.
 
 ## What gets in
 
-- A fix for a bug, with how to see it before and after.
-- A step closer to 1.12.1: a missing packet, verb, window, effect or behaviour, done the way
-  the real client does it.
-- A correction where benilla and the reference disagree, with the reference fact stated.
-- Whatever the stock 1.12.1 client loads from a patch, benilla loads: models, textures or data
-  rows that 1.12.1 shows and benilla does not are a bug.
+- A client-side modification: input, interface, presentation, or other client behaviour. Name
+  what 1.12.1 does, what this fork does instead, and why. Record the departure where it lives.
+- A fix for a bug, with how to see it before and after. Say whether the expected behaviour is
+  stock 1.12.1 or a modification of this fork.
+- A step that keeps an unmodified surface aligned with 1.12.1: a missing packet, verb, window,
+  effect or behaviour, done the way the real client does it.
+- A correction where an unmodified surface and the reference disagree, with the reference fact
+  stated.
+- Whatever the stock 1.12.1 client loads from a patch, an unmodified surface still loads:
+  models, textures or data rows that 1.12.1 shows and this fork does not are a bug, unless a
+  modification has said it drops them.
 
 ## What does not
 
-- Features 1.12.1 does not have, including what 1.12 client mods add (a new key binding, a spell
-  queue, new Lua functions, graphics past 1.12's), and behaviour changed because it seems better.
-  They live on top of benilla ("Building on top"), so that what benilla does is what 1.12.1 does,
-  for everyone who builds on it. A deviation from the reference is the maintainer's call and is
-  recorded where it lives; a pull request is not the place to propose one.
-- Anything from a WoW install: art, models, sounds, maps, data, and interface code (FrameXML and
-  GlueXML), which runs off the player's own install (`docs/METHOD.md`).
-- Big or mixed changes. One change per pull request, small enough to read in one sitting.
+- A server, or a client that stops speaking the 1.12.1 protocol. Modifications stay on the
+  client. The game's data stays the player's own install.
+- Anything from a WoW install: art, models, sounds, maps, data, and the stock interface code
+  (FrameXML and GlueXML), which runs off the player's own install (`docs/METHOD.md`).
+- An unrelated pile of changes. One concern at a time, small enough to read in one sitting. A
+  large modification lands as a series of those.
 
-## Building on top
+## Modifications live in this tree
 
-A feature 1.12.1 does not have lives in a crate of its own that adds its Bevy plugins through
-`benilla_app::run_with`, as `crates/benilla-app/examples/extended_launcher.rs` shows, or in a
-fork. A client started through `run_with` says `extended` in its build line, so its reports read
-apart from stock benilla's. The crate keeps its own settings, never rows in benilla's CVar table,
-which every addon reads, and its files go under `benilla_app::config_dir()`, its own
-`benilla-config/`: an addon it ships is written into that folder's `AddOns/` and loads as any
-addon does.
+Upstream sends a feature 1.12.1 does not have to a crate of its own that adds Bevy plugins
+through `benilla_app::run_with`, as `crates/benilla-app/examples/extended_launcher.rs` shows, or
+to a fork. This repository is that fork. The default home for a client-side modification is this
+tree.
 
-Past `run_with` and that folder, benilla opens a piece of itself to such a crate only when its own
-1.12.1 work creates that piece, never for the crate alone, and promises no stable API: a crate
-pins the benilla revision it builds on. What a crate cannot reach stays a fork's.
+`run_with` remains the path when a piece should stay a plugin outside the client. A client
+started through `run_with` says `extended` in its build line, so its reports read apart from
+this fork's. The crate keeps its own settings, never rows in the CVar table, which every addon
+reads, and its files go under `benilla_app::config_dir()`, its own `benilla-config/`: an addon
+it ships is written into that folder's `AddOns/` and loads as any addon does.
+
+Past `run_with` and that folder, the client opens a piece of itself to such a crate only when
+its own 1.12.1 work creates that piece, never for the crate alone, and promises no stable API:
+a crate pins the revision it builds on. What a crate cannot reach is written in this tree.
 
 ## How a change is judged
 
 1. `scripts/gates.sh` is green: fmt, clippy with warnings denied, the workspace tests (once
    with the client data, once without, so a test that reads the install has to declare it), the
    doc-link and render-pass lints, the player build with its own tests, and the engine boot
-   checks. A pull request from a fork runs the ones that need neither the install nor a display
-   in CI, on Linux; the rest run on the maintainer's machine before it lands.
-2. The reference fact is stated: what 1.12.1 does, and where that is known from (the client's
-   behaviour you observed, a DBC field, a FrameXML line, a packet capture). The names and shapes
-   under `reference/` are the surface benilla tracks.
-3. A comment where it matters, one line, saying what the code does and the 1.12 fact behind it.
-   No history.
-4. The commit message says what changed, for a player or a developer, in one line.
+   checks. CI on a pull request whose branch lives in another repository runs the gates that
+   need neither the install nor a display, on Linux. The rest run on the maintainer's machine
+   before it lands. A branch of this repository runs the full chain before it lands.
+2. The baseline fact is stated when the change touches stock behaviour: what 1.12.1 does, and
+   where that is known from (the client's behaviour you observed, a DBC field, a FrameXML line,
+   a packet capture). The names and shapes under `reference/` are the 1.12.1 surface this fork
+   tracks.
+3. A modification also states what this fork does instead. The departure is recorded where it
+   lives: a CVar's `Deviates` or `Ours` row, or a comment naming the reference fact and the
+   fork's choice, and a row in `docs/FORK.md`. `the_layer_does_not_grow` names the interface
+   layer's files; a new layer file
+   updates that list in the same change. A new `Deviates` row updates
+   `the_options_that_leave_the_reference_are_this_list_and_no_other` in the same change.
+4. A comment where it matters, one line, saying what the code does, the 1.12 fact behind it,
+   and the departure when there is one. No history.
+5. The commit message says what changed, for a player or a developer, in one line.
 
-## After you open it
+## Landing it
 
-A maintainer reads it, checks it against the reference, runs it and finishes it here: a rebase
-onto main, a fix, a test or a comment, added as commits on top of yours on your branch, so leave
-"Allow edits by maintainers" ticked. It lands as one squash-merged commit with you as its author.
-When what would land is mostly ours, we land our own version with you as a co-author and close
-yours with a note, and when main already has the fix, we close yours and say where. One that is
-out of scope is closed with the reason.
+Work sits on a branch, in atomic commits. Main moves by a squash-merged pull request, one
+commit per piece of work. The commit says what changed and what was verified. `scripts/gates.sh`
+is green on the tree that lands. One concern per change. A change whose behaviour is out of
+scope under "What does not" stops there.
 
 ## Setting up
 
@@ -118,8 +131,9 @@ out of scope is closed with the reason.
 
 ## Reporting a bug
 
-Open an issue: what you did, what you saw and what 1.12.1 does instead, with the `benilla build`
-line from the start of the terminal output, your platform and the server you ran on. Questions
-and ideas are welcome there or on the Discord linked from the README.
+Open an issue: what you did, what you saw, and what should have happened. Say whether that
+expectation is stock 1.12.1 behaviour or a modification of this fork. Include the `benilla build`
+line from the start of the terminal output, your platform and the server you ran on. The Discord
+linked from the README is the upstream project's.
 
 Working with an AI agent is expected. The agent reads `AGENTS.md`, and the same rules bind it.
