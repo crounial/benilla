@@ -270,6 +270,52 @@ impl UiScript {
         std::mem::take(&mut model.nameplates.clicks)
     }
 
+    /// A left (or other non-right) plate click is waiting. The orbit reads this on mouse-up so a
+    /// widget click is not also queued as a second select.
+    pub fn has_pending_nameplate_left_click(&self) -> bool {
+        let lua = self.lua();
+        let model = lua.app_data_ref::<Model>().expect("model app_data");
+        model
+            .nameplates
+            .clicks
+            .iter()
+            .any(|c| c.button != "RightButton")
+    }
+
+    /// Drop left plate clicks, keeping right ones. A camera drag that began on a plate must not
+    /// select it; the widget may already have recorded the mouse-up.
+    pub fn drop_nameplate_left_clicks(&mut self) {
+        let lua = self.lua();
+        let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+        model
+            .nameplates
+            .clicks
+            .retain(|c| c.button == "RightButton");
+    }
+
+    /// A right plate click is waiting. The turn reads this on mouse-up so a widget click is not
+    /// also emitted as a second world right-click.
+    pub fn has_pending_nameplate_right_click(&self) -> bool {
+        let lua = self.lua();
+        let model = lua.app_data_ref::<Model>().expect("model app_data");
+        model
+            .nameplates
+            .clicks
+            .iter()
+            .any(|c| c.button == "RightButton")
+    }
+
+    /// Drop right plate clicks, keeping the others. A camera turn that began on a plate must not
+    /// act on it; the widget may already have recorded the mouse-up.
+    pub fn drop_nameplate_right_clicks(&mut self) {
+        let lua = self.lua();
+        let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+        model
+            .nameplates
+            .clicks
+            .retain(|c| c.button != "RightButton");
+    }
+
     /// The freelook toggle (`0x60f830`): entering camera freelook disables mouse input on every
     /// plate and leaving re-enables it (called from `0x483e80` and `0x483e70`).
     pub fn set_nameplate_mouse(&mut self, enabled: bool) {

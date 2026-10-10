@@ -42,6 +42,27 @@ the unit. The cap is inclusive: a plate at 41 yards stays, and the next yard dro
 it. `MAX_DIST_YD` in `crates/benilla-app/src/vplates.rs`. Chat bubbles stay on the
 20-yard gate. Overhead names still have no distance cap.
 
+### Drag on a nameplate turns the camera
+
+1.12.1 gives a mouse-down on a nameplate to that plate (`0x7662c0`). A drag that
+starts on a plate never turns the camera. Upstream does the same:
+`PointerOverUi` is set over a plate, and the camera latch refuses the press.
+
+This fork still selects the unit on a left click of a nameplate, and a right click
+still acts on that unit. A drag that starts on a plate turns the camera. The left
+button orbits. The right button turns the body with the camera, as a world
+right-drag does. A plate drag does not emit a world click, so the release cannot
+deselect or act through an empty ray. A release inside the click window keeps the
+plate's click, including a short press whose mouse moved. A drag past that window
+does not. Other UI and the dev overlay still block both presses. The wheel still
+zooms over a plate.
+
+The latch and the look session are `latch_world_mouse` and `run_look_session` in
+`crates/benilla-app/src/player/camera.rs`. The left select lands in
+`select_on_plate_click` (`crates/benilla-app/src/target/click.rs`). The plate keeps
+the mouse until the gesture is a drag (`plates_take_mouse` in
+`crates/benilla-app/src/vplates.rs`).
+
 ## Repository
 
 These change how the tree is described and launched. They leave play unchanged.

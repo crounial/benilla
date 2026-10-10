@@ -672,8 +672,8 @@ fn a_scripted_click_selects_too() {
 }
 
 /// Entering mouselook turns the mouse off on every plate and leaving turns it back on (`0x60f830`,
-/// from `0x483e80` and `0x483e70`), for a turn begun on the world that drags across a plate; a
-/// press on a plate never reaches mouselook (`0x7662c0`).
+/// from `0x483e80` and `0x483e70`), for a turn begun on the world that drags across a plate.
+/// Whether a left press that starts on a plate begins that turn is the app's camera latch.
 #[test]
 fn freelook_hands_the_mouse_back() {
     let mut s = vm();

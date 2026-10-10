@@ -312,12 +312,12 @@ fn drive_vplates(
     mut plates: ResMut<VPlates>,
     mut plate_hover: ResMut<PlateHover>,
     mut plate_clicks: ResMut<PlateClicks>,
-    rig: Res<crate::player::CameraControl>,
+    mut rig: ResMut<crate::player::CameraControl>,
     world: PlateWorld,
     names: Res<NameCache>,
     net_commands: Res<NetCommands>,
     // `None` in a run with no UI VM.
-    script: Option<NonSendMut<benilla_ui::script::UiScript>>,
+    mut script: Option<NonSendMut<benilla_ui::script::UiScript>>,
     ui_scale: Res<crate::ui_script::UiScaleCvar>,
     anchor_q: (
         Query<&BoneAttach>,
@@ -334,6 +334,20 @@ fn drive_vplates(
     plates.0.clear();
     plate_hover.0 = None;
     bucket.clear();
+    // A drag that started on a plate already recorded its mouse-up. Drop that click before
+    // any early return, so it cannot select or act on a later frame.
+    let drop_left = std::mem::take(&mut rig.suppress_plate_click);
+    let drop_right = std::mem::take(&mut rig.suppress_plate_right_click);
+    if drop_left || drop_right {
+        if let Some(script) = script.as_mut() {
+            if drop_left {
+                script.drop_nameplate_left_clicks();
+            }
+            if drop_right {
+                script.drop_nameplate_right_clicks();
+            }
+        }
+    }
     // Every early return retires the plates first, or the widgets stay on screen; the reference
     // hides each live plate and returns it to the pool (`0x608a10`).
     let retire_all = |script: Option<NonSendMut<benilla_ui::script::UiScript>>| {
@@ -363,8 +377,9 @@ fn drive_vplates(
     let gx = |v: f32| gx_px(v, basis);
     let window = world.window.single().ok();
     // Plates stop taking the mouse in freelook (`0x60f830`, called from `0x483e80`/`0x483e70` on
-    // the transitions), written on the edge per VM.
-    let looking = rig.is_looking();
+    // the transitions), written on the edge per VM. A left orbit that began on a plate keeps the
+    // mouse until the gesture is a drag, so a click can still land on the plate.
+    let looking = !plates_take_mouse(rig.is_looking(), rig.plate_orbit, rig.plate_drag);
     if *mouse_told.get(&script) != Some(looking) {
         *mouse_told.get(&script) = Some(looking);
         script.set_nameplate_mouse(!looking);
@@ -637,6 +652,13 @@ fn drive_vplates(
     );
 }
 
+/// Whether nameplates accept the pointer. A world orbit and a nameplate drag take it away
+/// (`0x60f830`). A look that began on a plate and is still a click leaves it, so the mouse-up
+/// can select or act.
+pub(super) fn plates_take_mouse(looking: bool, plate_orbit: bool, plate_drag: bool) -> bool {
+    !(looking && (!plate_orbit || plate_drag))
+}
+
 /// The plate driver's set; the overhead-name driver runs after it.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct VPlateSet;
@@ -669,6 +691,24 @@ impl Plugin for VPlatesPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A click that started on a plate can still land there. A drag, and any other orbit, cannot.
+    #[test]
+    fn a_nameplate_orbit_keeps_the_mouse_until_the_gesture_is_a_drag() {
+        assert!(plates_take_mouse(false, false, false));
+        assert!(
+            !plates_take_mouse(true, false, false),
+            "a world orbit takes the mouse off plates"
+        );
+        assert!(
+            plates_take_mouse(true, true, false),
+            "a click in progress can still land on the plate"
+        );
+        assert!(
+            !plates_take_mouse(true, true, true),
+            "once it is a drag the plate lets go"
+        );
+    }
 
     /// 1.12 stops at 20 yd. This fork keeps a plate at 41 yd and drops it on the next yard.
     #[test]

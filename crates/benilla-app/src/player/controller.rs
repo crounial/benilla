@@ -126,9 +126,10 @@ pub(super) fn control(
     // concern); `binds` applied that gate when it latched, and the dev chords ignore it.
     let typing = ui_capture.typing;
 
-    // Every press below comes from `camera::latch_world_mouse`, so one the UI ate reaches none of
-    // them; the raw buttons only hold and release a gesture the world already owns. Read before
-    // the look session: the not-driving path seats its camera from this word and returns early.
+    // Every press below comes from `camera::latch_world_mouse`. A press the UI ate reaches none
+    // of them. A press on a nameplate is the latch's exception and still turns the camera. The
+    // raw buttons only hold and release a gesture the world already owns. Read before the look
+    // session: the not-driving path seats its camera from this word and returns early.
     let input::LookInput {
         both_buttons,
         follow_command,

@@ -1,12 +1,23 @@
 //! `MouselookStart`/`MouselookStop` against the look session: the latch and the session run as the
 //! frame runs them, with the VM's calls in between.
 
-use benilla_ui::script::UiScript;
+use benilla_ui::script::{PlateGeometry, PlateState, UiScript};
 use bevy::ecs::system::RunSystemOnce;
 use bevy::math::DVec2;
 
 use super::super::camera_dynamics::{CameraOptions, SubjectState};
 use super::*;
+
+/// The app clock [`run_look_session`] reads. A release inside 200 ms is a click however far the
+/// mouse travelled, so a drag test has to step this past that window.
+#[derive(Resource)]
+struct LookNow(f32);
+
+impl Default for LookNow {
+    fn default() -> Self {
+        Self(0.0)
+    }
+}
 
 /// What the session's caller keeps between frames: the facing and the two click tests.
 #[derive(Resource, Default)]
@@ -24,6 +35,7 @@ fn look_frame(
     window: Single<(&mut Window, &mut CursorOptions), With<PrimaryWindow>>,
     mut clicks: (MessageWriter<WorldClick>, MessageWriter<WorldRightClick>),
     mut hand: ResMut<Hand>,
+    now: Res<LookNow>,
 ) {
     let (mut window, mut opts) = window.into_inner();
     let focused = window.focused;
@@ -54,7 +66,7 @@ fn look_frame(
         &mut hand.right,
         LookConfig::default(),
         &dynamics,
-        0.0,
+        now.0,
         focused,
     );
 }
@@ -67,6 +79,7 @@ fn world(over_ui: bool) -> World {
     world.insert_resource(crate::ui_script::PointerOverUi(over_ui));
     world.init_resource::<CameraControl>();
     world.init_resource::<Hand>();
+    world.init_resource::<LookNow>();
     world.init_resource::<Messages<WorldClick>>();
     world.init_resource::<Messages<WorldRightClick>>();
     world.spawn((
@@ -386,4 +399,317 @@ fn mouselook_start_under_a_left_drag_is_the_both_button_run() {
     frame(&mut w, 0.0);
     assert_eq!(w.resource::<CameraControl>().look, Some(LookButton::Right));
     assert!(w.resource::<Messages<WorldClick>>().is_empty());
+}
+
+/// The unit a plate stands for. A hash would hide the value the orbit must keep.
+const PLATE_UNIT: u64 = 0x00F1_3000_0000_0045;
+
+/// `PointerOverUi` with a live plate under the cursor, as the arbiter and the widget layer leave
+/// them on the press frame.
+fn nameplate(over_ui: bool) -> World {
+    let mut world = world(over_ui);
+    let mut script = world.non_send_resource_mut::<UiScript>();
+    script.set_screen_size(1024.0, 768.0);
+    script
+        .run(r#"WorldFrame = CreateFrame("WorldFrame", "WorldFrame") WorldFrame:SetAllPoints()"#)
+        .unwrap();
+    script.resolve();
+    script.sync_nameplates(
+        PlateGeometry {
+            width: 128.0,
+            height: 32.0,
+            bar_off_x: 4.0,
+            bar_off_y: 4.0,
+            bar_width: 103.0,
+            bar_height: 9.0,
+            level_off_x: 11.8,
+            level_off_y: 9.1,
+            skull_size: 12.8,
+            raid_size: 25.6,
+            name_height: 12.8,
+            level_height: 11.0,
+            shadow_offset: 1.0,
+        },
+        &[PlateState {
+            key: PLATE_UNIT,
+            top_centre: (500.0, 400.0),
+            health: 30.0,
+            max_health: 40.0,
+            bar_colour: [1.0, 0.0, 0.0],
+            name: "Wolf".into(),
+            level: Some(12),
+            skull: false,
+            level_colour: [1.0, 1.0, 0.0],
+            raid_icon: None,
+            alpha: 1.0,
+            lit: false,
+            hovered: false,
+        }],
+    );
+    script.resolve();
+    // The plate hangs below its top centre; this is its middle.
+    script.mouse_move(500.0, 384.0);
+    assert_eq!(
+        script.hovered_nameplate(),
+        Some(PLATE_UNIT),
+        "the fixture must actually be hovering the plate"
+    );
+    world
+}
+
+fn at(world: &mut World, secs: f32) {
+    world.resource_mut::<LookNow>().0 = secs;
+}
+
+/// A left press on a nameplate orbits. Moving the mouse turns the camera, and the release is not
+/// a world click (that ray would miss the plate and deselect). Past the click window the plate's
+/// unit is not selected either.
+#[test]
+fn a_left_drag_from_a_nameplate_orbits_without_a_world_click() {
+    let mut w = nameplate(true);
+    press(&mut w, MouseButton::Left);
+    at(&mut w, 0.0);
+    frame(&mut w, 0.0);
+    assert_eq!(
+        w.resource::<CameraControl>().look,
+        Some(LookButton::Left),
+        "the press starts the orbit even though the plate owns the pointer"
+    );
+
+    // Off the plate before the release: the unit is the one under the press, not the release.
+    w.non_send_resource_mut::<UiScript>().mouse_move(1.0, 1.0);
+    at(&mut w, 0.25);
+    frame(&mut w, 40.0);
+    assert!(
+        yaw(&mut w) < 0.0,
+        "dragging turns the camera: {}",
+        yaw(&mut w)
+    );
+
+    // The widget records the mouse-up before the orbit classifies it. A drag must not keep it.
+    {
+        let mut script = w.non_send_resource_mut::<UiScript>();
+        script.mouse_button(500.0, 384.0, "LeftButton", true);
+        script.mouse_button(500.0, 384.0, "LeftButton", false);
+    }
+    release(&mut w, MouseButton::Left);
+    at(&mut w, 0.50);
+    frame(&mut w, 0.0);
+    assert!(w.resource::<Messages<WorldClick>>().is_empty());
+    assert!(
+        w.resource::<CameraControl>().plate_select.is_empty(),
+        "a drag past the click window does not select the plate"
+    );
+    assert!(w.resource::<CameraControl>().suppress_plate_click);
+    w.non_send_resource_mut::<UiScript>()
+        .drop_nameplate_left_clicks();
+    assert!(
+        w.non_send_resource_mut::<UiScript>()
+            .take_nameplate_clicks()
+            .is_empty(),
+        "the widget's mouse-up does not select after a drag"
+    );
+    assert_eq!(w.resource::<CameraControl>().look, None);
+}
+
+/// The plate widget recorded the click on its own. The orbit must not queue a second select.
+#[test]
+fn a_nameplate_click_the_widget_recorded_is_not_queued_again() {
+    let mut w = nameplate(true);
+    press(&mut w, MouseButton::Left);
+    at(&mut w, 0.0);
+    frame(&mut w, 0.0);
+    {
+        let mut script = w.non_send_resource_mut::<UiScript>();
+        script.mouse_button(500.0, 384.0, "LeftButton", true);
+        script.mouse_button(500.0, 384.0, "LeftButton", false);
+    }
+    release(&mut w, MouseButton::Left);
+    at(&mut w, 0.05);
+    frame(&mut w, 0.0);
+    assert!(
+        w.resource::<CameraControl>().plate_select.is_empty(),
+        "the widget click is the one select"
+    );
+    let clicks = w
+        .non_send_resource_mut::<UiScript>()
+        .take_nameplate_clicks();
+    assert_eq!(clicks.len(), 1);
+    assert_eq!(clicks[0].key, PLATE_UNIT);
+    assert!(w.resource::<Messages<WorldClick>>().is_empty());
+}
+
+/// A left press and release on a nameplate, with the mouse still, names that unit and does not
+/// emit a world click.
+#[test]
+fn a_left_click_on_a_nameplate_selects_its_unit() {
+    let mut w = nameplate(true);
+    press(&mut w, MouseButton::Left);
+    at(&mut w, 0.0);
+    frame(&mut w, 0.0);
+    w.non_send_resource_mut::<UiScript>().mouse_move(1.0, 1.0);
+
+    release(&mut w, MouseButton::Left);
+    at(&mut w, 0.05);
+    frame(&mut w, 0.0);
+    assert_eq!(w.resource::<CameraControl>().plate_select, vec![PLATE_UNIT]);
+    assert!(w.resource::<Messages<WorldClick>>().is_empty());
+    assert_eq!(yaw(&mut w), 0.0, "a still click does not turn the camera");
+}
+
+/// The same left press in empty world still selects through the world click.
+#[test]
+fn a_left_click_in_the_world_still_emits_a_world_click() {
+    let mut w = world(false);
+    press(&mut w, MouseButton::Left);
+    frame(&mut w, 0.0);
+    release(&mut w, MouseButton::Left);
+    at(&mut w, 0.05);
+    frame(&mut w, 0.0);
+    assert_eq!(w.resource::<Messages<WorldClick>>().len(), 1);
+    assert!(w.resource::<CameraControl>().plate_select.is_empty());
+}
+
+/// A right press on a nameplate turns. Moving the mouse turns the camera and the body, and the
+/// release is not a world right-click. Past the click window the plate's own right-click is
+/// dropped too.
+#[test]
+fn a_right_drag_from_a_nameplate_turns_without_a_world_right_click() {
+    let mut w = nameplate(true);
+    press(&mut w, MouseButton::Right);
+    at(&mut w, 0.0);
+    frame(&mut w, 0.0);
+    assert_eq!(
+        w.resource::<CameraControl>().look,
+        Some(LookButton::Right),
+        "the press starts the turn even though the plate owns the pointer"
+    );
+    assert!(
+        w.resource::<CameraControl>().plate_orbit,
+        "the turn began on the plate, so the plate keeps the mouse until it is a drag"
+    );
+
+    w.non_send_resource_mut::<UiScript>().mouse_move(1.0, 1.0);
+    at(&mut w, 0.25);
+    frame(&mut w, 40.0);
+    let turned = yaw(&mut w);
+    assert!(turned < 0.0, "dragging turns the camera: {turned}");
+    assert_eq!(
+        w.resource::<Hand>().face_yaw, turned,
+        "a right drag turns the body with the camera"
+    );
+    assert!(
+        w.resource::<CameraControl>().plate_drag,
+        "past the click window the plate gives the mouse up"
+    );
+
+    {
+        let mut script = w.non_send_resource_mut::<UiScript>();
+        script.mouse_button(500.0, 384.0, "RightButton", true);
+        script.mouse_button(500.0, 384.0, "RightButton", false);
+    }
+    release(&mut w, MouseButton::Right);
+    at(&mut w, 0.50);
+    frame(&mut w, 0.0);
+    assert!(w.resource::<Messages<WorldRightClick>>().is_empty());
+    assert!(
+        w.resource::<CameraControl>().suppress_plate_right_click,
+        "a drag past the click window does not act on the plate"
+    );
+    w.non_send_resource_mut::<UiScript>()
+        .drop_nameplate_right_clicks();
+    assert!(
+        w.non_send_resource_mut::<UiScript>()
+            .take_nameplate_clicks()
+            .is_empty(),
+        "the widget's mouse-up does not act after a drag"
+    );
+    assert_eq!(w.resource::<CameraControl>().look, None);
+}
+
+/// The plate widget recorded the right-click. The turn must not also emit a world right-click.
+#[test]
+fn a_right_click_the_widget_recorded_is_not_also_a_world_right_click() {
+    let mut w = nameplate(true);
+    press(&mut w, MouseButton::Right);
+    at(&mut w, 0.0);
+    frame(&mut w, 0.0);
+    {
+        let mut script = w.non_send_resource_mut::<UiScript>();
+        script.mouse_button(500.0, 384.0, "RightButton", true);
+        script.mouse_button(500.0, 384.0, "RightButton", false);
+    }
+    release(&mut w, MouseButton::Right);
+    at(&mut w, 0.05);
+    frame(&mut w, 0.0);
+    assert!(
+        w.resource::<Messages<WorldRightClick>>().is_empty(),
+        "the widget click is the one right-click"
+    );
+    let clicks = w
+        .non_send_resource_mut::<UiScript>()
+        .take_nameplate_clicks();
+    assert_eq!(clicks.len(), 1);
+    assert_eq!(clicks[0].key, PLATE_UNIT);
+    assert_eq!(clicks[0].button, "RightButton");
+}
+
+/// A right press and release on a nameplate, with the mouse still and the widget missing the
+/// mouse-up, still emits the world right-click the plate's action reads.
+#[test]
+fn a_right_click_on_a_nameplate_the_widget_missed_still_acts() {
+    let mut w = nameplate(true);
+    press(&mut w, MouseButton::Right);
+    at(&mut w, 0.0);
+    frame(&mut w, 0.0);
+    w.non_send_resource_mut::<UiScript>().mouse_move(1.0, 1.0);
+
+    release(&mut w, MouseButton::Right);
+    at(&mut w, 0.05);
+    frame(&mut w, 0.0);
+    assert_eq!(w.resource::<Messages<WorldRightClick>>().len(), 1);
+    assert!(w.resource::<CameraControl>().plate_select.is_empty());
+    assert_eq!(yaw(&mut w), 0.0, "a still click does not turn the camera");
+}
+
+/// A panel and the dev overlay still take both buttons.
+#[test]
+fn a_panel_and_the_dev_overlay_still_take_the_press() {
+    let mut panel = world(true);
+    press(&mut panel, MouseButton::Left);
+    frame(&mut panel, 40.0);
+    assert_eq!(
+        panel.resource::<CameraControl>().look,
+        None,
+        "a panel still eats the left press"
+    );
+
+    let mut panel_right = world(true);
+    press(&mut panel_right, MouseButton::Right);
+    frame(&mut panel_right, 40.0);
+    assert_eq!(
+        panel_right.resource::<CameraControl>().look,
+        None,
+        "a panel still eats the right press"
+    );
+
+    let mut covered = nameplate(true);
+    covered.insert_resource(crate::ui_script::EguiPointerOver(true));
+    press(&mut covered, MouseButton::Left);
+    frame(&mut covered, 40.0);
+    assert_eq!(
+        covered.resource::<CameraControl>().look,
+        None,
+        "the dev overlay stays above the plate"
+    );
+
+    let mut covered_right = nameplate(true);
+    covered_right.insert_resource(crate::ui_script::EguiPointerOver(true));
+    press(&mut covered_right, MouseButton::Right);
+    frame(&mut covered_right, 40.0);
+    assert_eq!(
+        covered_right.resource::<CameraControl>().look,
+        None,
+        "the dev overlay stays above a right press on the plate"
+    );
 }

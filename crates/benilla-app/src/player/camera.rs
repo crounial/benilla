@@ -565,6 +565,26 @@ pub(crate) struct CameraControl {
     /// `[cam+0x90] & 0x30000`, written only by the solver `0x50e570`, [`SmartPivot`]'s sixth
     /// conjunct; the look session reads it a frame later, as `0x50fee0` (from `0x514446`) does.
     pub(super) clipped: bool,
+    /// Left orbit began on a nameplate. The release selects that unit when the gesture is a
+    /// click, and never emits a world click. Cleared when the session ends. `pub(crate)` so the
+    /// nameplate driver can keep the plate's mouse until the gesture is a drag.
+    pub(crate) plate_orbit: bool,
+    /// The gesture has already spent the click budget, so the plate gives the mouse up and the
+    /// release does not select.
+    pub(crate) plate_drag: bool,
+    /// The unit under that press, kept until the release decides click or drag.
+    /// `pub(super)` so the other player modules can build a rig with `..default()`.
+    pub(super) plate_key: Option<u64>,
+    /// The plate widget already recorded this click, so the orbit must not queue another.
+    pub(super) plate_click_from_ui: bool,
+    /// The widget's mouse-up was a camera drag. [`crate::vplates`] drops that left click.
+    pub(crate) suppress_plate_click: bool,
+    /// The widget's right mouse-up was a camera turn. [`crate::vplates`] drops that right click.
+    pub(crate) suppress_plate_right_click: bool,
+    /// Units a nameplate left-click should select. The orbit's release writes a guid here when
+    /// the gesture was a click the widget did not record; [`crate::target::click::select_on_plate_click`]
+    /// drains it.
+    pub(crate) plate_select: Vec<u64>,
 }
 
 impl CameraControl {
@@ -627,6 +647,10 @@ pub(super) struct WorldMouse {
     scripted_rise: bool,
     /// A `MouselookStart`/`Stop` ran this frame; each disarms the pending click (`0x514810(0)`).
     disarmed: bool,
+    /// This frame's down began on a nameplate. The look session copies it when it engages.
+    plate_press: bool,
+    /// That plate's unit, when [`Self::plate_press`] is set.
+    plate_key: Option<u64>,
 }
 
 impl WorldMouse {
@@ -668,14 +692,15 @@ impl WorldMouse {
         self.disarmed
     }
 
-    /// Latch this frame; `world_press` says whether a down edge belongs to the world. A held bit
-    /// rides to its release, including a cover's emptying of the button planes.
-    fn update(&mut self, buttons: &ButtonInput<MouseButton>, world_press: bool) {
+    /// Latch this frame. `right` and `left` say whether that button's down edge belongs to the
+    /// world. A held bit rides to its release, including a cover's emptying of the button planes.
+    fn update(&mut self, buttons: &ButtonInput<MouseButton>, right: bool, left: bool) {
         self.scripted_rise = false;
         self.disarmed = false;
+        let accept = [right, left];
         for b in [LookButton::Right, LookButton::Left] {
             let i = b as usize;
-            self.down[i] = world_press && buttons.just_pressed(b.button());
+            self.down[i] = accept[i] && buttons.just_pressed(b.button());
             self.held[i] = (self.held[i] || self.down[i]) && buttons.pressed(b.button());
         }
     }
@@ -695,19 +720,20 @@ impl WorldMouse {
 }
 
 /// Decide once per frame which mouse buttons the world owns: a press in the viewport off the UI,
-/// or any press while a look session owns the cursor (a chord's second button). Its own system,
-/// ahead of `/follow`'s both-button cancel ([`super::follow::steer_follow`]), which runs before
-/// the controller and would otherwise read it a frame late.
+/// a press on a nameplate, or any press while a look session owns the cursor (a chord's
+/// second button). Its own system, ahead of `/follow`'s both-button cancel
+/// ([`super::follow::steer_follow`]), which runs before the controller and would otherwise read
+/// it a frame late.
 pub(super) fn latch_world_mouse(
     buttons: Res<ButtonInput<MouseButton>>,
-    // The raw flag: a press on a nameplate is the plate's, so dragging from a plate never turns the
-    // camera, as in 1.12. `0x7662c0` hands a mouse-down to one frame (capture at `0x7663e9`), and
-    // `CBindings::ExecuteBinding` (`0x4b7990`) runs only from `CGWorldFrame` handlers; the release
-    // goes to the plate's click slot (`0x7792d0` → `0x7cb910` → `0x4949f0`). Entering freelook
-    // disables plate input (`0x60f830`, from `0x483e80`) for a world drag across one. A plate's
-    // ground-targeting veto (`+0x3c`, `0x7cba30`) arrives through `PointerOverUi`
+    // Chrome eats both buttons. A nameplate does not: either press still turns the camera, and
+    // the release keeps the plate's click when the gesture is a click.
+    // Deviation from 1.12, where `0x7662c0` gives the mouse-down to the plate and a drag from one
+    // never turns the camera. The dev overlay stays above the plate. A plate's ground-targeting
+    // veto (`+0x3c`, `0x7cba30`) arrives through `PointerOverUi`
     // (`UiScript::set_nameplate_hit_test_veto`). The wheel still zooms over a plate.
     pointer_over_ui: Res<crate::ui_script::PointerOverUi>,
+    egui: Option<Res<crate::ui_script::EguiPointerOver>>,
     mut rig: ResMut<CameraControl>,
     cameras: Query<&Camera, With<FlyCam>>,
     window: Single<&Window, With<PrimaryWindow>>,
@@ -718,28 +744,59 @@ pub(super) fn latch_world_mouse(
         .as_mut()
         .map(|s| s.take_mouselook_calls())
         .unwrap_or_default();
+    let plate_key = script.as_ref().and_then(|s| s.hovered_nameplate());
     let Ok(camera) = cameras.single() else {
         return;
     };
     let over_ui = pointer_over_ui.0;
-    let world_press = rig.look.is_some() || (cursor_in_viewport(&window, camera) && !over_ui);
-    let wm = &mut rig.world_mouse;
-    wm.update(&buttons, world_press);
-    // The script's calls, made since the last latch, before this frame's release.
-    for on in calls {
-        wm.mouselook(on);
+    let in_view = cursor_in_viewport(&window, camera);
+    let looking = rig.look.is_some();
+    // The dev overlay is not the plate, even when the UI hit test still finds one under it.
+    let over_plate = plate_key.is_some() && !egui.as_ref().is_some_and(|e| e.0);
+    let right_world = looking || (in_view && (!over_ui || over_plate));
+    let left_world = looking || (in_view && (!over_ui || over_plate));
+    // The widget's mouse-up already ran this frame. Read it before borrowing the mouse word:
+    // a click it recorded is the plate's action, and the turn must not queue a second one.
+    let plate_button = rig.look.filter(|_| rig.plate_orbit);
+    let released_on_plate = match plate_button {
+        Some(LookButton::Left) => buttons.just_released(MouseButton::Left),
+        Some(LookButton::Right) => buttons.just_released(MouseButton::Right),
+        None => false,
+    };
+    let pending_plate_click = released_on_plate
+        && script.as_ref().is_some_and(|s| match plate_button {
+            Some(LookButton::Right) => s.has_pending_nameplate_right_click(),
+            _ => s.has_pending_nameplate_left_click(),
+        });
+    {
+        let wm = &mut rig.world_mouse;
+        wm.update(&buttons, right_world, left_world);
+        if wm.down(LookButton::Left) || wm.down(LookButton::Right) {
+            // A chord's second button is already a world press. Only the press that starts
+            // the turn is the plate's.
+            let starts = over_plate && !looking;
+            wm.plate_press = starts;
+            wm.plate_key = starts.then_some(plate_key).flatten();
+        }
+        // The script's calls, made since the last latch, before this frame's release.
+        for on in calls {
+            wm.mouselook(on);
+        }
+        // The right button's release ends a scripted channel too, wherever its press went: in
+        // freelook every button event goes to the `WorldFrame` (`0x492b50`), whose TURNORACTION up
+        // runs `TurnOrActionStop` (`0x514160`), `0x515090(1, 0, …)`.
+        if buttons.just_released(MouseButton::Right) {
+            wm.scripted = false;
+        }
+        // The world enter behind the cover clears the whole word (`0x5144c0` → `0x514b70(-1, …)`).
+        // A window deactivate clears none of it (`0x5144a3 and eax,0xfffff00f` keeps the low bits):
+        // the session outlives the focus, and only the OS cursor goes back ([`sync_look_focus`]).
+        if cover.is_some_and(|c| c.covering()) {
+            wm.scripted = false;
+        }
     }
-    // The right button's release ends a scripted channel too, wherever its press went: in
-    // freelook every button event goes to the `WorldFrame` (`0x492b50`), whose TURNORACTION up
-    // runs `TurnOrActionStop` (`0x514160`), `0x515090(1, 0, …)`.
-    if buttons.just_released(MouseButton::Right) {
-        wm.scripted = false;
-    }
-    // The world enter behind the cover clears the whole word (`0x5144c0` → `0x514b70(-1, …)`).
-    // A window deactivate clears none of it (`0x5144a3 and eax,0xfffff00f` keeps the low bits):
-    // the session outlives the focus, and only the OS cursor goes back ([`sync_look_focus`]).
-    if cover.is_some_and(|c| c.covering()) {
-        wm.scripted = false;
+    if released_on_plate {
+        rig.plate_click_from_ui = pending_plate_click;
     }
     // `IsMouselooking` (`0x514270`) reads `[InputControl+4] & 1`, the TurnOrAction channel.
     if let Some(mut script) = script {
@@ -754,7 +811,9 @@ pub(super) fn send_world_right_press(
     rig: Res<CameraControl>,
     mut world_right_press: MessageWriter<WorldRightPress>,
 ) {
-    if rig.world_mouse.down(LookButton::Right) {
+    // A press that started on a nameplate is the plate's click, not the WorldFrame hook, so
+    // repair mode and ground targeting stay as they do for any other UI frame.
+    if rig.world_mouse.down(LookButton::Right) && !rig.world_mouse.plate_press {
         world_right_press.write(WorldRightPress);
     }
 }
@@ -842,6 +901,21 @@ pub(super) fn run_look_session(
         test.yaw_travel += dyaw;
         test.pitch_travel += dpitch;
     }
+    // Once a nameplate press has spent the click budget, later frames take the mouse off the
+    // plate so the release is not also a click. A chord or a scripted stop spends it at once.
+    // The crossing frame's mouse-up, if it already landed, is dropped below.
+    let gesture_spent = match rig.look {
+        Some(LookButton::Left) => left_click.as_ref().is_some_and(|t| !t.is_click(now)),
+        Some(LookButton::Right) => right_click.as_ref().is_some_and(|t| !t.is_click(now)),
+        None => false,
+    };
+    if rig.plate_orbit && (rig.world_mouse.both() || disarmed) {
+        rig.plate_drag = true;
+        rig.suppress_plate_click = true;
+        rig.suppress_plate_right_click = true;
+    } else if rig.plate_orbit && gesture_spent {
+        rig.plate_drag = true;
+    }
 
     // Both buttons engage their session on the down edge, with no threshold (`0x51491f`); the click
     // test rides along to the release. Looking hides and locks the cursor until the release.
@@ -855,6 +929,23 @@ pub(super) fn run_look_session(
             if let Some(test) = test {
                 if test.is_click(now) {
                     match active {
+                        LookButton::Left if rig.plate_orbit => {
+                            // The widget click selects. This covers a release the widget missed
+                            // because the cursor lock took the pointer off the plate.
+                            if !std::mem::take(&mut rig.plate_click_from_ui) {
+                                if let Some(key) = rig.plate_key.take() {
+                                    rig.plate_select.push(key);
+                                }
+                            }
+                        }
+                        LookButton::Right if rig.plate_orbit => {
+                            // The widget click acts. This covers a release the widget missed
+                            // because the cursor lock took the pointer off the plate. The press
+                            // pick, latched on the down, is the unit the right-click acts on.
+                            if !std::mem::take(&mut rig.plate_click_from_ui) {
+                                world_right_click.write(WorldRightClick);
+                            }
+                        }
                         LookButton::Left => {
                             world_click.write(WorldClick);
                         }
@@ -862,7 +953,17 @@ pub(super) fn run_look_session(
                             world_right_click.write(WorldRightClick);
                         }
                     }
+                } else if rig.plate_orbit {
+                    match active {
+                        LookButton::Left => rig.suppress_plate_click = true,
+                        LookButton::Right => rig.suppress_plate_right_click = true,
+                    }
                 }
+            } else if rig.plate_orbit {
+                // A chord or a scripted stop already dropped the click test. The plate's
+                // mouse-up, if it landed this frame, must not act either.
+                rig.suppress_plate_click = true;
+                rig.suppress_plate_right_click = true;
             }
             // Hand off to the other channel if it is held, as the reference keeps turning; a
             // button the UI holds never fired its binding.
@@ -870,6 +971,10 @@ pub(super) fn run_look_session(
                 LookButton::Right => LookButton::Left,
                 LookButton::Left => LookButton::Right,
             };
+            rig.plate_orbit = false;
+            rig.plate_drag = false;
+            rig.plate_key = None;
+            rig.plate_click_from_ui = false;
             if rig.world_mouse.channel(other) {
                 rig.look = Some(other);
             } else {
@@ -881,6 +986,12 @@ pub(super) fn run_look_session(
         // viewport. Right-drag turns, and arms its click test unless left is held.
         if rig.world_mouse.down(LookButton::Right) {
             engage_look(rig, LookButton::Right, focused, window, cursor_opts);
+            let from_plate = rig.world_mouse.plate_press;
+            rig.plate_orbit = from_plate;
+            rig.plate_drag = false;
+            rig.plate_key = from_plate.then_some(rig.world_mouse.plate_key).flatten();
+            // Press and release in one frame: the widget still had the mouse and recorded it.
+            rig.plate_click_from_ui = from_plate && !rig.world_mouse.held(LookButton::Right);
             *right_click = (!rig.world_mouse.held(LookButton::Left) && !disarmed)
                 .then(|| PressGesture::new(now));
         } else if rig.world_mouse.turn() {
@@ -889,8 +1000,15 @@ pub(super) fn run_look_session(
             engage_look(rig, LookButton::Right, focused, window, cursor_opts);
         } else if rig.world_mouse.down(LookButton::Left) && !inspect_enabled {
             // Left-drag orbits, engaged on the press like right (`0x51491f`); the select settles
-            // at the release. While the inspector is armed, left belongs to it.
+            // at the release. While the inspector is armed, left belongs to it. A press on a
+            // nameplate orbits too; the plate's own click selects when the gesture is a click.
             engage_look(rig, LookButton::Left, focused, window, cursor_opts);
+            let from_plate = rig.world_mouse.plate_press;
+            rig.plate_orbit = from_plate;
+            rig.plate_drag = false;
+            rig.plate_key = from_plate.then_some(rig.world_mouse.plate_key).flatten();
+            // Press and release in one frame: the widget still had the mouse and recorded it.
+            rig.plate_click_from_ui = from_plate && !rig.world_mouse.held(LookButton::Left);
             // A cursor-payload world drop still orbits (`0x51491f`) but must not also select.
             *right_click = None;
             *left_click = (!click_consumed && !rig.world_mouse.turn() && !disarmed)
@@ -1896,7 +2014,7 @@ mod tests {
             let mut rig = CameraControl::default();
             let mut buttons = ButtonInput::<MouseButton>::default();
             buttons.press(MouseButton::Right);
-            rig.world_mouse.update(&buttons, world_press);
+            rig.world_mouse.update(&buttons, world_press, world_press);
             super::super::input::look_input(
                 &crate::bindings::BindingsState::default(),
                 &super::super::Player::default(),
@@ -1937,10 +2055,10 @@ mod tests {
 
         // Pressed over a UI row: never claimed, and no amount of later frames claims it.
         buttons.press(MouseButton::Right);
-        rig.world_mouse.update(&buttons, false);
+        rig.world_mouse.update(&buttons, false, false);
         assert!(!rig.world_mouse.held(LookButton::Right));
         buttons.clear();
-        rig.world_mouse.update(&buttons, true);
+        rig.world_mouse.update(&buttons, true, true);
         assert!(
             !rig.world_mouse.held(LookButton::Right),
             "a press the UI ate is never handed back mid-hold"
@@ -1950,10 +2068,10 @@ mod tests {
 
         // Pressed in the world: claimed, and it survives the UI arriving under the locked cursor.
         buttons.press(MouseButton::Right);
-        rig.world_mouse.update(&buttons, true);
+        rig.world_mouse.update(&buttons, true, true);
         assert!(rig.world_mouse.down(LookButton::Right));
         buttons.clear();
-        rig.world_mouse.update(&buttons, false);
+        rig.world_mouse.update(&buttons, false, false);
         assert!(rig.world_mouse.held(LookButton::Right));
         assert!(
             !rig.world_mouse.down(LookButton::Right),
@@ -1962,7 +2080,7 @@ mod tests {
 
         // The chord's second button joins the gesture the world already holds…
         buttons.press(MouseButton::Left);
-        rig.world_mouse.update(&buttons, true);
+        rig.world_mouse.update(&buttons, true, true);
         assert!(
             rig.world_mouse.both(),
             "both primaries = the both-button run"
@@ -1970,7 +2088,7 @@ mod tests {
 
         // …and the release ends it, including a cover's synthetic one (emptied button planes).
         buttons = ButtonInput::<MouseButton>::default();
-        rig.world_mouse.update(&buttons, false);
+        rig.world_mouse.update(&buttons, false, false);
         assert!(!rig.world_mouse.both());
         assert!(!rig.world_mouse.held(LookButton::Right));
         assert!(!rig.world_mouse.held(LookButton::Left));

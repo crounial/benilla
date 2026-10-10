@@ -32,6 +32,7 @@ pub(super) fn world_right_click_payload(
 /// nothing yet. A physical right-click arrives only here: `0x7cb910` → `0x4949f0` → `0x492820`.
 pub(super) fn select_on_plate_click(
     mut plate: ResMut<crate::vplates::PlateClicks>,
+    mut rig: ResMut<crate::player::CameraControl>,
     press: Res<PressPick>,
     ground: Res<crate::spell::SpellTargeting>,
     mut selection: ResMut<Selection>,
@@ -39,12 +40,21 @@ pub(super) fn select_on_plate_click(
     self_q: Query<(&Guid, Has<Engaged>), With<SelfPlayer>>,
     mut greeting: MessageWriter<crate::sound::NpcGreetingRequest>,
     mut right_clicks: MessageWriter<WorldRightClick>,
-    units: Query<(&Guid, Option<&ObjectStore>)>,
+    units: Query<(Entity, &Guid, Option<&ObjectStore>)>,
 ) {
-    let (left, right) = (
+    let (mut left, right) = (
         std::mem::take(&mut plate.left),
         std::mem::take(&mut plate.right),
     );
+    // A click the plate widget missed (the orbit had already taken the pointer) names the unit
+    // by guid. Skip one the widget already queued, so the greeting does not play twice.
+    for key in std::mem::take(&mut rig.plate_select) {
+        if let Some((entity, _, _)) = units.iter().find(|(_, guid, _)| guid.0 == key) {
+            if !left.contains(&entity) {
+                left.push(entity);
+            }
+        }
+    }
     if ground.active() {
         return;
     }
@@ -53,7 +63,7 @@ pub(super) fn select_on_plate_click(
         .map(|(g, e)| (Some(g.0), e))
         .unwrap_or((None, false));
     for entity in left {
-        let Ok((guid, store)) = units.get(entity) else {
+        let Ok((_, guid, store)) = units.get(entity) else {
             continue; // the unit left between the click and this frame
         };
         // The greeting fires on the select, plate or body, before SetTarget (`0x60c270`).
@@ -2021,6 +2031,44 @@ mod tests {
             }),
             Some(HELD),
             "so is a NOT_SELECTABLE unit the grader threw away"
+        );
+    }
+
+    /// A left click that started on a nameplate queues the unit's guid on the camera. The plate
+    /// widget never sees the mouse-up once the orbit hides its mouse, so this path selects it.
+    #[test]
+    fn a_nameplate_orbit_click_selects_that_unit() {
+        use crate::net::Guid;
+        use crate::player::CameraControl;
+        use bevy::ecs::system::RunSystemOnce;
+
+        const UNIT: u64 = 0x00F1_3000_0000_0045;
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut world = World::new();
+        world.insert_resource(NetCommands(tx));
+        world.init_resource::<crate::spell::QueuedMeleeSpell>();
+        world.init_resource::<crate::spell::AutoRepeatActive>();
+        world.init_resource::<crate::ui_loot::LootState>();
+        world.init_resource::<crate::ui_loot::LootLatch>();
+        world.init_resource::<crate::spell::SpellTargeting>();
+        world.init_resource::<PressPick>();
+        world.init_resource::<Selection>();
+        world.init_resource::<crate::vplates::PlateClicks>();
+        world.init_resource::<Messages<crate::sound::NpcGreetingRequest>>();
+        world.init_resource::<Messages<WorldRightClick>>();
+        world.init_resource::<Messages<crate::creature_anim::SheathRequest>>();
+        let mut rig = CameraControl::default();
+        rig.plate_select.push(UNIT);
+        world.insert_resource(rig);
+        world.spawn(SelfPlayer);
+        world.spawn(Guid(UNIT));
+        world
+            .run_system_once(select_on_plate_click)
+            .expect("select_on_plate_click runs");
+        assert_eq!(world.resource::<Selection>().guid, Some(UNIT));
+        assert!(
+            world.resource::<CameraControl>().plate_select.is_empty(),
+            "the queue is drained"
         );
     }
 

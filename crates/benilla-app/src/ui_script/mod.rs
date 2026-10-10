@@ -1036,10 +1036,11 @@ mod pointer_arbiter_tests {
         );
     }
 
-    /// The camera reads the raw flag (`0x7662c0` gives a mouse-down to exactly one frame, the
-    /// plate); the wheel reads chrome, walking past a frame that only takes the mouse.
+    /// `PointerOverUi` stays set over a plate. The wheel reads chrome and walks past a plate.
+    /// A drag that starts on a plate is `latch_world_mouse`'s exception, not a change to
+    /// this flag.
     #[test]
-    fn the_camera_yields_to_a_plate_and_the_wheel_does_not() {
+    fn a_plate_sets_pointer_over_ui_and_the_wheel_looks_through_it() {
         let mut app = app();
         let plate = app.world_mut().spawn_empty().id();
         app.world_mut().resource_mut::<PlayerUiHover>().0 = Some(7);
@@ -1047,10 +1048,10 @@ mod pointer_arbiter_tests {
             .resource_mut::<crate::vplates::PlateHover>()
             .0 = Some(plate);
         app.update();
-        // `latch_world_mouse` reads this one: the press is not the world's, so no look starts.
+        // The flag stays set. The left-orbit exception lives in the camera latch.
         assert!(
             app.world().resource::<PointerOverUi>().0,
-            "the camera must yield the press to the plate"
+            "a plate still sets PointerOverUi"
         );
         // …and `bindings`' wheel branch reads this one.
         assert!(
