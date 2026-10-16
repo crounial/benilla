@@ -68,11 +68,24 @@ impl VPlateMode {
 #[derive(Resource, Default)]
 pub(crate) struct VPlates(pub(crate) EntityHashSet);
 
-/// The unit whose plate the pointer is inside, from last frame's layout: the plate's OnEnter
+/// The unit whose plate holds the hover after this frame's UI walk: the plate's OnEnter
 /// publishing the mouseover (`0x7cb850` into `[0xb4e2c8]`), since the world pick stands down
-/// over UI.
+/// over UI. Read in the frame of the walk, as the plate's leave publishes the loss inside it
+/// (`0x7cb8b0`), so the pick never re-publishes a plate the walk has just left.
 #[derive(Resource, Default)]
 pub(crate) struct PlateHover(pub(crate) Option<Entity>);
+
+/// Read [`PlateHover`] off the walk that just ran, at the end of the UI input pass.
+pub(crate) fn seed_plate_hover(
+    script: Option<NonSend<benilla_ui::script::UiScript>>,
+    guids: Option<Res<crate::net::GuidIndex>>,
+    mut hover: ResMut<PlateHover>,
+) {
+    hover.0 = script
+        .and_then(|s| s.hovered_nameplate())
+        .zip(guids)
+        .and_then(|(guid, guids)| guids.0.get(&guid).copied());
+}
 
 /// Completed plate clicks, physical or an addon's `plate:Click`, waiting for the targeting chain:
 /// the reference's click slot (`0x7cb910`) ends in the same `SetSelection` as a body click.
@@ -310,7 +323,6 @@ struct PlateWorld<'w, 's> {
 fn drive_vplates(
     mode: Res<VPlateMode>,
     mut plates: ResMut<VPlates>,
-    mut plate_hover: ResMut<PlateHover>,
     mut plate_clicks: ResMut<PlateClicks>,
     mut rig: ResMut<crate::player::CameraControl>,
     world: PlateWorld,
@@ -318,7 +330,6 @@ fn drive_vplates(
     net_commands: Res<NetCommands>,
     // `None` in a run with no UI VM.
     mut script: Option<NonSendMut<benilla_ui::script::UiScript>>,
-    ui_scale: Res<crate::ui_script::UiScaleCvar>,
     anchor_q: (
         Query<&BoneAttach>,
         Query<&benilla_world::rig_anim::RigPose>,
@@ -332,7 +343,6 @@ fn drive_vplates(
     mut mouse_told: Local<crate::ui_script::VmMemo<Option<bool>>>,
 ) {
     plates.0.clear();
-    plate_hover.0 = None;
     bucket.clear();
     // A drag that started on a plate already recorded its mouse-up. Drop that click before
     // any early return, so it cannot select or act on a later frame.
@@ -569,9 +579,6 @@ fn drive_vplates(
         let mark = group.raid_target_index(guid.0);
         let x_units = (plate.min.x + plate.max.x) * 0.5 / seam;
         let y_units = (viewport.y - plate.min.y) / seam;
-        if hovered_key == Some(guid.0) {
-            plate_hover.0 = Some(entity);
-        }
         for click in &clicked {
             if click.key == guid.0 {
                 match click.button.as_str() {

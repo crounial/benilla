@@ -32,11 +32,10 @@ mod bowstring;
 mod camera_shake;
 #[cfg(feature = "dev")]
 mod capture;
-mod char_create;
-mod char_select;
 mod chat_bubble;
 mod chr_classes;
 mod cinematic;
+mod client_state;
 mod combat_log;
 mod combat_text;
 mod console;
@@ -53,25 +52,24 @@ mod debug_panel;
 mod dev;
 mod doodad_events;
 mod entities;
+mod field_watch;
 mod fishing_line;
 mod footprints;
 mod game_plugins;
-mod glue;
-mod glue_strings;
+mod glue_session;
 mod go_anim;
 mod go_templates;
 #[cfg(feature = "dev")]
 mod hover_log;
+mod item_watch;
 mod items;
 mod loading_screen;
 mod local_state;
-mod login;
 mod minimap;
 mod nameplates;
 mod names;
 mod net;
 mod npc_text;
-mod pending_item_ops;
 /// Ships in part (the FPS journal and the clocks it reads); the rest is `dev`.
 mod perf;
 mod pipe_warm;
@@ -86,7 +84,6 @@ mod query_cache;
 mod quest_markers;
 mod raid_marks;
 mod ranged_flex;
-mod realm_select;
 mod realmlist;
 mod run_mode;
 mod screen_fade;
@@ -151,6 +148,7 @@ mod ui_merchant;
 mod ui_mirror;
 mod ui_models;
 mod ui_net;
+mod ui_panes;
 mod ui_party;
 mod ui_pass;
 mod ui_pet;
@@ -253,6 +251,15 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
     // A dev build's install, state folder and probe identity resolve from the launcher's folder,
     // so a crate on top of benilla keeps them in its own and not in cargo's checkout of benilla.
     benilla_formats::set_project_folder(build.project_dir);
+    if run_mode::unattended() && std::env::var_os("BENILLA_HOME").is_none() {
+        // Before the logger exists; whoever reads what the run wrote needs the folder.
+        if let Some(home) = local_state::home() {
+            println!(
+                "state: an unattended run keeps its own state in {} (BENILLA_HOME pins one)",
+                home.display()
+            );
+        }
+    }
 
     // From here a panic leaves `benilla-config/Diagnostics/crash-<unix>.txt`; armed before the
     // `App` exists, so a panic while plugins build is reported too.
@@ -400,6 +407,8 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
     // macOS `Cmd+Q` goes straight to `terminate:`, which never runs another frame, so the session
     // was never written; re-pointed at the window close, which [`shutdown`] sees.
     .add_plugins(benilla_world::mac_quit::MacQuitPlugin)
+    // Alt+F4 on Windows and Linux, where a tiling window manager binds nothing to it.
+    .add_plugins(shutdown::AltF4Plugin)
     // The engine as one group; `world_plugins.rs` has its load-bearing ordering edges and what it
     // leaves out (`pipe_warm`).
     .add_plugins(benilla_world::world_plugins::WorldPlugins)

@@ -889,6 +889,8 @@ pub(super) fn seed_ui_fixture(
                 "mouseover",
                 Some(benilla_ui::script::UnitState {
                     exists: true,
+                    // A unit is found by its guid; the builder hides for guid 0 (`0x52a04e`).
+                    guid: 0xF130_0000_0044_0001,
                     name: Some("Stormwind Guard".into()),
                     health: 38,
                     max_health: 50,
@@ -916,6 +918,7 @@ pub(super) fn seed_ui_fixture(
                 "mouseover",
                 Some(benilla_ui::script::UnitState {
                     exists: true,
+                    guid: 0x0000_0000_0000_0B0B,
                     is_player: true,
                     name: Some("Bob".into()),
                     level: 60,
@@ -1016,8 +1019,8 @@ pub(super) fn seed_ui_fixture(
             bow.inventory_type = 15;
             items.insert_template(93_013, Some(bow));
             let mut arrows = template("Rough Arrow", 0);
-            arrows.class = 6; // projectile: the ammo slot's icon and bag-summed count (200)
-            arrows.inventory_type = 24; // INVTYPE_AMMO: the equip drains' SET_AMMO fork
+            arrows.class = 6; // projectile: the ammo icon, the bag-summed count (200), SET_AMMO
+            arrows.inventory_type = 24; // INVTYPE_AMMO
             arrows.display_info_id = DISP_STONE;
             items.insert_template(93_012, Some(arrows));
 
@@ -1574,23 +1577,34 @@ fn seed_cooldown_filmstrip(
         slots.insert(
             slot,
             benilla_ui::script::ContainerSlot {
+                use_fork: Default::default(),
+                item_class: None,
                 petition: None,
                 durability: None,
                 duration_ms: None,
                 bar_placeable: true,
+                consumable: false,
                 texture: texture.clone(),
                 count: 1,
                 quality: Some(1),
+                inventory_type: 0,
+                bonding: 0,
+                use_spell: 0,
                 item_id: 6948,
                 link: Some("|cffffffff|Hitem:6948|h[Hearthstone]|h|r".into()),
-                locked: false,
+                guid: 0,
                 equip_slots: Vec::new(),
                 cooldown: Some(((now_ms - fraction * span_ms) as i64, span_ms as u32, true)),
                 readable: false,
                 creator: None,
+                gift_creator: None,
+                creator_guid: 0,
+                gift_creator_guid: 0,
                 flags: 0,
                 already_bound: false,
+                occupied_seats: None,
                 enchants: Vec::new(),
+                spell_0: false,
             },
         );
     }
@@ -1626,23 +1640,34 @@ fn seed_bag_window(
     };
     let slot = |disp: u32, count: u32, id: u32, name: &str, quality: u32| {
         benilla_ui::script::ContainerSlot {
+            use_fork: Default::default(),
+            item_class: None,
             petition: None,
             durability: None,
             duration_ms: None,
             bar_placeable: true,
+            consumable: false,
             texture: icon(disp),
             count,
             quality: Some(quality),
+            inventory_type: 0,
+            bonding: 0,
+            use_spell: 0,
             item_id: id,
             link: Some(format!("|cffffffff|Hitem:{id}|h[{name}]|h|r")),
-            locked: false,
+            guid: 0,
             equip_slots: Vec::new(),
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
+            creator_guid: 0,
+            gift_creator_guid: 0,
             flags: 0,
             already_bound: false,
+            occupied_seats: None,
             enchants: Vec::new(),
+            spell_0: false,
         }
     };
     // Five items under their real template ids. Game slot 1, the Small Shield the Tooltip
@@ -1712,23 +1737,34 @@ fn seed_equipped_bags(
     };
     let slot =
         |disp: u32, count: u32, name: &str, quality: u32| benilla_ui::script::ContainerSlot {
+            use_fork: Default::default(),
+            item_class: None,
             petition: None,
             durability: None,
             duration_ms: None,
             bar_placeable: true,
+            consumable: false,
             texture: icon(disp),
             count,
             quality: Some(quality),
+            inventory_type: 0,
+            bonding: 0,
+            use_spell: 0,
             item_id: 0,
             link: Some(format!("|cffffffff|Hitem:0|h[{name}]|h|r")),
-            locked: false,
+            guid: 0,
             equip_slots: Vec::new(),
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
+            creator_guid: 0,
+            gift_creator_guid: 0,
             flags: 0,
             already_bound: false,
+            occupied_seats: None,
             enchants: Vec::new(),
+            spell_0: false,
         };
 
     // The equipped-bag slots (inv ids 20-23, `Bag0Slot`-`Bag3Slot`) get an icon each, so each

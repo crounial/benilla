@@ -309,7 +309,11 @@ fn build_name_mesh(atlas: &mut UiFontAtlas, lines: &[String]) -> Mesh {
                 path: None, // UNIT_NAME_FONT = Friz Quadrata, the default face
                 height: Some(BAKE_PX),
                 outline: Outline::None,
+                spacing: 0.0, // one line
+                shadow_x: 0.0,
                 alpha_gradient: None,
+                non_space_wrap: false,
+                max_lines: 0,
             },
             // A world billboard: the glyphs are re-seated in pitch units below, off the UI grid.
             TextSeat::Exact,
@@ -506,7 +510,9 @@ pub(crate) fn drive_nameplates(
         };
         // The one `"\n<%s>"` slot: a6 subtitle for an NPC, a5 guild for a player (CVar-gated).
         let bracketed = match net.kind {
-            EntityKind::Unit => benilla_protocol::guid::entry(guid.0)
+            EntityKind::Unit => store
+                .and_then(|s| s.0.object_entry())
+                .filter(|&e| e != 0)
                 .and_then(|e| names.creature_subname(e))
                 // vmangos sends "" for most templates: an empty subname is no line.
                 .filter(|s| !s.trim().is_empty()),

@@ -16,6 +16,10 @@ the interface engine are written from scratch, with no original client code, no 
 crates and no bundled game assets. This fork keeps that client as the baseline for significant
 client-side modifications. [`docs/FORK.md`](docs/FORK.md) lists the departures from upstream.
 
+What the real client does is read at its bytes in
+[benilla-re](https://github.com/samwhosung/benilla-re), the reverse engineering benilla is built
+against, by the same client addresses the comments here cite.
+
 ## What's inside
 
 - **Formats:** readers for the whole asset stack (the MPQ patch chain, BLP, DBC, ADT, WDT, WDL, M2
@@ -40,6 +44,7 @@ client-side modifications. [`docs/FORK.md`](docs/FORK.md) lists the departures f
 
 The format readers and the UI engine core are plain Rust with no Bevy in them, and the world
 renderer runs with no game attached. [`docs/MAP.md`](docs/MAP.md) maps every crate and subsystem,
+and [`docs/DEVIATIONS.md`](docs/DEVIATIONS.md) lists everywhere benilla differs from 1.12.1; both are
 generated from the code.
 
 ## Status
@@ -59,7 +64,8 @@ Upstream's remaining fidelity work is tracked as
 
 benilla builds and runs on macOS, Linux and Windows. You need:
 
-- **An English 1.12.1 client (build 5875)** for the game data. benilla only reads it.
+- **A 1.12.1 client (build 5875)** for the game data, in any locale. benilla only reads it, and
+  shows its text in the client's language; development runs on English clients.
 - **A 1.12.1 server with Warden off.** [vmangos](https://github.com/vmangos/core) is what
   development runs against, and it ships with Warden off; cMaNGOS and the other 1.12.1 cores speak
   the same protocol.
