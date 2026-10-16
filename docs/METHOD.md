@@ -27,8 +27,11 @@ crate or a fork. This repository is that fork, so the modification belongs in th
 ## The loop
 
 1. **The baseline first.** For anything that touches behaviour the stock client has, get the
-   mechanism before changing it: its behaviour, a DBC field, a FrameXML line, a packet capture.
-   The names and shapes under `reference/` are the 1.12.1 surface this fork tracks. A
+   mechanism before changing it: its code as
+   [benilla-re](https://github.com/samwhosung/benilla-re) documents it by address, its
+   behaviour, a DBC field, a FrameXML line, a packet capture. The names and shapes under
+   `reference/` are the 1.12.1 surface this fork tracks. A fact benilla-re lacks, or gets wrong, is
+   settled there, as an issue or a finding, and cited here by its client address. A
    modification starts from that fact and then records the departure.
 2. **Build it idiomatically.** Modern Bevy and Rust, performance woven in from the start.
    Implement the mechanism well; do not ape a quirk that is a bug.
@@ -83,6 +86,8 @@ crate or a fork. This repository is that fork, so the modification belongs in th
   Read it to orient; never edit or commit it by hand.
 - `docs/FORK.md`: the current departures from upstream benilla. A modification updates its
   row in the same change. It is the list, not a narrative of the work.
+- `docs/DEVIATIONS.md`: every place benilla differs from 1.12.1, its `Deviates` rows and `Deviation:`
+  comments, generated from the code by `scripts/genmap.sh` at every land; never edited by hand.
 - git: the history. No changelogs, no status docs, no "what we did" narratives.
 - The code: a comment says what the code does and the 1.12 fact behind it, in a line. When
   this fork departs from that fact, the same comment names the departure. No history, no
@@ -91,8 +96,8 @@ crate or a fork. This repository is that fork, so the modification belongs in th
 ## Gates
 
 - **The land gates**: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
-  -- -D warnings`, `cargo test --workspace`, the doc-link and render-pass lints, the player
-  build without the `dev` feature with its own tests, and the engine boot checks, as
+  -- -D warnings`, `cargo test --workspace`, the doc-link lint (a full `cargo doc` of the workspace) and the render-pass lint, the vendored-reference and message-catalog checks, the player
+  build without the `dev` feature, linted and with its own tests, and the engine boot checks, as
   `scripts/gates.sh`. It runs on the tree that lands, before it lands; it is memoized on the
   tree. The tests that read the install or the addon corpus skip where the data is absent, and
   the gate prints the count; where the data is, a skip is a failure (`BENILLA_REQUIRE_DATA=1`).

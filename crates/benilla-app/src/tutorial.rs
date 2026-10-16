@@ -22,7 +22,7 @@ use bevy::prelude::*;
 
 use benilla_ui::script::{ScriptValue, UiScript};
 
-use crate::char_select::ClientState;
+use crate::client_state::ClientState;
 use crate::net::{ClientCommand, EnteredWorldMessage, NetCommands, ObjectStore, SelfPlayer};
 use crate::player::Player;
 use crate::ui_script::{UiFeed, UiInput};
@@ -557,9 +557,12 @@ impl Plugin for TutorialPlugin {
                     on_world_enter.before(run_world_enter_cascade),
                     run_world_enter_cascade.before(feed_tutorials),
                     watch_windows.before(feed_tutorials),
-                    watch_self.after(on_world_enter).before(feed_tutorials),
+                    watch_self
+                        .after(on_world_enter)
+                        .after(crate::player::ControlRestore)
+                        .before(feed_tutorials),
                     // Not before the in-game UI exists: `fired` is taken once, with no `VmMemo`
-                    // behind it, so the login's Welcome and Questgivers fired into the boot VM
+                    // behind it, so the login's Welcome and Questgivers fired into the glue VM
                     // during the one frame it is still live in the world would be lost. `fired`
                     // simply waits for the first frame with an interface.
                     feed_tutorials
@@ -802,10 +805,10 @@ mod tests {
         app.insert_resource(crate::net::NetCommands(tx));
 
         // The deferral window: in the world on the wire, the entry load still owed, and a live
-        // boot VM with no frames.
-        app.insert_resource(State::new(crate::char_select::ClientState::InWorld));
+        // VM with no frames.
+        app.insert_resource(State::new(crate::client_state::ClientState::InWorld));
         app.insert_resource(crate::ui_script::PendingEntryUiLoad);
-        app.insert_non_send_resource(UiScript::new().expect("the boot VM"));
+        app.insert_non_send_resource(UiScript::new().expect("a frameless VM"));
 
         {
             let mut t = app.world_mut().resource_mut::<Tutorials>();

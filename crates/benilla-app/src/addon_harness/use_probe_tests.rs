@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::test_support::link_dir;
 use super::{survey, Used};
 
 /// One throwaway AddOns root, cleaned up on drop even if a test panics; its own temp prefix keeps
@@ -90,7 +91,7 @@ fn the_use_column_can_fail() {
         "#,
         ),
     );
-    // `OnDragStart` fires only past the 4 px threshold, so the drag must actually move.
+    // `OnDragStart` fires only past the drag-start distance, so the drag must actually move.
     fx.addon(
         "RaisesOnDrag",
         &painted_button(
@@ -201,7 +202,6 @@ fn the_use_column_can_fail() {
 /// `!OmniCC` is never `raised`: its output is a `FontString` on an anonymous mouse-disabled frame,
 /// so it is `untouched`. Bagnon's item slots must be reachable (`driven >= 1` on a `BagnonItem*`
 /// frame); whether they raise is not asserted here.
-#[cfg(unix)]
 #[test]
 fn bagnon_is_reachable_and_omnicc_is_not_broken() {
     benilla_formats::wow_data_or_skip!();
@@ -209,7 +209,7 @@ fn bagnon_is_reachable_and_omnicc_is_not_broken() {
     let corpus = benilla_formats::addon_corpus_or_skip!();
     let fx = Fixtures::new("oracle");
     for name in ["!OmniCC", "Bagnon", "Bagnon_Core", "Bagnon_Forever"] {
-        std::os::unix::fs::symlink(corpus.join(name), fx.root().join(name)).unwrap();
+        link_dir(&corpus.join(name), &fx.root().join(name)).unwrap();
     }
     let reports = survey(fx.root());
     let row = |name: &str| {

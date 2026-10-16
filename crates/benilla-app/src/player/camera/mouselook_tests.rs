@@ -191,6 +191,25 @@ fn mouselook_start_turns_the_camera_and_the_character_with_no_button_held() {
     assert!(w.resource::<CameraControl>().is_looking());
 }
 
+/// A right press over bare world that the UI consumed, as a layout-mode Alt press is
+/// (`0x766353`, before any frame sees it), turns nothing; the same press unconsumed turns.
+#[test]
+fn a_press_the_ui_consumed_over_the_world_turns_nothing() {
+    let mut w = world(false);
+    w.insert_resource(crate::ui_script::PlayerUiPressConsumed(true));
+    press(&mut w, MouseButton::Right);
+    frame(&mut w, 40.0);
+    assert_eq!(w.resource::<CameraControl>().look, None);
+    assert_eq!(yaw(&mut w), 0.0, "the camera did not turn");
+
+    let mut w = world(false);
+    w.insert_resource(crate::ui_script::PlayerUiPressConsumed(false));
+    press(&mut w, MouseButton::Right);
+    frame(&mut w, 40.0);
+    assert_eq!(w.resource::<CameraControl>().look, Some(LookButton::Right));
+    assert!(yaw(&mut w) < 0.0, "an unconsumed press turns it");
+}
+
 /// `MouselookStop` (`0x514240`) ends the session: the cursor comes back and the mouse turns
 /// nothing, and `IsMouselooking` answers nil.
 #[test]
@@ -595,7 +614,8 @@ fn a_right_drag_from_a_nameplate_turns_without_a_world_right_click() {
     let turned = yaw(&mut w);
     assert!(turned < 0.0, "dragging turns the camera: {turned}");
     assert_eq!(
-        w.resource::<Hand>().face_yaw, turned,
+        w.resource::<Hand>().face_yaw,
+        turned,
         "a right drag turns the body with the camera"
     );
     assert!(

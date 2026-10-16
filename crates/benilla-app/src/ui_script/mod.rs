@@ -16,9 +16,23 @@ use benilla_world::schedule::WorldStage;
 pub(crate) mod addons;
 mod content;
 pub(crate) mod extract;
+/// The stock glue screens as the session and the instruments see them.
+pub(crate) mod glue;
+/// The stock create screen's catalog off the host's DBC catalogs.
+pub(crate) mod glue_create;
+/// `CGlueMgr`'s screen states over benilla's login, for the stock glue screens.
+pub(crate) mod glue_mgr;
+pub(crate) mod glue_scene;
 mod input;
+/// The server alert's fetch and `LaunchURL`'s browser, for the stock glue screens.
+pub(crate) mod server_alert;
 #[cfg(test)]
-mod layer_tests;
+pub(crate) use input::feed_keys;
+// Test-only: the bindings tests run the UI's wheel sweep ahead of the dispatch pass.
+#[cfg(test)]
+pub(crate) use input::feed_wheel;
+#[cfg(test)]
+pub(crate) mod layer_tests;
 mod load_log;
 mod manifest;
 
@@ -31,7 +45,7 @@ mod session;
 /// The feed gate: a UI feed's input-side early-out, audited by `WOW_FEED_GATE_CHECK=1`.
 pub(crate) mod gate;
 
-pub(crate) use session::VmMemo;
+pub(crate) use session::{VmMemo, WindowMemo};
 
 // Not test-only: the addon harness loads the whole shipped interface under each addon.
 pub(crate) use manifest::default_bindings;
@@ -39,6 +53,7 @@ pub(crate) use manifest::load_default_ui;
 pub(crate) use manifest::load_ingame_ui;
 #[cfg(test)]
 pub(crate) use manifest::{load_stock_bindings, stock_bindings_file};
+pub(crate) use reference_ui::{boot_client_locale, client_locale, client_region};
 
 /// Whether the pointer is over any UI (the egui dev overlay or a player-UI frame), combined by
 /// [`arbitrate_pointer_over_ui`]; gameplay reads it, so it is not the dev plugin's.
@@ -122,6 +137,12 @@ pub(crate) struct UiKeyboardCapture {
 #[derive(Resource, Default)]
 pub(crate) struct PlayerUiClickConsumed(pub(crate) bool);
 
+/// A press the UI consumed this frame, whatever is under the pointer: the layout drag's press
+/// returns at `0x766353`–`0x76635b`, before any frame, the world frame included, sees it, so the
+/// world latch takes no press this frame even with no UI frame hovered.
+#[derive(Resource, Default)]
+pub(crate) struct PlayerUiPressConsumed(pub(crate) bool);
+
 /// Whether the cursor carries a payload, a `Send` mirror. A click on sky with one held never
 /// deselects: the reference gates its nothing-leg `SetSelection(0,0)` on no payload (`0x492d30`).
 #[derive(Resource, Default)]
@@ -143,12 +164,6 @@ pub(crate) struct UiPassState {
     pub(crate) solves_before: u64,
     pub(crate) derives_before: u64,
 }
-
-/// UI chrome under the pointer: [`PointerOverUi`] minus the nameplates, which take the mouse but
-/// not the wheel. The reference has no such bit: a wheel notch walks the strata and falls through
-/// any frame without `OnMouseWheel` to `CGWorldFrame`.
-#[derive(Resource, Default)]
-pub(crate) struct PointerOverUiPanel(pub(crate) bool);
 
 /// The player-UI feed phase, after [`WorldStage::Net`] and ungated (`UnitFeed` is the gated
 /// sub-phase): every push this frame's tick must see, as in the reference's frame, where packet
@@ -264,8 +279,13 @@ pub(crate) fn on_cvar(ev: On<crate::cvars::CvarChanged>, mut scale: ResMut<UiSca
     }
 }
 
-/// `/console reloadUI`: the same deferred rebuild `ReloadUI()` and `/reload` queue.
+/// `/console reloadUI` (`0x4035f0`): a glue rebuild asked for whatever the state
+/// ([`glue::run_pending_glue_rebuild`] spends it), then the same deferred rebuild `ReloadUI()` and
+/// `/reload` queue, which the world alone honours.
 fn console_reload_ui(world: &mut World, _args: &str) -> Vec<String> {
+    if let Some(mut rebuild) = world.get_resource_mut::<glue::GlueRebuild>() {
+        rebuild.request();
+    }
     match world.get_non_send_resource_mut::<UiScript>() {
         Some(mut script) => {
             script.queue_session_request(benilla_ui::script::SessionRequest::ReloadUi);
@@ -283,9 +303,11 @@ impl Plugin for UiScriptPlugin {
         // The quit root runs in `Last`: the close button's `AppExit` is written in `PostUpdate`.
         crate::shutdown::on_app_exit(app, shutdown_on_exit.into_configs());
         app.insert_resource(UiScaleCvar(default_ui_scale()))
+            .init_non_send_resource::<glue_mgr::SharedGlueMgr>()
             .init_resource::<UiAutoScaleCache>()
             .init_resource::<UiFrameCost>()
             .init_resource::<crate::bindings::WheelNotches>()
+            .init_resource::<crate::bindings::WorldWheel>()
             .init_resource::<UiCostWanted>()
             .init_resource::<PointerOverUi>()
             .init_resource::<SyntheticPointer>()
@@ -298,33 +320,52 @@ impl Plugin for UiScriptPlugin {
             .init_resource::<PlayerUiHover>()
             .init_resource::<UiKeyboardCapture>()
             .init_resource::<PlayerUiClickConsumed>()
+            .init_resource::<PlayerUiPressConsumed>()
             .init_resource::<CursorPayloadHeld>()
             .init_resource::<UiClock>()
             .init_resource::<AddOnIdentity>()
             // After `AssetSet::Open`: the VM's first load is the chain's `GlobalStrings.lua`.
-            .add_systems(Startup, setup_script.after(benilla_assets::AssetSet::Open))
+            .add_systems(
+                Startup,
+                // After the CVars load: the glue screens read the agreements as they come up. After
+                // the glyph cache, which measures the text their first show sizes frames by.
+                setup_script
+                    .after(benilla_assets::AssetSet::Open)
+                    .after(crate::cvars::CvarLoad)
+                    .after(crate::ui_text::FontAtlasInit),
+            )
             // The in-game UI loads on world entry, as the reference's does, once the loading cover
             // has presented, so its ~0.5 s never stalls the cover's first frame.
             .add_systems(
-                OnEnter(crate::char_select::ClientState::InWorld),
+                OnEnter(crate::client_state::ClientState::InWorld),
                 lifecycle::arm_entry_ui_load,
             )
             // The shutdown tail: events, then writes, in the reference's order.
             .add_systems(
-                OnExit(crate::char_select::ClientState::InWorld),
+                OnExit(crate::client_state::ClientState::InWorld),
                 end_ui_session,
             )
             // `init_` here and in `UiUnitPlugin`: either plugin may be built alone in a test.
-            .init_resource::<LeavingWorldArmed>()
-            .add_message::<WorldLeaveSweepMessage>()
-            .add_systems(Update, lifecycle::arm_leaving_world_on_self_create)
+            .init_world_leave_sweep()
+            .add_systems(Update, sweep::arm_leaving_world_on_self_create)
             // A queued `ReloadUI()` runs in `PreUpdate`, a frame after its drain (the reference's
             // deferral, `0x495590`) and before every `Update` seed or feed.
             .init_resource::<ReloadUiPending>()
+            .init_resource::<glue::GlueRebuild>()
             // Both are exclusive edges on the VM and must not interleave.
             .add_systems(
                 PreUpdate,
-                (run_pending_reload, lifecycle::run_pending_entry_load).chain(),
+                (
+                    run_pending_reload,
+                    // The glue's `ConsoleExec` lines the last frame left and its top's size
+                    // callback, then the rebuild either asked for.
+                    (glue::drain_glue_console, glue::watch_glue_aspect)
+                        .chain()
+                        .run_if(glue::glue_ui_up),
+                    glue::run_pending_glue_rebuild,
+                    lifecycle::run_pending_entry_load,
+                )
+                    .chain(),
             )
             // The three UI phases in order: feeds after the net drain, the tick, then the paint.
             .configure_sets(
@@ -338,14 +379,21 @@ impl Plugin for UiScriptPlugin {
             )
             // In the feed phase, so an `OnUpdate` reads this frame's `GetFramerate()`.
             .add_systems(Update, feed_framerate.in_set(UiFeed))
-            // The input pass hit-tests the rects the tick just resolved, and runs in-world only.
+            // The input pass hit-tests the rects the tick just resolved, and runs in-world only or
+            // on the stock glue screens.
             .init_resource::<UiPassState>()
-            .init_resource::<PointerOverUiPanel>()
             .add_systems(
                 Update,
                 (
                     extract::tick_script,
-                    input::feed_ui_input.in_set(crate::char_select::InWorldGated),
+                    input::feed_ui_input.run_if(
+                        in_state(crate::client_state::ClientState::InWorld).or(glue::glue_ui_up),
+                    ),
+                    input::feed_ui_wheel.run_if(
+                        in_state(crate::client_state::ClientState::InWorld).or(glue::glue_ui_up),
+                    ),
+                    // Off the walk that just ran, for the pick and the arbiter after the pass.
+                    crate::vplates::seed_plate_hover,
                 )
                     .chain()
                     .in_set(UiInput)
@@ -367,6 +415,25 @@ impl Plugin for UiScriptPlugin {
                 arbitrate_pointer_over_ui
                     .after(UiInput)
                     .before(WorldStage::Input),
+            )
+            .add_message::<server_alert::LaunchUrl>()
+            .add_message::<server_alert::LaunchAddonUrl>()
+            // The stock glue screens' frame, ahead of the login engine, so the manager's asks reach
+            // it in the frame whose Lua made them.
+            .add_systems(
+                Update,
+                (
+                    // After the tick whose Lua called its verbs.
+                    glue_mgr::drive_glue_mgr.after(UiInput),
+                    // Off the roster and the screen the manager and the tick just moved.
+                    glue_scene::feed_stock_glue_preview.in_set(crate::portrait::GluePreviewFeed),
+                    // Each reads only its message, so no state orders it but the sets.
+                    server_alert::open_launched.after(WorldStage::Stream),
+                    server_alert::open_addon_launched.after(WorldStage::Stream),
+                )
+                    .chain()
+                    .before(crate::glue_session::login::LoginPolicy)
+                    .after(WorldStage::Net),
             );
 
         // A UI capture's synthetic unit snapshots, after the real feed so they win.
@@ -390,22 +457,29 @@ fn capture_ui_active(capture: Option<Res<crate::run_mode::CaptureMode>>) -> bool
 fn arbitrate_pointer_over_ui(
     egui: Option<Res<EguiPointerOver>>,
     hover: Res<PlayerUiHover>,
-    plate_hover: Res<crate::vplates::PlateHover>,
     mut over: ResMut<PointerOverUi>,
-    mut panel: ResMut<PointerOverUiPanel>,
 ) {
     // No cinematic term: the hit test finds the full-screen, mouse-enabled `CinematicFrame`.
     over.0 = egui.is_some_and(|e| e.0) || hover.0.is_some();
-    // Chrome excludes the plates; the plate hover is last frame's, as the plate driver runs later.
-    panel.0 = over.0 && plate_hover.0.is_none();
 }
 
 /// The session lifecycle: the VM's birth, identity, death and reload.
 mod lifecycle;
 pub(crate) use lifecycle::{
-    end_ui_session, ingame_ui_up, run_pending_reload, setup_script, AddOnIdentity, LeaveWorldSweep,
-    LeavingWorldArmed, PendingEntryUiLoad, ReloadUiPending, WorldLeaveSweepMessage,
+    end_ui_session, ingame_ui_up, run_pending_reload, setup_script, strings_vm, AddOnIdentity,
+    PendingEntryUiLoad, ReloadUiPending,
 };
+/// The leave-world sweep `0x490a80`: its latch, its schedule and its legs' order.
+mod sweep;
+#[cfg(test)]
+pub(crate) use sweep::test_support as sweep_test;
+#[cfg(test)]
+pub(crate) use sweep::WorldLeaveSweep;
+pub(crate) use sweep::{
+    run_leave_world_sweep, sweep_on_worldport, LeavingWorldArmed, SweepApp, SweepLeg, SweptWorlds,
+};
+#[cfg(test)]
+mod sweep_tests;
 // Test-only: other modules' tests consume these, and a plain re-export would warn unused.
 #[cfg(test)]
 pub(crate) use lifecycle::load_ingame_ui_on_world_entry;
@@ -582,6 +656,7 @@ fn demo_unit_feed(script: Option<NonSendMut<UiScript>>, mut fired: Local<VmMemo<
                     count,
                     // The seed's only item slot is the food stack, which is consumable.
                     consumable: kind == 0x80,
+                    use_spell: None,
                 }),
             );
             // Server-less a slot has no usable state; a live bar's resting state is usable.
@@ -633,7 +708,7 @@ fn demo_unit_feed(script: Option<NonSendMut<UiScript>>, mut fired: Local<VmMemo<
                  if MultiActionBar_Update then MultiActionBar_Update() end",
             );
         }
-        script.fire_event("PLAYER_XP_UPDATE", vec![]);
+        script.fire_event("PLAYER_XP_UPDATE", vec![ScriptValue::Str("player".into())]);
         for token in ["player", "target"] {
             script.fire_event("UNIT_HEALTH", vec![ScriptValue::Str(token.into())]);
         }
@@ -702,6 +777,10 @@ pub(crate) fn load_ui_for_test(script: &benilla_ui::script::UiScript, entry: &st
 
 #[cfg(test)]
 mod cinematic_tests;
+#[cfg(test)]
+mod glue_input_tests;
+#[cfg(test)]
+mod key_walk_tests;
 
 #[cfg(test)]
 mod cast_tests;
@@ -776,7 +855,7 @@ mod faux_scroll_tests;
 #[cfg(test)]
 mod panel_template_tests;
 
-/// The return-shape gate: `reference/1.12-shapes.tsv` against what this client answers.
+/// The return-shape gate: `reference/bindings.tsv` against what this client answers.
 #[cfg(test)]
 mod shape_gate;
 
@@ -784,11 +863,15 @@ mod shape_gate;
 #[cfg(test)]
 mod surface_gate;
 
-/// The event argument-shape gate: every fire site against `reference/1.12-events.tsv`.
+/// The reader of every fire site, for the event gates.
+#[cfg(test)]
+mod fire_scan;
+
+/// The event argument-shape gate: every fire site against `reference/event_args.tsv`.
 #[cfg(test)]
 mod event_shape_gate;
 
-/// The verb-fired event gate, against `reference/1.12-verb-events.tsv`.
+/// The verb-fired event gate, against `reference/verb_events.tsv`.
 #[cfg(test)]
 mod verb_event_gate;
 
@@ -805,6 +888,9 @@ mod uiparent_tests;
 
 #[cfg(test)]
 mod trainer_tests;
+
+#[cfg(test)]
+mod auction_tests;
 
 #[cfg(test)]
 mod bank_tests;
@@ -966,6 +1052,8 @@ mod dressup_tests;
 mod minimap_tests;
 
 #[cfg(test)]
+mod protected_gate_tests;
+#[cfg(test)]
 mod spellbook_tests;
 
 #[cfg(test)]
@@ -1037,74 +1125,29 @@ mod seam_scale_tests {
 mod pointer_arbiter_tests {
     use super::*;
 
-    /// A world to run the arbiter in: its inputs and its two outputs, nothing else.
+    /// A world to run the arbiter in: its inputs and its output, nothing else.
     fn app() -> App {
         let mut app = App::new();
         app.init_resource::<PlayerUiHover>()
-            .init_resource::<crate::vplates::PlateHover>()
             .init_resource::<PointerOverUi>()
-            .init_resource::<PointerOverUiPanel>()
             .add_systems(Update, arbitrate_pointer_over_ui);
         app
     }
 
+    /// The camera reads this flag (`0x7662c0` gives a mouse-down to exactly one frame, a plate
+    /// included); the wheel does not (`ui_script::input`'s sweep).
     #[test]
-    fn a_hovered_plate_is_ui_but_not_chrome() {
-        let mut app = app();
-        let plate = app.world_mut().spawn_empty().id();
-        app.world_mut().resource_mut::<PlayerUiHover>().0 = Some(7);
-        app.world_mut()
-            .resource_mut::<crate::vplates::PlateHover>()
-            .0 = Some(plate);
-        app.update();
-        assert!(
-            app.world().resource::<PointerOverUi>().0,
-            "the plate takes the pointer"
-        );
-        assert!(
-            !app.world().resource::<PointerOverUiPanel>().0,
-            "…and the WHEEL looks straight through it"
-        );
-    }
-
-    /// `PointerOverUi` stays set over a plate. The wheel reads chrome and walks past a plate.
-    /// A drag that starts on a plate is `latch_world_mouse`'s exception, not a change to
-    /// this flag.
-    #[test]
-    fn a_plate_sets_pointer_over_ui_and_the_wheel_looks_through_it() {
-        let mut app = app();
-        let plate = app.world_mut().spawn_empty().id();
-        app.world_mut().resource_mut::<PlayerUiHover>().0 = Some(7);
-        app.world_mut()
-            .resource_mut::<crate::vplates::PlateHover>()
-            .0 = Some(plate);
-        app.update();
-        // The flag stays set. The left-orbit exception lives in the camera latch.
-        assert!(
-            app.world().resource::<PointerOverUi>().0,
-            "a plate still sets PointerOverUi"
-        );
-        // …and `bindings`' wheel branch reads this one.
-        assert!(
-            !app.world().resource::<PointerOverUiPanel>().0,
-            "the wheel must still reach the world over a plate"
-        );
-    }
-
-    #[test]
-    fn a_hovered_panel_is_both() {
+    fn a_hovered_frame_is_ui() {
         let mut app = app();
         app.world_mut().resource_mut::<PlayerUiHover>().0 = Some(7);
         app.update();
         assert!(app.world().resource::<PointerOverUi>().0);
-        assert!(app.world().resource::<PointerOverUiPanel>().0);
     }
 
     #[test]
-    fn no_hover_is_neither() {
+    fn no_hover_is_not() {
         let mut app = app();
         app.update();
         assert!(!app.world().resource::<PointerOverUi>().0);
-        assert!(!app.world().resource::<PointerOverUiPanel>().0);
     }
 }

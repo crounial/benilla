@@ -470,9 +470,9 @@ impl super::UiScript {
 
     /// Install the host's world-to-map projection behind `GetWorldLocMapPosition` and the
     /// landmark list.
-    pub fn set_world_loc_projector(&mut self, projector: super::WorldLocProjector) {
+    pub fn set_world_loc_projector(&mut self, projector: Box<super::WorldLocFn>) {
         let mut model = self.model_mut();
-        model.world_loc_projector = Some(projector);
+        model.world_loc_projector = Some(projector.into());
         refresh_landmarks(&mut model);
     }
 
@@ -870,7 +870,14 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                     .and_then(|i| model.worldmap.landmarks.get(i).cloned())
             };
             let Some(l) = landmark else {
-                return Ok(MultiValue::from_vec(vec![Value::Nil]));
+                // `0x4a88b3`: nil, nil, 0, 0, 0.
+                return Ok(super::binding_abi::tuple(&[
+                    None,
+                    None,
+                    Some(0),
+                    Some(0),
+                    Some(0),
+                ]));
             };
             let description = match l.description.is_empty() {
                 true => Value::Nil,
@@ -908,7 +915,16 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                     .and_then(|i| revealed_overlays(&model.worldmap).get(i).cloned().cloned())
             };
             let Some(o) = overlay else {
-                return Ok(MultiValue::from_vec(vec![Value::Nil]));
+                // `0x4a8b53`: nil, then six 0.
+                return Ok(super::binding_abi::tuple(&[
+                    None,
+                    Some(0),
+                    Some(0),
+                    Some(0),
+                    Some(0),
+                    Some(0),
+                    Some(0),
+                ]));
             };
             Ok(MultiValue::from_vec(vec![
                 Value::String(lua.create_string(&o.texture)?),

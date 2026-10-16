@@ -276,6 +276,8 @@ pub(crate) struct AttackSeam<'w, 's> {
     pub(crate) ecs: Commands<'w, 's>,
     /// Our own entity.
     pub(crate) me: Query<'w, 's, Entity, With<crate::net::SelfPlayer>>,
+    /// Our own descriptor, for [`Self::player_is_charmed`].
+    self_store: Query<'w, 's, &'static crate::net::ObjectStore, With<crate::net::SelfPlayer>>,
     /// The open loot, which the selection teardown closes when it loots the outgoing target.
     pub(crate) loot: ResMut<'w, crate::ui_loot::LootState>,
     /// The loot latch: the teardown's close drops it, and the right-click loot legs arm it.
@@ -283,6 +285,16 @@ pub(crate) struct AttackSeam<'w, 's> {
 }
 
 impl AttackSeam<'_, '_> {
+    /// `SelectTarget`'s first return (`0x493589`-`0x49359c`): the active player is charmed
+    /// (`UNIT_FIELD_CHARMEDBY`), and whatever the guid, a select and a deselect alike return before
+    /// they touch anything.
+    pub(crate) fn player_is_charmed(&self) -> bool {
+        self.self_store
+            .iter()
+            .next()
+            .is_some_and(|me| me.0.unit_charmed_by().is_some())
+    }
+
     /// The selection teardown's loot close (`0x493910`, `0x493959`–`0x493974`): a window looting
     /// the outgoing selection closes as `CloseLoot` does, its release ahead of anything the new
     /// selection sends. The close's dead-unit deselect (`0x48f369`) targets the selection already
@@ -290,6 +302,11 @@ impl AttackSeam<'_, '_> {
     /// `CMSG_SET_SELECTION` 0 (`0x493a2a`), which this does not.
     pub(crate) fn close_loot_on(&mut self, outgoing: u64) {
         if self.loot.source() == Some(outgoing) {
+            // `dl` clear (`0x493970`): a disenchant window with rows left is swept, not closed.
+            if self.loot.disenchant_holds() {
+                self.loot.owe_sweep();
+                return;
+            }
             debug!("target: the selection teardown closes the loot on {outgoing:#x}");
             crate::ui_loot::close_interaction(
                 &mut self.loot,
@@ -349,6 +366,12 @@ pub(crate) struct CastEvent {
     pub(crate) entity: Entity,
     pub(crate) spell_id: u32,
     pub(crate) kind: CastEventKind,
+    /// `SMSG_SPELL_GO`'s cast flags, 0 on every other edge: the tradeskill repeat's hook skips a
+    /// GO with `0x41` set (`0x6e81de`, vmangos `Spell.h:54`).
+    pub(crate) cast_flags: u16,
+    /// `SMSG_SPELL_GO`'s first guid is an item, not the caster: the tradeskill repeat's hook runs
+    /// only when that guid is the player (`0x6e81d3`-`0x6e81dc`).
+    pub(crate) item_cast: bool,
     /// `PlaySeq` stamp, carried to the kit's `EmoteAnim`.
     pub(crate) seq: u64,
 }
