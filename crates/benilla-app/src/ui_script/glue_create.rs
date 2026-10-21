@@ -225,6 +225,11 @@ mod tests {
         );
         assert_eq!(c.class_lists[&3], [1, 2, 3, 4, 5]);
         assert_eq!(
+            c.class_lists[&7],
+            [1, 2, 4, 8, 9],
+            "gnome paladin is offered on the create screen"
+        );
+        assert_eq!(
             c.classes[&11],
             GlueCreateClass {
                 name: "Druid".into(),

@@ -210,12 +210,24 @@ impl CharCreateCatalog {
 
     /// The create screen's class list for `race`, the builder `0x4706b0`: every CharBaseInfo row of
     /// the race in file order, less the literal `race == 3 && class == 8` (`0x4706e3`, `0x47075b`).
+    /// This fork then slots [`FORK_COMBOS`] in by class id. 1.12.1's builder has no gnome paladin.
     pub fn class_list(&self, race: u8) -> Vec<u8> {
-        self.base_info
+        let mut list: Vec<u8> = self
+            .base_info
             .iter()
             .filter(|&&(r, c)| r == race && !(r == 3 && c == 8))
             .map(|&(_, c)| c)
-            .collect()
+            .collect();
+        for &(r, c) in &FORK_COMBOS {
+            if r == race && !list.contains(&c) {
+                let at = list
+                    .iter()
+                    .position(|&existing| existing > c)
+                    .unwrap_or(list.len());
+                list.insert(at, c);
+            }
+        }
+        list
     }
 
     /// NameGen's rows in file order; empty when the table did not load.
@@ -747,8 +759,8 @@ mod tests {
     }
 
     /// The create screen's sources in file order: ChrRaces' rows with their flags and templates
-    /// (Goblin flagged `0x1`), the class lists in CharBaseInfo row order less Dwarf-Mage, and
-    /// NameGen's rows by race then sex, male first.
+    /// (Goblin flagged `0x1`), the class lists in CharBaseInfo row order less Dwarf-Mage, plus
+    /// this fork's gnome paladin, and NameGen's rows by race then sex, male first.
     #[test]
     fn the_create_screens_rows_in_file_order() {
         let data = crate::wow_data_or_skip!();
@@ -776,6 +788,11 @@ mod tests {
         assert_eq!(cat.race_name(9), Some("Goblin"), "every row is kept");
         assert_eq!(cat.class_list(3), [1, 2, 3, 4, 5], "no Dwarf Mage");
         assert_eq!(cat.class_list(8), [1, 3, 4, 5, 7, 8]);
+        assert_eq!(
+            cat.class_list(7),
+            [1, 2, 4, 8, 9],
+            "gnome paladin is this fork's pair, in class-id order"
+        );
         assert!(cat.class_list(9).is_empty());
         let gen = cat.name_gen();
         assert_eq!(gen.len(), 1405);

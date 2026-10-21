@@ -441,7 +441,7 @@ fn drive_vplates(
             if store.is_some_and(|s| s.0.unit_is_ghost_visual()) {
                 continue;
             }
-            if (tf.translation - self_tf.translation).length_squared() > MAX_DIST_SQ {
+            if !in_plate_range(self_tf.translation, tf.translation) {
                 continue;
             }
             // A CREATEDBY owner, no SUMMONEDBY owner and flags bit 9 (`0x200`): no plate in either
