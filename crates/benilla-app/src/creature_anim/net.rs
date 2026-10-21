@@ -1,22 +1,24 @@
 //! The animation layer's packet handlers: each resolves a guid and writes one message to play on a
-//! streamed unit. The swing record and the environmental-damage log also feed
-//! [`crate::combat_log`], whose handlers are registered first and so run first.
+//! streamed unit. The environmental-damage log also feeds [`crate::combat_log`], whose handler is
+//! registered first and so runs first. The swing's handler registers ahead of the combat log's
+//! (`net_handler_ahead`): `0x62578d` flushes and dispatches the victim's feedback before it
+//! writes the packet's line, last (`0x625a2c`, `0x625a78`).
 
 use benilla_protocol::messages::{AttackSwingError, AttackerState, EnvironmentalDamageLog};
 use benilla_protocol::{SessionEvent, SessionEventKind};
 use bevy::prelude::*;
 
+use super::impact::{receive_swing, stop_swing, ImpactSinks};
 use super::{
-    Engaged, EnvDamageTable, KitPush, MountFlourish, PlaySeq, RangedHold, SheathRequest,
-    SwingFlush, SwingImpact, SwingMessage,
+    Engaged, EnvDamageTable, KitPush, MountFlourish, PendingImpacts, PlaySeq, RangedHold,
+    SheathRequest, SwingImpact, SwingMessage,
 };
 use crate::net::{AiReactionMessage, EmoteKind, EmoteMessage, GuidIndex, NetHandlerApp, SelfGuid};
 use crate::swing_refusal::SwingRefusalEdge;
 use crate::ui_action::{UiError, UiErrorKeys};
-use crate::ui_unit::CombatTextEvent;
 
 /// Register the layer's handlers, from [`super::CreatureAnimPlugin`].
-pub(super) fn register(app: &mut App) {
+pub(crate) fn register(app: &mut App) {
     use SessionEventKind as K;
     app.net_handler(K::AttackStart, on_attack_start)
         .net_handler(K::AttackStop, on_attack_stop)
@@ -28,7 +30,7 @@ pub(super) fn register(app: &mut App) {
         .net_handler(K::TextEmote, on_text_emote)
         .net_handler(K::Emote, on_emote)
         .net_handler(K::PlaySpellVisual, on_play_spell_visual)
-        .net_handler(K::AttackerState, on_attacker_state)
+        .net_handler_ahead(K::AttackerState, on_attacker_state)
         .net_handler(K::EnvironmentalDamageLog, on_environmental_damage_log);
 }
 
@@ -42,10 +44,18 @@ fn on_attack_stop(
     In(ev): In<SessionEvent>,
     mut commands: Commands,
     index: Res<GuidIndex>,
-    mut flushes: MessageWriter<SwingFlush>,
+    mut pending: ResMut<PendingImpacts>,
+    mut sinks: ImpactSinks,
 ) {
     if let SessionEvent::AttackStop { attacker, victim } = ev {
-        attack_stop(attacker, victim, &mut commands, &index, &mut flushes);
+        attack_stop(
+            attacker,
+            victim,
+            &mut commands,
+            &index,
+            &mut pending,
+            &mut sinks,
+        );
     }
 }
 
@@ -67,9 +77,9 @@ fn on_swing_refusal(In(ev): In<SessionEvent>, mut edges: MessageWriter<SwingRefu
     }
 }
 
-fn on_feign_death_resisted(In(ev): In<SessionEvent>, mut errors: ResMut<UiErrorKeys>) {
+fn on_feign_death_resisted(In(ev): In<SessionEvent>, errors: Res<UiErrorKeys>) {
     if let SessionEvent::FeignDeathResisted = ev {
-        feign_death_resisted(&mut errors);
+        feign_death_resisted(&errors);
     }
 }
 
@@ -88,7 +98,7 @@ fn on_text_emote(
     In(ev): In<SessionEvent>,
     index: Res<GuidIndex>,
     mut out: MessageWriter<EmoteMessage>,
-    mut chat_log: ResMut<crate::ui_chat::ChatLog>,
+    chat_log: Res<crate::ui_chat::ChatLog>,
 ) {
     if let SessionEvent::TextEmote {
         guid,
@@ -96,14 +106,7 @@ fn on_text_emote(
         target_name,
     } = ev
     {
-        self::text_emote(
-            guid,
-            text_emote,
-            target_name,
-            &index,
-            &mut out,
-            &mut chat_log,
-        );
+        self::text_emote(guid, text_emote, target_name, &index, &mut out, &chat_log);
     }
 }
 
@@ -118,11 +121,10 @@ fn on_attacker_state(
     index: Res<GuidIndex>,
     self_guid: Res<SelfGuid>,
     mut swings: MessageWriter<SwingMessage>,
-    mut impacts: MessageWriter<SwingImpact>,
-    mut center: MessageWriter<CombatTextEvent>,
     mut sheaths: MessageWriter<SheathRequest>,
     mut edges: MessageWriter<SwingRefusalEdge>,
-    stores: Query<&mut crate::net::ObjectStore>,
+    mut pending: ResMut<PendingImpacts>,
+    mut sinks: ImpactSinks,
     mut play_seq: ResMut<PlaySeq>,
 ) {
     if let SessionEvent::AttackerState(s) = ev {
@@ -131,11 +133,10 @@ fn on_attacker_state(
             &index,
             &self_guid,
             &mut swings,
-            &mut impacts,
-            &mut center,
             &mut sheaths,
             &mut edges,
-            &stores,
+            &mut pending,
+            &mut sinks,
             play_seq.next(),
         );
     }
@@ -184,13 +185,13 @@ fn attack_stop(
     victim: u64,
     commands: &mut Commands,
     index: &GuidIndex,
-    flushes: &mut MessageWriter<SwingFlush>,
+    pending: &mut PendingImpacts,
+    sinks: &mut ImpactSinks,
 ) {
     debug!("net: attack stop {attacker:#x} → {victim:#x}");
     if let Some(&e) = index.0.get(&attacker) {
         commands.entity(e).remove::<Engaged>();
-        // `0x624e40`: a pending swing flushes as text only; death and stun arrive as this packet.
-        flushes.write(SwingFlush(e));
+        stop_swing(e, pending, sinks);
     }
 }
 
@@ -208,9 +209,9 @@ fn cancel_combat(edges: &mut MessageWriter<SwingRefusalEdge>) {
 /// `SMSG_FEIGN_DEATH_RESISTED`: one red "Resisted" line and nothing else. The reference's handler
 /// `0x6e9800` is a bare `DisplayError(421)` (`0x496720`), with no latch and no state. vmangos sends
 /// it together with `SMSG_CANCEL_COMBAT` (`Unit.cpp:9469-9470`).
-fn feign_death_resisted(errors: &mut UiErrorKeys) {
+fn feign_death_resisted(errors: &UiErrorKeys) {
     debug!("net: feign death resisted");
-    errors.0.push(UiError::key("ERR_FEIGN_DEATH_RESISTED"));
+    errors.push(UiError::key("ERR_FEIGN_DEATH_RESISTED"));
 }
 
 /// A creature flared aggro or a stealth pre-aggro alert (`SMSG_AI_REACTION`).
@@ -233,18 +234,17 @@ fn ai_reaction(
 }
 
 /// One melee swing (`SMSG_ATTACKERSTATEUPDATE`): the attacker's swing plays now and the victim's
-/// feedback waits for the clip's attack-hit key (`0x6247d0`), except the center combat text, which
-/// the client shows at parse (`0x6255b0` → `0x629d30` → `0x703f50`).
+/// feedback waits for the clip's attack-hit key (`0x6247d0`); the combat-log line and its
+/// `COMBAT_TEXT_UPDATE` word come off the same packet in [`crate::combat_log`], after this.
 fn attacker_state(
-    mut s: AttackerState,
+    s: AttackerState,
     index: &GuidIndex,
     self_guid: &SelfGuid,
     swings: &mut MessageWriter<SwingMessage>,
-    impacts: &mut MessageWriter<SwingImpact>,
-    center: &mut MessageWriter<CombatTextEvent>,
     sheaths: &mut MessageWriter<SheathRequest>,
     edges: &mut MessageWriter<SwingRefusalEdge>,
-    stores: &Query<&mut crate::net::ObjectStore>,
+    pending: &mut PendingImpacts,
+    sinks: &mut ImpactSinks,
     seq: u64,
 ) {
     let victim = index.0.get(&s.victim).copied();
@@ -262,28 +262,7 @@ fn attacker_state(
             ),
         );
     }
-    // The full-block synthesis (`0x625e20`): a resolved victim, no damage and a blocked amount
-    // read as state 5, BLOCK, before any consumer; a partial block stays state 1.
-    if victim.is_some() && s.damage == 0 && s.blocked != 0 {
-        s.victim_state = 5;
-    }
-    // The center text for a hit on us, after the synthesis so a full block reads BLOCK, not MISS.
-    if self_guid.0 == Some(s.victim) {
-        if let Some((message_type, data, extra)) = crate::combat_log::text::melee_center_text(
-            s.hit_info,
-            s.victim_state,
-            s.damage,
-            s.absorb,
-            s.resist,
-            s.blocked,
-        ) {
-            center.write(CombatTextEvent {
-                message_type,
-                data,
-                extra,
-            });
-        }
-    }
+    let s = crate::combat_log::read_swing(s, index, &sinks.stores);
     let swing = SwingMessage {
         attacker: Entity::PLACEHOLDER, // filled per branch below
         victim,
@@ -302,18 +281,21 @@ fn attacker_state(
             state: 1,
             ceremony: false,
         });
-        swings.write(SwingMessage {
+        let swing = SwingMessage {
             attacker: e,
             ..swing
-        });
+        };
+        receive_swing(swing, pending, sinks);
+        swings.write(swing);
     } else if swing.victim.is_some_and(|v| {
         // The unresolved-attacker leg (`0x625823` → `0x625a3e`) calls the gated dispatcher
         // (`0x625a6d` → `0x624530`), so the lootable gate applies here too.
-        !stores.get(v).is_ok_and(|s| s.0.unit_lootable())
+        !sinks.stores.get(v).is_ok_and(|s| s.0.unit_lootable())
     }) {
         // An attacker we cannot resolve cannot swing, so the victim's feedback fires now, in
-        // full. The placeholder attacker resolves nowhere (blood defaults to the front).
-        impacts.write(SwingImpact {
+        // full, before the line. The placeholder attacker resolves nowhere (blood defaults to
+        // the front).
+        sinks.fire(SwingImpact {
             swing,
             text_only: false,
             natural: None,
@@ -330,7 +312,7 @@ fn text_emote(
     target_name: String,
     index: &GuidIndex,
     out: &mut MessageWriter<EmoteMessage>,
-    chat_log: &mut crate::ui_chat::ChatLog,
+    chat_log: &crate::ui_chat::ChatLog,
 ) {
     out.write(EmoteMessage {
         guid,

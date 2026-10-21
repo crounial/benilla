@@ -17,8 +17,9 @@ use crate::entities::ItemDisplays;
 use crate::items::Items;
 use crate::names::NameCache;
 use crate::net::{ClientCommand, Guid, GuidIndex, NetCommands, ObjectStore, SelfPlayer};
+use crate::query_cache::Ask;
 use crate::ui_action::{show_messages, ui_error_text, MessageSink, Shown, Spells, UiError};
-use crate::ui_script::{SweepApp, SweepLeg, UiFeed, UiInput};
+use crate::ui_script::{SweepApp, SweepLeg, UiFeed};
 use crate::ui_session::{CoreCloses, LatchApp, LatchedWindow, NpcWindow};
 
 /// The wire packet that opened the current panel.
@@ -59,6 +60,11 @@ pub(crate) struct QuestGiver {
     /// vmangos sends), per guid, so a live probe can tell a drop from a query never sent.
     refused: HashMap<u64, u32>,
     refused_count: u32,
+    /// Panel publishes so far, and the last one [`feed_quest`] asked for: a publish fires the
+    /// panel's event, on which the stock frame calls `GetQuestItemInfo`, which looks the item up
+    /// with a callback (`0x5017de`).
+    panels: u64,
+    panels_asked: u64,
 }
 
 impl QuestGiver {
@@ -66,6 +72,7 @@ impl QuestGiver {
     pub(crate) fn open(&mut self, npc: u64, view: QuestView) {
         self.npc = Some(npc);
         self.view = Some(view);
+        self.panels = self.panels.wrapping_add(1);
         // `0x500bd0` clears the already-acted latch (`0x500d91`) and the chosen reward
         // (`0x500d8c`) on every panel publish.
         self.acted = false;
@@ -139,16 +146,6 @@ impl QuestGiver {
         self.statuses.get(&npc).copied()
     }
 
-    /// The open panel's title if it shows `quest_id`: the `%s` of a refusal naming the quest.
-    pub(crate) fn view_title(&self, quest_id: u32) -> Option<String> {
-        match self.view.as_ref()? {
-            QuestView::Detail(d) if d.quest_id == quest_id => Some(d.title.clone()),
-            QuestView::Progress(p) if p.quest_id == quest_id => Some(p.title.clone()),
-            QuestView::Reward(o) if o.quest_id == quest_id => Some(o.title.clone()),
-            _ => None,
-        }
-    }
-
     /// Queue a message for [`feed_quest`]; its key's catalog row picks the surface.
     pub(crate) fn push_message(&mut self, msg: UiError) {
         self.messages.push(msg);
@@ -196,6 +193,8 @@ pub(crate) fn questgiver_failed_key(reason: u32) -> &'static str {
 mod lines;
 mod net;
 
+#[cfg(test)]
+pub(crate) use lines::test_template;
 pub(crate) use lines::{QuestLine, QuestLines};
 
 pub(crate) struct UiQuestPlugin;
@@ -213,7 +212,7 @@ impl Plugin for UiQuestPlugin {
                     // The feed before the input pass and the drain after it, so a click goes out
                     // the same frame.
                     feed_quest.in_set(UiFeed),
-                    drain_quest.after(UiInput),
+                    drain_quest.in_set(crate::ui_script::UiDrain),
                 ),
             );
     }
@@ -299,13 +298,14 @@ pub(crate) fn row_is_one_click(icon: u32) -> bool {
 type Pool = Vec<(u32, u32)>;
 
 /// One wire item row for Lua; the name and quality are `None` and white until the template lands.
+/// Read as `ask` says: `GetQuestItemInfo` looks it up with a callback (`0x5017de`).
 fn resolve_item(
     it: &QuestRewardItem,
     items: &Items,
     icons: Option<&ItemDisplays>,
-    commands: &NetCommands,
+    ask: Ask<'_>,
 ) -> QuestItemView {
-    let template = items.template(it.item_id, 0, commands);
+    let template = items.template(it.item_id, 0, ask);
     let name = template.map(|t| t.name.clone());
     let quality = template.map(|t| t.quality).unwrap_or(1);
     let texture = icons
@@ -330,10 +330,10 @@ fn resolve_items(
     src: &[QuestRewardItem],
     items: &Items,
     icons: Option<&ItemDisplays>,
-    commands: &NetCommands,
+    ask: Ask<'_>,
 ) -> Vec<QuestItemView> {
     src.iter()
-        .map(|it| resolve_item(it, items, icons, commands))
+        .map(|it| resolve_item(it, items, icons, ask))
         .collect()
 }
 
@@ -360,7 +360,7 @@ fn snapshot(
     giver: &QuestGiver,
     items: &Items,
     icons: Option<&ItemDisplays>,
-    commands: &NetCommands,
+    ask: Ask<'_>,
     macros: &crate::npc_text::MacroContext,
     spells: Option<&Spells>,
 ) -> Option<QuestState> {
@@ -396,8 +396,8 @@ fn snapshot(
             title: sub(&d.title),
             body: sub(&d.details),
             objectives: sub(&d.objectives),
-            choices: resolve_items(&d.choices, items, icons, commands),
-            rewards: resolve_items(&d.rewards, items, icons, commands),
+            choices: resolve_items(&d.choices, items, icons, ask),
+            rewards: resolve_items(&d.rewards, items, icons, ask),
             reward_money: d.money.max(0) as u32,
             reward_spell: reward_spell_view(d.reward_spell, spells),
             ..Default::default()
@@ -406,7 +406,7 @@ fn snapshot(
             panel: QuestPanel::Progress,
             title: sub(&p.title),
             body: sub(&p.request_text),
-            required: resolve_items(&p.required_items, items, icons, commands),
+            required: resolve_items(&p.required_items, items, icons, ask),
             required_money: p.required_money,
             completable: p.is_complete,
             ..Default::default()
@@ -415,8 +415,8 @@ fn snapshot(
             panel: QuestPanel::Reward,
             title: sub(&o.title),
             body: sub(&o.offer_text),
-            choices: resolve_items(&o.choices, items, icons, commands),
-            rewards: resolve_items(&o.rewards, items, icons, commands),
+            choices: resolve_items(&o.choices, items, icons, ask),
+            rewards: resolve_items(&o.rewards, items, icons, ask),
             reward_money: o.money.max(0) as u32,
             reward_spell: reward_spell_view(o.reward_spell, spells),
             ..Default::default()
@@ -436,7 +436,7 @@ fn panel_event(panel: QuestPanel) -> &'static str {
 /// Push the quest view into the VM and fire its events: a panel's open event on a new panel,
 /// `QUEST_ITEM_UPDATE` on a content change. The close is the core's ([`close_core`]).
 pub(crate) fn feed_quest(
-    script: Option<NonSendMut<UiScript>>,
+    mut hosted_vm: crate::script_calls::HostedVm,
     mut giver: ResMut<QuestGiver>,
     objects: crate::net::Objects,
     items: Res<Items>,
@@ -453,76 +453,84 @@ pub(crate) fn feed_quest(
     mut last_name: crate::ui_script::WindowMemo<Option<String>>,
     mut closes: CoreCloses,
 ) {
-    let Some(mut script) = script else {
-        return;
-    };
-    let last = last.get(&script);
-    let last_name = last_name.get(&script);
-    if closes.since_last(&script, NpcWindow::Quest) {
-        *last = None;
-        *last_name = None;
-    }
-    if giver.take_completed_fanfare() {
-        script.queue_sound_kit("QUESTCOMPLETED");
-    }
-    // Before the snapshot's early-out, so a refusal that closes the panel still prints.
-    let lines: Vec<Shown> = giver
-        .take_messages()
-        .into_iter()
-        .filter_map(|msg| {
-            let get = |key: &str| script.lua().globals().get::<String>(key).ok();
-            ui_error_text(&msg, &get).map(|text| Shown::keyed(msg.key, text))
-        })
-        .collect();
-    show_messages(&mut script, &mut sink, "ui_quest", lines);
-    let player = crate::npc_text::player_identity(&self_q, &names, &commands, unit_names.get());
-    let fresh = snapshot(
-        &giver,
-        &items,
-        icons.as_deref(),
-        &commands,
-        &crate::npc_text::MacroContext {
-            subject: player.as_ref(),
-            states: &states,
-        },
-        spells.as_deref(),
-    );
-    // The background is the source object's material, never a creature's and never on the wire
-    // (`GetQuestBackgroundMaterial`, `0x502230`); the reader window's binding shares its body.
-    let fresh = fresh.map(|mut st| {
-        st.background_material = giver.npc.and_then(|source| {
-            crate::ui_item_text::object_material(
-                source,
-                &objects,
-                &items,
-                &go_templates,
-                materials.as_deref(),
-                &commands,
-            )
-        });
-        st
-    });
-    let npc_name = giver
-        .npc
-        .and_then(|g| names.resolve(&objects, g, &commands).map(str::to_string));
-    let name_changed = *last_name != npc_name;
-    if fresh == *last && !name_changed {
-        return;
-    }
-    script.set_quest(fresh.clone());
-    // The panel events carry no argument: the frame reads `UnitName("npc")` (`QuestFrame.lua:63`).
-    // A close is the core's, which told the VM; a disconnect's clear tells it nothing.
-    if let Some(f) = &fresh {
-        let same_panel = last.as_ref().is_some_and(|l| l.panel == f.panel);
-        let event = if same_panel {
-            "QUEST_ITEM_UPDATE"
-        } else {
-            panel_event(f.panel)
+    hosted_vm.run(|script| {
+        let Some(script) = script else {
+            return;
         };
-        script.fire_event(event, vec![]);
-    }
-    *last = fresh;
-    *last_name = npc_name;
+        let last = last.get(script);
+        let last_name = last_name.get(script);
+        if closes.since_last(script, NpcWindow::Quest) {
+            *last = None;
+            *last_name = None;
+        }
+        if giver.take_completed_fanfare() {
+            script.queue_sound_kit("QUESTCOMPLETED");
+        }
+        // Before the snapshot's early-out, so a refusal that closes the panel still prints.
+        let lines: Vec<Shown> = giver
+            .take_messages()
+            .into_iter()
+            .filter_map(|msg| {
+                let get = |key: &str| script.lua().globals().get::<String>(key).ok();
+                ui_error_text(&msg, &get).map(|text| Shown::keyed(msg.key, text))
+            })
+            .collect();
+        show_messages(script, &mut sink, "ui_quest", lines);
+        let player = crate::npc_text::player_identity(&self_q, &names, unit_names.get());
+        // A panel's publish, or a window this VM has not shown, is the stock frame's getter calls.
+        let ask = Ask::at(
+            last.is_none() || giver.panels != giver.panels_asked,
+            &commands,
+        );
+        giver.panels_asked = giver.panels;
+        let fresh = snapshot(
+            &giver,
+            &items,
+            icons.as_deref(),
+            ask,
+            &crate::npc_text::MacroContext {
+                subject: player.as_ref(),
+                states: &states,
+            },
+            spells.as_deref(),
+        );
+        // The background is the source object's material, never a creature's and never on the wire
+        // (`GetQuestBackgroundMaterial`, `0x502230`); the reader window's binding shares its body.
+        let fresh = fresh.map(|mut st| {
+            st.background_material = giver.npc.and_then(|source| {
+                crate::ui_item_text::object_material(
+                    source,
+                    &objects,
+                    &items,
+                    &go_templates,
+                    materials.as_deref(),
+                )
+            });
+            st
+        });
+        let npc_name = giver
+            .npc
+            .and_then(|g| names.resolve(&objects, g, ask).map(str::to_string));
+        let name_changed = *last_name != npc_name;
+        if fresh == *last && !name_changed {
+            return;
+        }
+        script.set_quest(fresh.clone());
+        // The panel events carry no argument: the frame reads `UnitName("npc")`
+        // (`QuestFrame.lua:63`). A close is the core's, which told the VM; a disconnect's clear
+        // tells it nothing.
+        if let Some(f) = &fresh {
+            let same_panel = last.as_ref().is_some_and(|l| l.panel == f.panel);
+            let event = if same_panel {
+                "QUEST_ITEM_UPDATE"
+            } else {
+                panel_event(f.panel)
+            };
+            script.fire_event(event, vec![]);
+        }
+        *last = fresh;
+        *last_name = npc_name;
+    })
 }
 
 /// `CloseQuest()`'s binding `0x501a10`, and `DeclineQuest`'s teardown leg (`0x5014aa`): the core
@@ -583,7 +591,7 @@ fn decline_leg(npc: u64, acted: bool, close_on_cancel: u32, npc_flags: Option<u3
 
 /// Drain the Lua intents: greeting-row selects and the panel buttons, each to its `CMSG`.
 fn drain_quest(
-    script: Option<NonSendMut<UiScript>>,
+    mut hosted_vm: crate::script_calls::HostedVm,
     mut giver: ResMut<QuestGiver>,
     commands: Res<NetCommands>,
     index: Res<GuidIndex>,
@@ -591,129 +599,131 @@ fn drain_quest(
     mut tutorials: Option<MessageWriter<crate::tutorial::TutorialEvent>>,
     mut world_commands: Commands,
 ) {
-    let Some(mut script) = script else {
-        return;
-    };
-    let Some(npc) = giver.npc else {
-        // Drain the VM anyway, so intents do not queue against a closed window.
-        script.take_quest_selects();
-        script.take_quest_actions();
-        return;
-    };
-    // The giver's live `UNIT_NPC_FLAGS`, `None` when it is not streamed.
-    let npc_flags = index
-        .0
-        .get(&npc)
-        .and_then(|e| stores.get(*e).ok())
-        .map(|s| s.0.unit_npc_flags());
-
-    for sel in script.take_quest_selects() {
-        let Some(QuestView::Greeting(list)) = giver.view.as_ref() else {
-            continue;
+    hosted_vm.run(|script| {
+        let Some(script) = script else {
+            return;
         };
-        // The snapshot's split again, keeping the icon for the one-click flag.
-        let (mut active, mut available): (Pool, Pool) = (Vec::new(), Vec::new());
-        for q in &list.quests {
-            if row_is_active(q.icon) {
-                active.push((q.quest_id, q.icon));
+        let Some(npc) = giver.npc else {
+            // Drain the VM anyway, so intents do not queue against a closed window.
+            script.take_quest_selects();
+            script.take_quest_actions();
+            return;
+        };
+        // The giver's live `UNIT_NPC_FLAGS`, `None` when it is not streamed.
+        let npc_flags = index
+            .0
+            .get(&npc)
+            .and_then(|e| stores.get(*e).ok())
+            .map(|s| s.0.unit_npc_flags());
+
+        for sel in script.take_quest_selects() {
+            let Some(QuestView::Greeting(list)) = giver.view.as_ref() else {
+                continue;
+            };
+            // The snapshot's split again, keeping the icon for the one-click flag.
+            let (mut active, mut available): (Pool, Pool) = (Vec::new(), Vec::new());
+            for q in &list.quests {
+                if row_is_active(q.icon) {
+                    active.push((q.quest_id, q.icon));
+                } else {
+                    available.push((q.quest_id, q.icon));
+                }
+            }
+            let pool = if sel.active { &active } else { &available };
+            let Some(&(quest, icon)) = sel.index.checked_sub(1).and_then(|i| pool.get(i as usize))
+            else {
+                debug!("ui_quest: greeting select {sel:?} out of range — ignored");
+                continue;
+            };
+            // `SelectActiveQuest` (`0x501320`) always sends COMPLETE_QUEST; `SelectAvailableQuest`
+            // (`0x5012a0`) does too for a one-click row, and QUERY_QUEST otherwise.
+            let cmd = if sel.active || row_is_one_click(icon) {
+                ClientCommand::QuestgiverComplete { npc, quest }
             } else {
-                available.push((q.quest_id, q.icon));
-            }
+                ClientCommand::QuestgiverQuery { npc, quest }
+            };
+            let _ = commands.0.send(cmd);
         }
-        let pool = if sel.active { &active } else { &available };
-        let Some(&(quest, icon)) = sel.index.checked_sub(1).and_then(|i| pool.get(i as usize))
-        else {
-            debug!("ui_quest: greeting select {sel:?} out of range — ignored");
-            continue;
-        };
-        // `SelectActiveQuest` (`0x501320`) always sends COMPLETE_QUEST; `SelectAvailableQuest`
-        // (`0x5012a0`) does too for a one-click row, and QUERY_QUEST otherwise.
-        let cmd = if sel.active || row_is_one_click(icon) {
-            ClientCommand::QuestgiverComplete { npc, quest }
-        } else {
-            ClientCommand::QuestgiverQuery { npc, quest }
-        };
-        let _ = commands.0.send(cmd);
-    }
 
-    let view_quest = giver.view.as_ref().and_then(|v| match v {
-        QuestView::Detail(d) => Some(d.quest_id),
-        QuestView::Progress(p) => Some(p.quest_id),
-        QuestView::Reward(o) => Some(o.quest_id),
-        QuestView::Greeting(_) => None,
-    });
-    for action in script.take_quest_actions() {
-        match action {
-            // A close ends the drain: the reference's verbs after it find no panel.
-            QuestAction::Close => {
-                crate::ui_session::queue(&mut world_commands, close_quest_reporting);
-                return;
-            }
-            QuestAction::Decline => {
-                let leg = decline_leg(npc, giver.acted, giver.close_on_cancel, npc_flags);
-                debug!("ui_quest: decline on {npc:#x} — {leg:?}");
-                match leg {
-                    DeclineLeg::Nothing => {}
-                    DeclineLeg::Teardown => {
-                        crate::ui_session::queue(&mut world_commands, close_quest_reporting);
-                        return;
-                    }
-                    DeclineLeg::GossipHello => {
-                        let _ = commands.0.send(ClientCommand::GossipHello { guid: npc });
-                        giver.acted = true;
-                    }
-                    DeclineLeg::QuestgiverHello => {
-                        let _ = commands.0.send(ClientCommand::QuestgiverHello { npc });
-                        giver.acted = true;
-                    }
-                }
-            }
-            QuestAction::Accept => {
-                // `0x501380` refuses while the already-acted latch is set (`0x5013a8`).
-                if giver.acted {
-                    continue;
-                }
-                if let Some(quest) = view_quest {
-                    giver.acted = true;
-                    let _ = commands
-                        .0
-                        .send(ClientCommand::QuestgiverAccept { npc, quest });
-                    // `AcceptQuest`'s tail (`0x5013df`) triggers the Quest Log tutorial.
-                    if let Some(t) = tutorials.as_mut() {
-                        t.write(crate::tutorial::TutorialEvent::trigger(
-                            crate::tutorial::id::QUEST_LOG,
-                        ));
-                    }
-                    // The reference closes on the click, not on an answer: it sends `0x189`
-                    // (`0x5eac10`), then clears with `0x501130(0,0)`, firing `QUEST_FINISHED`.
-                    crate::ui_session::queue(&mut world_commands, close_quest_silently);
+        let view_quest = giver.view.as_ref().and_then(|v| match v {
+            QuestView::Detail(d) => Some(d.quest_id),
+            QuestView::Progress(p) => Some(p.quest_id),
+            QuestView::Reward(o) => Some(o.quest_id),
+            QuestView::Greeting(_) => None,
+        });
+        for action in script.take_quest_actions() {
+            match action {
+                // A close ends the drain: the reference's verbs after it find no panel.
+                QuestAction::Close => {
+                    crate::ui_session::queue(&mut world_commands, close_quest_reporting);
                     return;
                 }
-            }
-            QuestAction::Continue => {
-                if let Some(quest) = view_quest {
-                    let _ = commands
-                        .0
-                        .send(ClientCommand::QuestgiverRequestReward { npc, quest });
-                }
-            }
-            QuestAction::Reward(choice) => {
-                if let Some(quest) = view_quest {
-                    // `0x5015b0` latches the chosen row's item when the panel offers a choice.
-                    if let Some(QuestView::Reward(o)) = giver.view.as_ref() {
-                        if let Some(it) = o.choices.get(choice as usize) {
-                            giver.chosen_reward = it.item_id;
+                QuestAction::Decline => {
+                    let leg = decline_leg(npc, giver.acted, giver.close_on_cancel, npc_flags);
+                    debug!("ui_quest: decline on {npc:#x} — {leg:?}");
+                    match leg {
+                        DeclineLeg::Nothing => {}
+                        DeclineLeg::Teardown => {
+                            crate::ui_session::queue(&mut world_commands, close_quest_reporting);
+                            return;
+                        }
+                        DeclineLeg::GossipHello => {
+                            let _ = commands.0.send(ClientCommand::GossipHello { guid: npc });
+                            giver.acted = true;
+                        }
+                        DeclineLeg::QuestgiverHello => {
+                            let _ = commands.0.send(ClientCommand::QuestgiverHello { npc });
+                            giver.acted = true;
                         }
                     }
-                    let _ = commands.0.send(ClientCommand::QuestgiverChooseReward {
-                        npc,
-                        quest,
-                        choice,
-                    });
+                }
+                QuestAction::Accept => {
+                    // `0x501380` refuses while the already-acted latch is set (`0x5013a8`).
+                    if giver.acted {
+                        continue;
+                    }
+                    if let Some(quest) = view_quest {
+                        giver.acted = true;
+                        let _ = commands
+                            .0
+                            .send(ClientCommand::QuestgiverAccept { npc, quest });
+                        // `AcceptQuest`'s tail (`0x5013df`) triggers the Quest Log tutorial.
+                        if let Some(t) = tutorials.as_mut() {
+                            t.write(crate::tutorial::TutorialEvent::trigger(
+                                crate::tutorial::id::QUEST_LOG,
+                            ));
+                        }
+                        // The reference closes on the click, not on an answer: it sends `0x189`
+                        // (`0x5eac10`), then clears with `0x501130(0,0)`, firing `QUEST_FINISHED`.
+                        crate::ui_session::queue(&mut world_commands, close_quest_silently);
+                        return;
+                    }
+                }
+                QuestAction::Continue => {
+                    if let Some(quest) = view_quest {
+                        let _ = commands
+                            .0
+                            .send(ClientCommand::QuestgiverRequestReward { npc, quest });
+                    }
+                }
+                QuestAction::Reward(choice) => {
+                    if let Some(quest) = view_quest {
+                        // `0x5015b0` latches the chosen row's item when the panel offers a choice.
+                        if let Some(QuestView::Reward(o)) = giver.view.as_ref() {
+                            if let Some(it) = o.choices.get(choice as usize) {
+                                giver.chosen_reward = it.item_id;
+                            }
+                        }
+                        let _ = commands.0.send(ClientCommand::QuestgiverChooseReward {
+                            npc,
+                            quest,
+                            choice,
+                        });
+                    }
                 }
             }
         }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -763,6 +773,68 @@ mod tests {
         }
     }
 
+    /// `GetQuestItemInfo` looks each reward up with a callback (`0x5017de`) when the stock frame
+    /// calls it, on the panel's event; the frames between ask only what the cache holds nothing
+    /// for. A refused reward is asked by no frame, and again by the next panel the giver publishes.
+    #[test]
+    fn a_refused_reward_is_asked_at_the_next_panel_never_by_a_frame() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::new();
+        app.insert_resource(NetCommands(tx))
+            .init_resource::<QuestGiver>()
+            .init_resource::<Items>()
+            .init_resource::<NameCache>()
+            .init_resource::<crate::net::GuidIndex>()
+            .init_resource::<crate::world_state::WorldStates>()
+            .init_resource::<crate::go_templates::GameObjectTemplates>()
+            .init_resource::<crate::ui_chat::ChatLog>()
+            .init_resource::<crate::sound::MessageSounds>()
+            .add_systems(Update, feed_quest);
+        app.insert_non_send_resource(UiScript::new().unwrap());
+        // A player source, so the giver's name is no creature read: its own query is the name's.
+        const SOURCE: u64 = 0x42;
+        let publish = |app: &mut App| {
+            app.world_mut().resource_mut::<QuestGiver>().open(
+                SOURCE,
+                QuestView::Detail(QuestDetails {
+                    npc: SOURCE,
+                    quest_id: 100,
+                    title: "A Threat Within".into(),
+                    details: String::new(),
+                    objectives: String::new(),
+                    auto_finish: 1,
+                    choices: vec![],
+                    rewards: vec![triple(3000)],
+                    money: 0,
+                    reward_spell: 0,
+                }),
+            );
+        };
+        let reward_asks = |rx: &crossbeam_channel::Receiver<ClientCommand>| {
+            crate::query_cache::queries(rx)
+                .iter()
+                .filter(|c| matches!(c, ClientCommand::ItemQuery { entry: 3000, .. }))
+                .count()
+        };
+        publish(&mut app);
+        app.update();
+        assert_eq!(reward_asks(&rx), 1);
+        app.world_mut()
+            .resource_mut::<Items>()
+            .insert_template(3000, None);
+        for _ in 0..600 {
+            app.update();
+        }
+        assert_eq!(reward_asks(&rx), 0, "no frame asks the refusal");
+        publish(&mut app);
+        app.update();
+        assert_eq!(reward_asks(&rx), 1, "the next panel does, once");
+        for _ in 0..600 {
+            app.update();
+        }
+        assert_eq!(reward_asks(&rx), 0);
+    }
+
     #[test]
     fn detail_snapshot_carries_text_and_rows() {
         let mut giver = QuestGiver::default();
@@ -795,7 +867,7 @@ mod tests {
             &giver,
             &items,
             None,
-            &commands,
+            Ask::New(&commands),
             &crate::npc_text::MacroContext {
                 subject: Some(&player),
                 states: &crate::world_state::WorldStates::default(),
@@ -839,7 +911,7 @@ mod tests {
             &giver,
             &items,
             None,
-            &commands,
+            Ask::New(&commands),
             &crate::npc_text::MacroContext {
                 subject: None,
                 states: &crate::world_state::WorldStates::default(),
@@ -885,7 +957,7 @@ mod tests {
             &giver,
             &Items::default(),
             None,
-            &NetCommands(tx),
+            Ask::New(&NetCommands(tx)),
             &crate::npc_text::MacroContext {
                 subject: None,
                 states: &crate::world_state::WorldStates::default(),
@@ -947,29 +1019,6 @@ mod tests {
         for reason in [0, 1, 5, 16, 18, 49, 51] {
             assert_eq!(questgiver_failed_key(reason), "ERR_QUEST_FAILED_S");
         }
-    }
-
-    #[test]
-    fn view_title_answers_only_for_the_open_quest() {
-        let mut giver = QuestGiver::default();
-        assert_eq!(giver.view_title(100), None);
-        giver.open(
-            0x42,
-            QuestView::Detail(QuestDetails {
-                npc: 0x42,
-                quest_id: 100,
-                title: "A Threat Within".into(),
-                details: String::new(),
-                objectives: String::new(),
-                auto_finish: 0,
-                choices: vec![],
-                rewards: vec![],
-                money: 0,
-                reward_spell: 0,
-            }),
-        );
-        assert_eq!(giver.view_title(100).as_deref(), Some("A Threat Within"));
-        assert_eq!(giver.view_title(101), None);
     }
 
     /// Reads the install's `GlobalStrings.lua`; skips without it.

@@ -29,6 +29,7 @@ fn clip(anim_id: u16, node: u32, looping: bool) -> AnimClip {
         anim_id,
         seq_index: 0,
         node: AnimationNodeIndex::new(node as usize),
+        blend_node: None,
         looping,
         duration: 1.0,
         move_speed: 0.0,
@@ -284,6 +285,7 @@ fn spawn_fidgeter(app: &mut App) -> (Entity, Vec<AnimationNodeIndex>) {
         .add(graph);
     let seq = |id: u16, node, duration: f32, frequency: u16| AnimClip {
         node,
+        blend_node: None,
         duration,
         blend_time: 0.0,
         frequency,
@@ -3113,6 +3115,7 @@ fn spawn_vendor(app: &mut App) -> (Entity, Vec<AnimationNodeIndex>) {
         .add(graph);
     let seq = |id: u16, node, duration: f32, blend_time: f32| AnimClip {
         node,
+        blend_node: None,
         duration,
         blend_time,
         replay: (0, 0),
@@ -3527,6 +3530,7 @@ fn a_no_wound_creature_takes_no_flinch() {
         pet_family: 0,
         rank: 0,
         type_flags,
+        pet_spell_list: 0,
         civilian: false,
         racial_leader: false,
         display_id: 0,
@@ -3613,6 +3617,7 @@ fn the_no_wound_flag_takes_the_parry_but_not_the_dodge() {
         pet_family: 0,
         rank: 0,
         type_flags,
+        pet_spell_list: 0,
         civilian: false,
         racial_leader: false,
         display_id: 0,

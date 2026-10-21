@@ -96,7 +96,9 @@ crate or a fork. This repository is that fork, so the modification belongs in th
 ## Gates
 
 - **The land gates**: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
-  -- -D warnings`, `cargo test --workspace`, the doc-link lint (a full `cargo doc` of the workspace) and the render-pass lint, the vendored-reference and message-catalog checks, the player
+  -- -D warnings`, the workspace tests (`scripts/unit-tests.sh`: cargo-nextest where it is
+  installed, else `cargo test`) and their doctests, the doc-link lint (a full `cargo doc` of the
+  workspace) and the render-pass lint, the vendored-reference and message-catalog checks, the player
   build without the `dev` feature, linted and with its own tests, and the engine boot checks, as
   `scripts/gates.sh`. It runs on the tree that lands, before it lands; it is memoized on the
   tree. The tests that read the install or the addon corpus skip where the data is absent, and

@@ -4,6 +4,7 @@
 //! [`roster_deactivated`] are the object layer's hooks on a roster member's stream-out.
 
 use benilla_protocol::messages::{GroupLootInfo, GroupMemberEntry, PartyMemberStatsInfo};
+use benilla_ui::script::UiScript;
 use bevy::prelude::*;
 
 use benilla_protocol::{SessionEvent, SessionEventKind};
@@ -11,6 +12,7 @@ use benilla_protocol::{SessionEvent, SessionEventKind};
 use super::{GroupState, GROUPTYPE_RAID};
 use crate::names::NameCache;
 use crate::net::{ClientCommand, GuidIndex, NetCommands, NetHandlerApp, ObjectStore, SelfGuid};
+use crate::query_cache::Ask;
 use crate::sound::MessageSounds;
 use crate::ui_action::{UiError, UiErrorKeys};
 use crate::ui_quest::QuestGiver;
@@ -34,79 +36,57 @@ pub(super) fn register(app: &mut App) {
         .net_handler(K::ReadyCheckRequest, on_ready_check_request)
         .net_handler(K::ReadyCheckAnswer, on_ready_check_answer)
         .net_handler(K::RaidInstanceInfo, on_raid_instance_info)
+        .net_handler(K::PlayerName, on_player_name)
         .net_handler(K::Disconnected, on_session_end);
 }
 
-fn on_invite(
-    In(ev): In<SessionEvent>,
-    mut group: ResMut<GroupState>,
-    mut errors: ResMut<UiErrorKeys>,
-) {
+fn on_invite(In(ev): In<SessionEvent>, mut group: ResMut<GroupState>, errors: Res<UiErrorKeys>) {
     if let SessionEvent::GroupInvite { inviter } = ev {
-        invited(&mut group, &mut errors, &inviter);
+        invited(&mut group, &errors, &inviter);
     }
 }
 
-fn on_decline(
-    In(ev): In<SessionEvent>,
-    mut group: ResMut<GroupState>,
-    mut errors: ResMut<UiErrorKeys>,
-) {
+fn on_decline(In(ev): In<SessionEvent>, mut group: ResMut<GroupState>, errors: Res<UiErrorKeys>) {
     if let SessionEvent::GroupDecline { name } = ev {
-        declined(&mut group, &mut errors, &name);
+        declined(&mut group, &errors, &name);
     }
 }
 
-fn on_uninvited(
-    In(ev): In<SessionEvent>,
-    mut group: ResMut<GroupState>,
-    mut errors: ResMut<UiErrorKeys>,
-) {
+fn on_uninvited(In(ev): In<SessionEvent>, mut group: ResMut<GroupState>, errors: Res<UiErrorKeys>) {
     if let SessionEvent::GroupUninvited = ev {
-        uninvited(&mut group, &mut errors);
+        uninvited(&mut group, &errors);
     }
 }
 
 fn on_leader_changed(
     In(ev): In<SessionEvent>,
     mut group: ResMut<GroupState>,
-    mut errors: ResMut<UiErrorKeys>,
+    errors: Res<UiErrorKeys>,
     self_guid: Res<SelfGuid>,
     names: Res<NameCache>,
-    commands: Res<NetCommands>,
 ) {
     if let SessionEvent::GroupLeaderChanged { name } = ev {
-        leader_changed(
-            &mut group,
-            &mut errors,
-            &name,
-            &self_guid,
-            &names,
-            &commands,
-        );
+        leader_changed(&mut group, &errors, &name, &self_guid, &names);
     }
 }
 
-fn on_destroyed(
-    In(ev): In<SessionEvent>,
-    mut group: ResMut<GroupState>,
-    mut errors: ResMut<UiErrorKeys>,
-) {
+fn on_destroyed(In(ev): In<SessionEvent>, mut group: ResMut<GroupState>, errors: Res<UiErrorKeys>) {
     if let SessionEvent::GroupDestroyed = ev {
-        destroyed(&mut group, &mut errors);
+        destroyed(&mut group, &errors);
     }
 }
 
 fn on_list(
     In(ev): In<SessionEvent>,
     mut group: ResMut<GroupState>,
-    mut errors: ResMut<UiErrorKeys>,
-    mut sounds: ResMut<MessageSounds>,
+    errors: Res<UiErrorKeys>,
+    sounds: Res<MessageSounds>,
     mut quest: ResMut<QuestGiver>,
     self_guid: Res<SelfGuid>,
     names: Res<NameCache>,
     index: Res<GuidIndex>,
     commands: Res<NetCommands>,
+    tutorials: Option<MessageWriter<crate::tutorial::TutorialEvent>>,
 ) {
     if let SessionEvent::GroupList {
         group_type,
@@ -116,20 +96,18 @@ fn on_list(
         loot,
     } = ev
     {
+        // The raid roster writer opens on Raid Groups for a rebuild with rows (`0x4ba604`,
+        // `0x4ba60d`), every one; the tutorial's own bit makes it fire once.
+        if group_type == GROUPTYPE_RAID && !members.is_empty() {
+            if let Some(mut tutorials) = tutorials {
+                tutorials.write(crate::tutorial::TutorialEvent::trigger(
+                    crate::tutorial::id::RAID_GROUPS,
+                ));
+            }
+        }
         list(
-            &mut group,
-            &mut errors,
-            &mut sounds,
-            &mut quest,
-            group_type,
-            own_flags,
-            members,
-            leader,
-            loot,
-            &self_guid,
-            &names,
-            &index,
-            &commands,
+            &mut group, &errors, &sounds, &mut quest, group_type, own_flags, members, leader, loot,
+            &self_guid, &names, &index, &commands,
         );
     }
 }
@@ -137,7 +115,7 @@ fn on_list(
 fn on_command_result(
     In(ev): In<SessionEvent>,
     mut group: ResMut<GroupState>,
-    mut errors: ResMut<UiErrorKeys>,
+    errors: Res<UiErrorKeys>,
 ) {
     if let SessionEvent::PartyCommandResult {
         operation,
@@ -145,7 +123,7 @@ fn on_command_result(
         result,
     } = ev
     {
-        command_result(&mut group, &mut errors, operation, &member, result);
+        command_result(&mut group, &errors, operation, &member, result);
     }
 }
 
@@ -167,7 +145,7 @@ fn on_member_stats(
 
 fn on_raid_target(In(ev): In<SessionEvent>, mut group: ResMut<GroupState>) {
     match ev {
-        SessionEvent::RaidTargetSet { icon, guid } => group.apply_raid_target(icon, guid),
+        SessionEvent::RaidTargetSet { icon, guid } => group.apply_raid_target_update(icon, guid),
         SessionEvent::RaidTargetList { entries } => group.apply_raid_target_list(&entries),
         _ => {}
     }
@@ -176,11 +154,11 @@ fn on_raid_target(In(ev): In<SessionEvent>, mut group: ResMut<GroupState>) {
 fn on_ready_check_request(
     In(ev): In<SessionEvent>,
     mut group: ResMut<GroupState>,
-    mut errors: ResMut<UiErrorKeys>,
+    errors: Res<UiErrorKeys>,
     self_guid: Res<SelfGuid>,
 ) {
     if let SessionEvent::ReadyCheckRequest = ev {
-        ready_check_request(&mut group, &mut errors, &self_guid);
+        ready_check_request(&mut group, &errors, &self_guid);
     }
 }
 
@@ -196,63 +174,70 @@ fn on_raid_instance_info(In(ev): In<SessionEvent>, mut group: ResMut<GroupState>
     }
 }
 
+/// `SMSG_NAME_QUERY_RESPONSE`, found or refused: the roster's lookups that waited on it run
+/// ([`GroupState::apply_player_name`]).
+fn on_player_name(In(ev): In<SessionEvent>, mut group: ResMut<GroupState>) {
+    if let SessionEvent::PlayerName { guid, .. } = ev {
+        group.apply_player_name(guid);
+    }
+}
+
 /// The group state dies with the socket, after the bridge's own teardown.
 fn on_session_end(In(_): In<SessionEvent>, mut group: ResMut<GroupState>) {
     group.clear_session();
 }
 
 /// Queue the messages an `apply_*` named; `ui_action::feed_actions` resolves and shows them.
-fn push_group_lines(errors: &mut UiErrorKeys, lines: Vec<UiError>) {
-    errors.0.extend(lines);
+fn push_group_lines(errors: &UiErrorKeys, lines: Vec<UiError>) {
+    errors.extend(lines);
 }
 
 /// We lead when our guid is the leader's, the reference's test at `0x4ba3a0`.
-fn ready_check_request(group: &mut GroupState, errors: &mut UiErrorKeys, self_guid: &SelfGuid) {
+fn ready_check_request(group: &mut GroupState, errors: &UiErrorKeys, self_guid: &SelfGuid) {
     let we_lead = self_guid.0 == Some(group.leader);
     push_group_lines(errors, group.apply_ready_check_request(we_lead));
 }
 
-fn invited(group: &mut GroupState, errors: &mut UiErrorKeys, inviter: &str) {
+fn invited(group: &mut GroupState, errors: &UiErrorKeys, inviter: &str) {
     push_group_lines(errors, group.apply_invited(inviter));
 }
 
-fn declined(group: &mut GroupState, errors: &mut UiErrorKeys, name: &str) {
+fn declined(group: &mut GroupState, errors: &UiErrorKeys, name: &str) {
     push_group_lines(errors, group.apply_declined(name));
 }
 
-fn uninvited(group: &mut GroupState, errors: &mut UiErrorKeys) {
+fn uninvited(group: &mut GroupState, errors: &UiErrorKeys) {
     push_group_lines(errors, group.apply_uninvited());
 }
 
-fn destroyed(group: &mut GroupState, errors: &mut UiErrorKeys) {
+fn destroyed(group: &mut GroupState, errors: &UiErrorKeys) {
     push_group_lines(errors, group.apply_destroyed());
 }
 
 /// Our own name, cached from login (`session::connected`), picks the line; this never queries.
 fn leader_changed(
     group: &mut GroupState,
-    errors: &mut UiErrorKeys,
+    errors: &UiErrorKeys,
     name: &str,
     self_guid: &SelfGuid,
     names: &NameCache,
-    net_commands: &NetCommands,
 ) {
     let own = self_guid
         .0
-        .and_then(|g| names.resolve_player(g, net_commands).map(str::to_string));
+        .and_then(|g| names.resolve_player(g, Ask::Read).map(str::to_string));
     push_group_lines(errors, group.apply_leader_changed(name, own.as_deref()));
 }
 
 /// `SMSG_GROUP_LIST`: apply the roster, seat new members' records and re-ask the questgiver sweep
 /// (shared-quest availability follows the roster). Every member is name-queried once: the
 /// answer's race, class and gender are the only source of them for a member we never see streamed.
-/// A raid's rebuild counts the rows whose name is still to come (`0x4ba9b6`-`0x4ba9d0`), ours
-/// among them once others are listed (`0x5e6e73`), and signals `RAID_ROSTER_UPDATE` only with none
-/// (`0x4babdf`-`0x4babef`).
+/// The party seats (`0x4e8477`) and a raid's rows (`0x4ba9c7`), ours among them once others are
+/// listed (`0x5e6e73`), each look their name up with a callback, which [`GroupState`] keeps for
+/// the answer ([`on_player_name`]).
 fn list(
     group: &mut GroupState,
-    errors: &mut UiErrorKeys,
-    sounds: &mut MessageSounds,
+    errors: &UiErrorKeys,
+    sounds: &MessageSounds,
     quest: &mut QuestGiver,
     group_type: u8,
     own_flags: u8,
@@ -264,15 +249,15 @@ fn list(
     index: &GuidIndex,
     net_commands: &NetCommands,
 ) {
-    let mut names_pending = false;
-    for m in &members {
-        names_pending |= names.resolve_player(m.guid, net_commands).is_none();
-    }
-    if group_type == GROUPTYPE_RAID && !members.is_empty() {
-        if let Some(own) = self_guid.0 {
-            names_pending |= names.resolve_player(own, net_commands).is_none();
-        }
-    }
+    // The lookups with a callback, which ask a refused name again; a miss waits for the answer.
+    // A party list seats every member and a raid list rows every one, so each is asked.
+    let lookup = |guid: u64| {
+        names
+            .resolve_player(guid, Ask::Event(net_commands))
+            .map(str::to_string)
+    };
+    // The loot master's name as the setter reads it, from the cache with no callback (`0x4e878f`).
+    let cached_name = |guid: u64| names.resolve_player(guid, Ask::Read).map(str::to_string);
     // Taken before `apply_list` consumes the list; `seat_new_records` then treats a member with
     // no record as new, the reference's `srcRec == 0`.
     let seats: Vec<(u64, bool)> = members
@@ -286,7 +271,8 @@ fn list(
         leader,
         loot,
         self_guid.0,
-        names_pending,
+        &lookup,
+        &cached_name,
     );
     push_group_lines(errors, shown.lines);
     if shown.invite_accept {
@@ -323,17 +309,31 @@ fn seat_new_records(
     }
 }
 
+/// The pet name the deactivate snapshot (`0x5f0880`) writes for a held pet: `0x609210`'s answer
+/// (`0x5f0a63`), the cached `name`, else the VM's `UNKNOWNOBJECT` text as it reads at the snapshot
+/// (`0x609324`-`0x60933c`, [`benilla_ui::script::UiScript::unknown_object_text`]). With no VM up,
+/// as between the world-entry edge and the interface's load, there is no text to copy, and the
+/// name is left empty.
+pub(crate) fn snapshot_pet_name(name: Option<&str>, script: Option<&UiScript>) -> String {
+    match (name, script) {
+        (Some(name), _) => name.to_string(),
+        (None, Some(script)) => script.unknown_object_text(),
+        (None, None) => String::new(),
+    }
+}
+
 /// The despawn hook, the reference's deactivate virtual `0x5e9aa0` (object destroyed or out of
 /// range): for a roster member, snapshot the live descriptor into their record (`0x5f0880`), their
-/// pet's too while `held` finds it, with the name `names` holds for it, then request their stats
-/// (`0x4e8646`). Nothing happens off the roster or without an object, since the hook is a virtual
-/// on the object.
+/// pet's too while `held` finds it, with the name `names` holds for it or `UNKNOWNOBJECT` on a miss
+/// ([`snapshot_pet_name`]), then request their stats (`0x4e8646`). Nothing happens off the roster
+/// or without an object, since the hook is a virtual on the object.
 pub(crate) fn member_deactivated<'a>(
     guid: u64,
     group: &mut GroupState,
     store: Option<&'a ObjectStore>,
     held: impl Fn(u64) -> Option<&'a ObjectStore>,
     names: &NameCache,
+    script: Option<&UiScript>,
     net_commands: &NetCommands,
 ) {
     let Some(store) = store else {
@@ -346,12 +346,13 @@ pub(crate) fn member_deactivated<'a>(
     let pet = pet_guid.and_then(held);
     let pet_name = pet_guid
         .zip(pet)
-        .and_then(|(g, p)| names.peek_unit(g, Some(p)));
-    group
-        .stats
-        .entry(guid)
-        .or_default()
-        .snapshot_descriptor(&store.0, pet.map(|p| &p.0), pet_name);
+        .and_then(|(g, p)| names.resolve_unit(g, Some(p), Ask::Read));
+    let pet_name = snapshot_pet_name(pet_name, script);
+    group.stats.entry(guid).or_default().snapshot_descriptor(
+        &store.0,
+        pet.map(|p| &p.0),
+        &pet_name,
+    );
     let _ = net_commands
         .0
         .send(ClientCommand::RequestPartyMemberStats { guid });
@@ -364,6 +365,7 @@ pub(crate) fn roster_deactivated(
     index: &GuidIndex,
     stores: &Query<&mut ObjectStore>,
     names: &NameCache,
+    script: Option<&UiScript>,
     net_commands: &NetCommands,
 ) {
     let streamed: Vec<u64> = group
@@ -374,25 +376,24 @@ pub(crate) fn roster_deactivated(
         .collect();
     let held = |g: u64| index.0.get(&g).and_then(|e| stores.get(*e).ok());
     for guid in streamed {
-        member_deactivated(guid, group, held(guid), held, names, net_commands);
+        member_deactivated(guid, group, held(guid), held, names, script, net_commands);
     }
 }
 
 fn command_result(
     group: &mut GroupState,
-    errors: &mut crate::ui_action::UiErrorKeys,
+    errors: &crate::ui_action::UiErrorKeys,
     operation: u32,
     member: &str,
     result: u32,
 ) {
     // By key, so the catalog row picks the surface; `None` is the reference's silence.
-    errors
-        .0
-        .extend(group.apply_command_result(operation, member, result));
+    errors.extend(group.apply_command_result(operation, member, result));
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::GroupSignal;
     use super::*;
     use crate::net::ClientCommand;
     use benilla_protocol::guid;
@@ -407,11 +408,53 @@ mod tests {
         }
     }
 
+    /// Each list looks its members up with a callback (`0x4e8477`): a refused name is asked again
+    /// by the next list, and nothing between lists asks.
+    #[test]
+    fn a_refused_member_is_asked_again_by_the_next_list() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let net = NetCommands(tx);
+        let (mut group, errors, mut quest) = (
+            GroupState::default(),
+            UiErrorKeys::default(),
+            QuestGiver::default(),
+        );
+        let mut names = NameCache::default();
+        let far = 8 | (u64::from(guid::HIGH_PLAYER) << 48);
+        let mut send = |names: &NameCache| {
+            list(
+                &mut group,
+                &errors,
+                &MessageSounds::default(),
+                &mut quest,
+                0,
+                0,
+                vec![member(far, "Brisca")],
+                far,
+                None,
+                &SelfGuid::default(),
+                names,
+                &GuidIndex::default(),
+                &net,
+            );
+        };
+        send(&names);
+        assert_eq!(crate::query_cache::queries(&rx).len(), 1);
+        names.insert_player(far, String::new(), None);
+        assert!(crate::query_cache::queries(&rx).is_empty());
+        send(&names);
+        assert_eq!(
+            crate::query_cache::queries(&rx).len(),
+            1,
+            "the next list asks again"
+        );
+    }
+
     #[test]
     fn the_roster_warms_every_member_into_the_name_cache_once() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let net = NetCommands(tx);
-        let (mut group, mut errors, mut quest) = (
+        let (mut group, errors, mut quest) = (
             GroupState::default(),
             UiErrorKeys::default(),
             QuestGiver::default(),
@@ -423,8 +466,8 @@ mod tests {
 
         list(
             &mut group,
-            &mut errors,
-            &mut MessageSounds::default(),
+            &errors,
+            &MessageSounds::default(),
             &mut quest,
             0,
             0,
@@ -454,8 +497,8 @@ mod tests {
         names.insert_player(leader, "Aldwyn".into(), Some((1, 4, 1)));
         list(
             &mut group,
-            &mut errors,
-            &mut MessageSounds::default(),
+            &errors,
+            &MessageSounds::default(),
             &mut quest,
             0,
             0,
@@ -481,7 +524,7 @@ mod tests {
     fn a_raid_list_signals_the_roster_only_once_every_name_is_held() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let net = NetCommands(tx);
-        let (mut group, mut errors, mut quest) = (
+        let (mut group, errors, mut quest) = (
             GroupState::default(),
             UiErrorKeys::default(),
             QuestGiver::default(),
@@ -492,8 +535,8 @@ mod tests {
         let mut raid = |group: &mut GroupState, names: &NameCache, group_type: u8| {
             list(
                 group,
-                &mut errors,
-                &mut MessageSounds::default(),
+                &errors,
+                &MessageSounds::default(),
                 &mut quest,
                 group_type,
                 0,
@@ -505,7 +548,11 @@ mod tests {
                 &GuidIndex::default(),
                 &net,
             );
-            group.roster_updates
+            let signals = group.signals.since(0);
+            signals
+                .iter()
+                .filter(|s| **s == GroupSignal::RaidRosterUpdate)
+                .count()
         };
 
         assert_eq!(raid(&mut group, &names, 1), 0, "no name held");
@@ -542,17 +589,17 @@ mod tests {
     fn a_join_queues_the_invite_accept_chime_and_a_resync_does_not() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let net = NetCommands(tx);
-        let (mut group, mut errors, mut sounds, mut quest) = (
+        let (mut group, errors, sounds, mut quest) = (
             GroupState::default(),
             UiErrorKeys::default(),
             MessageSounds::default(),
             QuestGiver::default(),
         );
         let names = NameCache::default();
-        let mut send = |sounds: &mut MessageSounds, members: Vec<GroupMemberEntry>| {
+        let mut send = |sounds: &MessageSounds, members: Vec<GroupMemberEntry>| {
             list(
                 &mut group,
-                &mut errors,
+                &errors,
                 sounds,
                 &mut quest,
                 0,
@@ -567,15 +614,15 @@ mod tests {
             );
         };
 
-        send(&mut sounds, vec![member(7, "Aldwyn")]);
+        send(&sounds, vec![member(7, "Aldwyn")]);
         assert_eq!(
             sounds.queued_cues(),
             ["igPlayerInviteAccept"],
             "our first party"
         );
-        send(&mut sounds, vec![member(7, "Aldwyn")]);
+        send(&sounds, vec![member(7, "Aldwyn")]);
         assert_eq!(sounds.queued_cues().len(), 1, "a resync is silent");
-        send(&mut sounds, vec![member(7, "Aldwyn"), member(8, "Brisca")]);
+        send(&sounds, vec![member(7, "Aldwyn"), member(8, "Brisca")]);
         assert_eq!(sounds.queued_cues().len(), 2, "a member joining our party");
         assert_eq!(
             benilla_ui::messages::by_key("ERR_JOINED_GROUP_S").and_then(|r| r.sound),
@@ -633,6 +680,7 @@ mod tests {
             Some(&store),
             |_| None,
             &NameCache::default(),
+            None,
             &net,
         );
 
@@ -689,7 +737,7 @@ mod tests {
         let held = |g: u64| (g == pet_guid).then_some(&pet);
         let mut names = NameCache::default();
         names.insert_pet(4, "Whelp".into());
-        member_deactivated(guid, &mut group, Some(&store), held, &names, &net);
+        member_deactivated(guid, &mut group, Some(&store), held, &names, None, &net);
 
         let rec = group.stats.get(&guid).expect("the member has a record");
         assert_eq!(
@@ -708,12 +756,185 @@ mod tests {
         assert_eq!(rec.pet_auras, Some(vec![]));
         assert_eq!(rec.pet_auras_negative, Some(vec![(40, 770)]));
 
+        // A pet whose name the cache misses: `0x609210` answers `UNKNOWNOBJECT` (`0x609324`) and
+        // the record takes that, never the name it held (`0x5f0a70`).
+        let unnamed = NameCache::default();
+        let vm = benilla_ui::script::UiScript::new().unwrap();
+        vm.run(r#"UNKNOWNOBJECT = "Unknown""#).unwrap();
+        member_deactivated(
+            guid,
+            &mut group,
+            Some(&store),
+            held,
+            &unnamed,
+            Some(&vm),
+            &net,
+        );
+        assert_eq!(group.stats[&guid].pet_name.as_deref(), Some("Unknown"));
+
         // The pet not held: its block is emptied, not left as it was.
-        member_deactivated(guid, &mut group, Some(&store), |_| None, &names, &net);
+        member_deactivated(guid, &mut group, Some(&store), |_| None, &names, None, &net);
         let rec = group.stats.get(&guid).unwrap();
         assert_eq!((rec.pet_guid, rec.pet_auras_negative.clone()), (None, None));
         assert_eq!(rec.pet_name, None, "and its name with it (`0x5f0a0f`)");
         assert_eq!(rec.auras, Some(vec![(0, 1126)]));
+    }
+
+    /// Raid Groups opens on every raid roster rebuild with rows (`0x4ba604`, `0x4ba60d`): a raid
+    /// list that names a member asks for it, each time, and a raid of one or a party asks nothing.
+    #[test]
+    fn a_raid_list_with_rows_triggers_the_raid_groups_tutorial() {
+        use crate::tutorial::{id, TutorialEvent};
+        use bevy::ecs::system::RunSystemOnce;
+        let mut app = App::new();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        app.insert_resource(NetCommands(tx))
+            .init_resource::<GroupState>()
+            .init_resource::<UiErrorKeys>()
+            .init_resource::<MessageSounds>()
+            .init_resource::<QuestGiver>()
+            .insert_resource(SelfGuid(Some(0x10)))
+            .init_resource::<NameCache>()
+            .init_resource::<GuidIndex>()
+            .add_message::<TutorialEvent>();
+        let mut triggered = |group_type: u8, members: Vec<GroupMemberEntry>| {
+            app.world_mut()
+                .run_system_once_with(
+                    on_list,
+                    SessionEvent::GroupList {
+                        group_type,
+                        own_flags: 0,
+                        members,
+                        leader: 0x10,
+                        loot: None,
+                    },
+                )
+                .expect("the group-list handler");
+            app.world_mut()
+                .resource_mut::<Messages<TutorialEvent>>()
+                .drain()
+                .filter(|e| *e == TutorialEvent::trigger(id::RAID_GROUPS))
+                .count()
+        };
+        assert_eq!(triggered(GROUPTYPE_RAID, Vec::new()), 0, "a raid of one");
+        assert_eq!(triggered(0, vec![member(0x22, "Brisca")]), 0, "a party");
+        assert_eq!(triggered(GROUPTYPE_RAID, vec![member(0x22, "Brisca")]), 1);
+        assert_eq!(
+            triggered(GROUPTYPE_RAID, vec![member(0x22, "Brisca")]),
+            1,
+            "every rebuild with rows"
+        );
+    }
+
+    /// The snapshot reads the VM's `UNKNOWNOBJECT` as it stands at the snapshot (`0x609324`), so a
+    /// list that landed before the VM came up leaves nothing stale to copy; an empty global reads
+    /// the literal (`0x60933c`), and with no VM there is no text to copy.
+    #[test]
+    fn a_snapshot_reads_unknownobject_off_the_vm_it_runs_beside() {
+        use benilla_ui::script::UiScript;
+        const SUMMON: u16 = 8;
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let net = NetCommands(tx);
+        let pet_guid = 0xF140_0000_0000_0099;
+        let store = ObjectStore(benilla_protocol::messages::ObjectFields::from_pairs(&[
+            (HEALTH, 2400),
+            (SUMMON, pet_guid as u32),
+            (SUMMON + 1, (pet_guid >> 32) as u32),
+        ]));
+        let pet = ObjectStore(benilla_protocol::messages::ObjectFields::from_pairs(&[(
+            HEALTH, 900,
+        )]));
+        let held = |g: u64| (g == pet_guid).then_some(&pet);
+        let named = |global: Option<&str>| {
+            let vm = global.map(|g| {
+                let vm = UiScript::new().unwrap();
+                vm.run(&format!("UNKNOWNOBJECT = {g:?}")).unwrap();
+                vm
+            });
+            // The list lands with no VM up, as in the world entry's window before the interface.
+            let mut group = grouped(&[member(0x22, "Brisca")]);
+            member_deactivated(
+                0x22,
+                &mut group,
+                Some(&store),
+                held,
+                &NameCache::default(),
+                vm.as_ref(),
+                &net,
+            );
+            group.stats[&0x22].pet_name.clone()
+        };
+        assert_eq!(named(Some("Unknown")).as_deref(), Some("Unknown"));
+        assert_eq!(named(Some("")).as_deref(), Some("Unknown Being"));
+        assert_eq!(named(None).as_deref(), Some(""), "no VM");
+    }
+
+    /// The handlers end to end: a raid list whose member's name the cache misses asks it and holds
+    /// `RAID_ROSTER_UPDATE` back (`0x4ba9c7`, `0x4babdf`); the answer's handler runs the lookup
+    /// that waited, the last pending, so the roster update and the members change signal
+    /// (`0x4bad90`-`0x4badb0`).
+    #[test]
+    fn a_raid_list_waits_on_a_name_the_answer_brings() {
+        use bevy::ecs::system::RunSystemOnce;
+        const ME: u64 = 0x10;
+        let mut app = App::new();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.insert_resource(NetCommands(tx))
+            .init_resource::<GroupState>()
+            .init_resource::<UiErrorKeys>()
+            .init_resource::<MessageSounds>()
+            .init_resource::<QuestGiver>()
+            .insert_resource(SelfGuid(Some(ME)))
+            .init_resource::<NameCache>()
+            .init_resource::<GuidIndex>();
+        app.world_mut()
+            .resource_mut::<NameCache>()
+            .insert_player(ME, "Me".into(), None);
+        let mut far = member(0x22, "Brisca");
+        far.flags = 1;
+        app.world_mut()
+            .run_system_once_with(
+                on_list,
+                SessionEvent::GroupList {
+                    group_type: GROUPTYPE_RAID,
+                    own_flags: 0,
+                    members: vec![far],
+                    leader: ME,
+                    loot: None,
+                },
+            )
+            .expect("the group-list handler");
+        let signals = |app: &mut App| app.world_mut().resource_mut::<GroupState>().signals.take();
+        assert_eq!(
+            signals(&mut app),
+            [GroupSignal::MembersChanged, GroupSignal::LeaderChanged],
+            "a name pending: the list's own, and no roster yet"
+        );
+        let queried: Vec<u64> = rx
+            .try_iter()
+            .filter_map(|c| match c {
+                ClientCommand::NameQuery { guid } => Some(guid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(queried, vec![0x22], "and asked, once");
+
+        app.world_mut()
+            .run_system_once_with(
+                on_player_name,
+                SessionEvent::PlayerName {
+                    guid: 0x22,
+                    name: "Brisca".into(),
+                    race: 1,
+                    class: 1,
+                    gender: 0,
+                },
+            )
+            .expect("the name handler");
+        assert_eq!(
+            signals(&mut app),
+            [GroupSignal::RaidRosterUpdate, GroupSignal::MembersChanged]
+        );
     }
 
     #[test]
@@ -732,6 +953,7 @@ mod tests {
             Some(&store),
             |_| None,
             &NameCache::default(),
+            None,
             &net,
         );
         assert!(asked(&rx).is_empty());
@@ -744,6 +966,7 @@ mod tests {
             None,
             |_| None,
             &NameCache::default(),
+            None,
             &net,
         );
         assert!(asked(&rx).is_empty());
@@ -753,7 +976,7 @@ mod tests {
     fn a_roster_new_member_is_seated_at_one_one_and_asked_for_only_when_unseen() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let net = NetCommands(tx);
-        let (mut group, mut errors, mut quest) = (
+        let (mut group, errors, mut quest) = (
             GroupState::default(),
             UiErrorKeys::default(),
             QuestGiver::default(),
@@ -770,8 +993,8 @@ mod tests {
         let mut send = |group: &mut GroupState, members: Vec<GroupMemberEntry>| {
             list(
                 group,
-                &mut errors,
-                &mut MessageSounds::default(),
+                &errors,
+                &MessageSounds::default(),
                 &mut quest,
                 0,
                 0,
@@ -828,7 +1051,7 @@ mod tests {
     fn a_resent_list_moves_a_known_members_online_bit_and_keeps_its_record() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let net = NetCommands(tx);
-        let (mut group, mut errors, mut quest) = (
+        let (mut group, errors, mut quest) = (
             GroupState::default(),
             UiErrorKeys::default(),
             QuestGiver::default(),
@@ -842,8 +1065,8 @@ mod tests {
             };
             list(
                 group,
-                &mut errors,
-                &mut MessageSounds::default(),
+                &errors,
+                &MessageSounds::default(),
                 &mut quest,
                 0,
                 0,
@@ -956,7 +1179,7 @@ mod tests {
                 let refused = app
                     .world()
                     .resource::<UiErrorKeys>()
-                    .0
+                    .snapshot()
                     .iter()
                     .map(|e| e.key)
                     .collect();
@@ -1047,6 +1270,88 @@ mod tests {
                 }
             ),
             [signal(28)]
+        );
+    }
+
+    /// A login's group list lands while the VM in hand is not the loaded interface's (the glue's,
+    /// the parked one, a bare entry VM), which defines none of `ITEM_QUALITY<n>_DESC`: the
+    /// threshold line keeps the global's key and takes the word from the VM that shows it
+    /// (`0x4e87c9`, `0x703bf0`). The master's name is read as the packet lands, from the player
+    /// cache with no callback, which a miss leaves unasked (`0x4e878f`).
+    #[test]
+    fn a_login_lists_loot_threshold_reads_its_word_from_the_vm_that_shows_it() {
+        use super::super::pets::tests::{app_with, ME};
+        use bevy::ecs::system::RunSystemOnce;
+
+        // The bare VM the packet lands on: no GlobalStrings at all.
+        let mut app = app_with(benilla_ui::script::UiScript::new().unwrap());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.insert_resource(NetCommands(tx));
+        app.init_resource::<UiErrorKeys>()
+            .init_resource::<MessageSounds>()
+            .init_resource::<QuestGiver>()
+            .insert_resource(SelfGuid(Some(ME)));
+        let aldwyn = 0x1001;
+        let brisca = 0x1002;
+        // Listed nowhere: a lookup with a callback would ask for it.
+        let stranger = 0x1003;
+        app.world_mut()
+            .resource_mut::<NameCache>()
+            .insert_player(aldwyn, "Aldwyn".into(), None);
+        let mut send = |master: u64| {
+            app.world_mut()
+                .run_system_once_with(
+                    on_list,
+                    SessionEvent::GroupList {
+                        group_type: 0,
+                        own_flags: 0,
+                        members: vec![member(aldwyn, "Aldwyn"), member(brisca, "Brisca")],
+                        leader: aldwyn,
+                        loot: Some(GroupLootInfo {
+                            method: 2,
+                            master,
+                            threshold: 3,
+                        }),
+                    },
+                )
+                .expect("the group-list handler");
+            app.world().resource::<UiErrorKeys>().take()
+        };
+        let lines = send(aldwyn);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+
+        // The interface comes up; the chat feed resolves the queued lines against it.
+        let real = benilla_ui::script::UiScript::new().unwrap();
+        real.run(
+            r#"
+            ERR_SET_LOOT_MASTER = "Looting changed to master looter."
+            ERR_NEW_LOOT_MASTER_S = "%s is now the loot master."
+            ERR_SET_LOOT_THRESHOLD_S = "Loot threshold set to %s"
+            ITEM_QUALITY3_DESC = "Rare"
+            "#,
+        )
+        .unwrap();
+        let shown: Vec<Option<String>> = lines
+            .iter()
+            .map(|e| {
+                crate::ui_action::ui_error_text(e, &|k| real.lua().globals().get::<String>(k).ok())
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                Some("Looting changed to master looter.".to_string()),
+                Some("Aldwyn is now the loot master.".to_string()),
+                Some("Loot threshold set to Rare".to_string()),
+            ]
+        );
+
+        // A master the cache does not hold is no line, and no query from this lookup.
+        let _ = crate::query_cache::queries(&rx);
+        assert_eq!(send(stranger), []);
+        assert!(
+            crate::query_cache::queries(&rx).is_empty(),
+            "the loot lookup carries no callback, so it asks nothing"
         );
     }
 }

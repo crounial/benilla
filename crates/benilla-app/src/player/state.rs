@@ -116,6 +116,10 @@ pub(super) const SKIN_WIDTH: f32 = 0.02;
 
 /// Seconds of stalled streaming before the post-snap hold gives up: the streamer pushes the
 /// deadline on while the world is stale or any load counter moves, so only a dead stream hits it.
+/// Terrain that never arrives still holds the body, by the world query gate ([`super::edge`]),
+/// so what the release can hand over early is a placement that never spawned. Deviation: the
+/// reference's blocking load (`0x694920`) waits out its reads before the frame goes on and has
+/// no such release; without one, a model that never loads would freeze our body for good.
 pub(crate) const SETTLE_TIMEOUT: f32 = 6.0;
 
 /// The player body's collision capsule, swept by avian's `MoveAndSlide`: origin at its centre, the
@@ -281,6 +285,14 @@ pub(crate) fn incapacitated_flags(flags: u32, translate_gated: bool, turn_gated:
     out
 }
 
+/// The local player's own control, the reference's `[0xb4b3e4]` cleared (`0x4958e0`): written by
+/// `0x5fa600` only when the named unit is our own character (`0x5fa6d0`), so a possessed
+/// creature's loss ([`Player::control_lost`] on a released guid) never reaches it. The item and
+/// cursor gates, StartAttack, `HasFullControl` and `PLAYER_CONTROL_LOST` read this one. A resource
+/// of its own, so its many readers do not order against every other writer of [`Player`].
+#[derive(Resource, Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OwnControlLost(pub(crate) bool);
+
 /// Our avatar: until `active` the camera free-flies, then we drive the body the server placed.
 /// `PartialEq` serves the test that the session end resets the whole of it to `Player::default()`.
 #[derive(Resource, Default, PartialEq)]
@@ -308,11 +320,6 @@ pub(crate) struct Player {
     /// standing. The reference zeroes its mover; vmangos neither roots a charmed player nor refuses
     /// its movement, so nothing else holds the body. Unlike a root, it stops turning too.
     pub(crate) control_lost: bool,
-    /// The local player's own control, the reference's `[0xb4b3e4]` cleared (`0x4958e0`): written
-    /// by `0x5fa600` only when the named unit is our own character (`0x5fa6d0`), so a possessed
-    /// creature's loss ([`Self::control_lost`] on a released guid) never reaches it. The item and
-    /// cursor gates, `HasFullControl` and `PLAYER_CONTROL_LOST` read this one.
-    pub(crate) own_control_lost: bool,
     /// The unit we drive in place of our body (a mind-controlled creature, Eye of Kilrogg), `None`
     /// for our own. Our body must then send nothing: outbound `MSG_MOVE_*` carry no guid, so the
     /// server applies them to whatever we last claimed.
@@ -372,6 +379,11 @@ pub(crate) struct Player {
     /// Milliseconds of movement the settle hold skipped, sent as `CMSG_MOVE_TIME_SKIPPED` on the
     /// release edge; fractional because it accrues a frame `dt` at a time.
     pub(super) skipped_ms: f32,
+    /// The world query gate's sub-millisecond residue, carried into its next per-frame report.
+    pub(super) gate_skip_ms: f32,
+    /// The last mover step was refused by the world query gate ([`super::edge`]), the latch of the
+    /// `gate` trace's edges.
+    pub(super) gated: bool,
     /// When the current airborne phase began (`Time::elapsed_secs`): the wire `fall_time`, and the
     /// take-off and landing edges that emit `MSG_MOVE_JUMP` and `MSG_MOVE_FALL_LAND`.
     pub(super) airborne_since: Option<f32>,
@@ -413,7 +425,7 @@ pub(crate) struct Player {
     /// live flags read them instead of the keys; re-seeded by the air nudge, stale while grounded.
     pub(super) airborne_dirs: u32,
     /// Launch height (Bevy Y), the client's `StartFalling` z snapshot (`+0x7c`): the FALLINGFAR
-    /// distance leg measures descent below it.
+    /// distance leg measures descent below it. A rider's moves with the deck ([`Self::carry_to`]).
     pub(super) fall_start_y: f32,
     /// `MOVEFLAG_FALLINGFAR` latched for this arc ([`FALL_FAR_DROP`], [`FALL_FAR_TIME`]); only
     /// landing clears it, as the client's `StopFalling` does.
@@ -550,6 +562,13 @@ impl Player {
     /// (turning) on them, as the reference's ripple driver `0x5fa760` does.
     pub(crate) fn move_flags(&self) -> u32 {
         self.move_flags
+    }
+
+    /// `CGPlayer_C::GetStandState` (`0x5ed570`) for the active player: the local state
+    /// `[player+0x1d68]`, a committed change ahead of its echo, else `descriptor`, the
+    /// `UNIT_FIELD_BYTES_1` byte 0 it tracks.
+    pub(crate) fn stand_state(&self, descriptor: u8) -> u8 {
+        self.stand_pending.unwrap_or(descriptor)
     }
 
     /// The states on this resource that stop WASD, comma-joined, or `"none"`: an instrument for the

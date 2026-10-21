@@ -236,6 +236,16 @@ pub(crate) struct Creatures {
 }
 
 impl Creatures {
+    /// The display row a unit's records come from (`0x60afb0`).
+    pub(crate) fn records_row(&self, display_id: u32) -> Option<u32> {
+        self.catalog.records_row(display_id)
+    }
+
+    /// Whether `display_id` names other records than the `held` row's (`0x60ae10`).
+    pub(crate) fn display_records_differ(&self, display_id: u32, held: u32) -> bool {
+        self.catalog.display_records_differ(display_id, held)
+    }
+
     /// Whether a display id has a model row behind it (`CreatureDisplayInfo` → `CreatureModelData`),
     /// the chain `0x5ec480` walks after the race row's id.
     pub(crate) fn resolves_model(&self, display_id: u32) -> bool {
@@ -336,8 +346,8 @@ impl Creatures {
     }
 
     /// A built display's booth framing (model-local, pre-scale): its authored cameras, index 0 of
-    /// `cameraLookup` for the round portrait (`0x713540`) and raw index 1 for a `<PlayerModel>`
-    /// pane (`0x505890`), with each path's fallback for a model that has none.
+    /// `cameraLookup` for the round portrait (`0x713540`) and the raw table for a `<PlayerModel>`
+    /// pane (`0x505890`, `SetCamera`), with each path's fallback for a model that has none.
     pub(crate) fn display_anchors(
         &self,
         display_id: u32,
@@ -346,7 +356,7 @@ impl Creatures {
         dm.parts.as_ref()?; // not yet built
         Some(crate::portrait::PortraitAnchors {
             camera: dm.portrait_camera,
-            pane_camera: dm.pane_camera,
+            cameras: dm.cameras.clone(),
             bbox_center: dm.bake_center_local,
             head: crate::portrait::head_anchor(&dm.skeleton, &dm.attachments),
             pivot_height: dm.pivot_height_local,
@@ -881,6 +891,19 @@ fn setup_entities(
             f.err().or(p.err()).expect("at least one of the two failed")
         ),
     }
+    // The unit tooltip's studied-creature block: without `Resistances.dbc` the armor line reads
+    // the reference's no-school slot, and without `CreatureSpellData.dbc` no ability line shows.
+    let armor_school = benilla_formats::load_armor_school(&mut chain)
+        .map_err(|e| warn!("Resistances.dbc unavailable, no armor school: {e:#}"))
+        .ok()
+        .flatten();
+    let pet_spells = benilla_formats::load_creature_spell_data(&mut chain)
+        .map_err(|e| warn!("CreatureSpellData.dbc unavailable, no pet abilities: {e:#}"))
+        .ok();
+    commands.insert_resource(crate::ui_unit::tooltip_facts::StudyTables {
+        armor_school,
+        pet_spells,
+    });
     match CharacterGeosets::load(&mut chain) {
         Ok(geosets) => commands.insert_resource(Characters(geosets)),
         Err(e) => warn!("character geosets unavailable, players show every geoset: {e:#}"),

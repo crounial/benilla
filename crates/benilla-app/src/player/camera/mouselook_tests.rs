@@ -460,7 +460,7 @@ fn nameplate(over_ui: bool) -> World {
             skull: false,
             level_colour: [1.0, 1.0, 0.0],
             raid_icon: None,
-            alpha: 1.0,
+            alpha: 255,
             lit: false,
             hovered: false,
         }],

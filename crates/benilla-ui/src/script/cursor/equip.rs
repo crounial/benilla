@@ -184,7 +184,7 @@ mod tests {
 
     fn bag(slots: &[(u32, u64, u32)]) -> ContainerState {
         ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots: slots
                 .iter()
@@ -289,7 +289,7 @@ mod tests {
     /// slot.
     fn boe_bag(bonding: u32, bound: bool) -> ContainerState {
         ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots: [(
                 1,
@@ -375,6 +375,7 @@ mod tests {
     #[test]
     fn a_right_click_on_a_bind_on_equip_item_holds_it_under_the_question() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_container(0, Some(boe_bag(2, false)));
         s.run("UseContainerItem(0, 1)").unwrap();
 
@@ -393,6 +394,7 @@ mod tests {
     #[test]
     fn a_right_click_on_an_ordinary_item_sends_and_leaves_the_cursor_empty() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_container(0, Some(boe_bag(0, false)));
         s.run("UseContainerItem(0, 1)").unwrap();
 
@@ -410,6 +412,7 @@ mod tests {
     #[test]
     fn the_accept_clears_the_cursor_and_sends_without_asking_again() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_container(0, Some(boe_bag(2, false)));
         s.run("UseContainerItem(0, 1)").unwrap();
         assert!(s.cursor_item().is_some());

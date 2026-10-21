@@ -9,10 +9,10 @@
 
 use bevy::prelude::*;
 
-use benilla_ui::script::{PetStats, ScriptValue, UiScript};
+use benilla_ui::script::{PetStats, ScriptValue};
 
 use crate::names::NameCache;
-use crate::net::{NetCommands, ObjectStore};
+use crate::net::ObjectStore;
 use crate::ui_pet::{PetBar, PetUnit};
 use crate::ui_unit::UnitFeed;
 
@@ -63,21 +63,18 @@ impl Plugin for UiPetStatsPlugin {
 
 /// The pet's family word, icon and diet, from its cached creature template. The template entry is
 /// the descriptor's `OBJECT_FIELD_ENTRY`, not the guid's entry slot, which holds the pet number
-/// (vmangos `Pet::Create`); `Creature::InitEntry` writes the real entry (`Creature.cpp:376`). A
-/// miss sends the ask-once creature query and answers all-absent until it lands. The icon is
-/// `CreatureFamily.dbc`'s own column: `GetPetIcon`'s answer and the stable's slot art.
+/// (vmangos `Pet::Create`); `Creature::InitEntry` writes the real entry (`Creature.cpp:376`). The
+/// record is only read, as `GetPetIcon` and `GetPetFoodTypes` read the unit's (`0x4beb10`,
+/// `0x4bea10`), which the unit's create asked for; a miss answers all-absent until it lands. The
+/// icon is `CreatureFamily.dbc`'s own column: `GetPetIcon`'s answer and the stable's slot art.
 fn family_for(
     pet: Option<&ObjectStore>,
     names: &NameCache,
-    commands: &NetCommands,
     tables: Option<&PetFamilyTables>,
 ) -> (Option<String>, Option<String>, Vec<String>) {
     let Some(entry) = pet.and_then(|s| s.0.object_entry()).filter(|&e| e != 0) else {
         return (None, None, Vec::new());
     };
-    // vmangos answers a creature query off the entry alone (`HandleCreatureQueryOpcode`), so the
-    // guid is 0.
-    let _ = names.resolve_creature(entry, 0, commands);
     let Some(tables) = tables else {
         return (None, None, Vec::new());
     };
@@ -161,71 +158,73 @@ fn stats_for(
 }
 
 pub(crate) fn feed_pet_stats(
-    script: Option<NonSendMut<UiScript>>,
-    bar: Res<PetBar>,
+    mut vm: crate::script_calls::VmWith<Res<'static, PetBar>>,
     pet: PetUnit,
     self_store: Query<&ObjectStore, With<crate::net::SelfPlayer>>,
     tables: Option<Res<PetStatTables>>,
     family_tables: Option<Res<PetFamilyTables>>,
     names: Res<NameCache>,
-    commands: Res<NetCommands>,
     mut last: Local<crate::ui_script::VmMemo<Option<(bool, PetStats)>>>,
 ) {
-    let Some(mut script) = script else {
-        return;
-    };
-    let last = last.get(&script);
-    let store = pet.store(bar.spells.pet_guid);
-    let family = family_for(store, &names, &commands, family_tables.as_deref());
-    let fresh = stats_for(store, self_store.iter().next(), tables.as_deref(), family);
-    if last.as_ref() == Some(&fresh) {
-        return;
-    }
-    // `UNIT_HAPPINESS`, the pet frame's icon repaint (`PetFrame.lua:63`). Deviation: fired when
-    // the bucket or its two tooltip figures change, not on every change of the happiness field as
-    // in the reference, because no stock consumer reads the raw value.
-    let happiness_moved = last.as_ref().map(|(_, s)| {
-        (
-            s.happiness,
-            s.damage_percentage.to_bits(),
-            s.loyalty_rate.to_bits(),
-        )
-    }) != Some((
-        fresh.1.happiness,
-        fresh.1.damage_percentage.to_bits(),
-        fresh.1.loyalty_rate.to_bits(),
-    ));
-    if happiness_moved {
-        debug!(
-            "ui_pet_stats: happiness {:?} ({}% damage), loyalty {:?}",
-            fresh.1.happiness, fresh.1.damage_percentage, fresh.1.loyalty
-        );
-    }
-    // The family lands with the creature-query answer and fires nothing: the pet page registers no
-    // event known to fire then (not the reference's query event, `UNIT_CLASSIFICATION_CHANGED`).
-    // The page's `OnShow` covers an open; a page already open repaints on its next `UNIT_STATS`.
-    if last.as_ref().map(|(_, s)| &s.family) != Some(&fresh.1.family) {
-        debug!(
-            "ui_pet_stats: pet family {:?}, diet {:?}",
-            fresh.1.family, fresh.1.food_types
-        );
-    }
-    *last = Some(fresh.clone());
-    script.set_pet_stats(fresh.0, fresh.1);
-    // Push before firing: dispatch runs the Lua handlers synchronously.
-    if happiness_moved {
-        // `arg1` is the unit token, as on every 1.12 `UNIT_*` event; its handlers gate on it.
-        script.fire_event("UNIT_HAPPINESS", vec![ScriptValue::Str("pet".into())]);
-    }
-    // The pet page's other repaint events, `UNIT_PET_EXPERIENCE` and `UNIT_PET_TRAINING_POINTS`
-    // (`PetPaperDollFrame.lua:9,21`), are the bridge's watches on fields 141/142 and 149
-    // (`crate::field_watch`), fired after this push.
+    vm.feed(|script, bar, fires| {
+        let Some(script) = script else {
+            return;
+        };
+        let last = last.get(script);
+        let store = pet.store(bar.spells.pet_guid);
+        let family = family_for(store, &names, family_tables.as_deref());
+        let fresh = stats_for(store, self_store.iter().next(), tables.as_deref(), family);
+        if last.as_ref() == Some(&fresh) {
+            return;
+        }
+        // `UNIT_HAPPINESS`, the pet frame's icon repaint (`PetFrame.lua:63`). Deviation: fired when
+        // the bucket or its two tooltip figures change, not on every change of the happiness field
+        // as in the reference, because no stock consumer reads the raw value.
+        let happiness_moved = last.as_ref().map(|(_, s)| {
+            (
+                s.happiness,
+                s.damage_percentage.to_bits(),
+                s.loyalty_rate.to_bits(),
+            )
+        }) != Some((
+            fresh.1.happiness,
+            fresh.1.damage_percentage.to_bits(),
+            fresh.1.loyalty_rate.to_bits(),
+        ));
+        if happiness_moved {
+            debug!(
+                "ui_pet_stats: happiness {:?} ({}% damage), loyalty {:?}",
+                fresh.1.happiness, fresh.1.damage_percentage, fresh.1.loyalty
+            );
+        }
+        // The family lands with the creature-query answer and fires nothing: the pet page registers
+        // no event known to fire then (not the reference's query event,
+        // `UNIT_CLASSIFICATION_CHANGED`). The page's `OnShow` covers an open; a page already open
+        // repaints on its next `UNIT_STATS`.
+        if last.as_ref().map(|(_, s)| &s.family) != Some(&fresh.1.family) {
+            debug!(
+                "ui_pet_stats: pet family {:?}, diet {:?}",
+                fresh.1.family, fresh.1.food_types
+            );
+        }
+        *last = Some(fresh.clone());
+        script.set_pet_stats(fresh.0, fresh.1);
+        // The push before the post: the handlers run when it fires, after the turn, and read it.
+        if happiness_moved {
+            // `arg1` is the unit token, as on every 1.12 `UNIT_*` event; its handlers gate on it.
+            fires.post("UNIT_HAPPINESS", vec![ScriptValue::Str("pet".into())]);
+        }
+        // The pet page's other repaint events, `UNIT_PET_EXPERIENCE` and `UNIT_PET_TRAINING_POINTS`
+        // (`PetPaperDollFrame.lua:9,21`), are the bridge's watches on fields 141/142 and 149
+        // (`crate::field_watch`), fired after this push.
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use benilla_protocol::ObjectFields;
+    use benilla_ui::script::UiScript;
 
     const BYTES_0: u16 = 36;
     const BYTES_1: u16 = 138;
@@ -302,20 +301,13 @@ mod tests {
                 pet_family,
                 rank: 0,
                 type_flags: 0,
+                pet_spell_list: 0,
                 civilian: false,
                 racial_leader: false,
                 display_id: 0,
             }),
         );
         names
-    }
-
-    fn commands() -> (
-        NetCommands,
-        crossbeam_channel::Receiver<crate::net::ClientCommand>,
-    ) {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        (NetCommands(tx), rx)
     }
 
     /// On the real DBC data: the training-point word order, the loyalty byte, and a maxed pet's
@@ -447,40 +439,31 @@ mod tests {
     #[test]
     fn the_pets_family_resolves_off_its_descriptor_entry() {
         let Some(t) = family_tables() else { return };
-        let (cmds, rx) = commands();
 
         // 1. No pet.
         let names = NameCache::default();
-        assert_eq!(family_for(None, &names, &cmds, Some(&t)), no_family());
-        assert!(rx.try_recv().is_err(), "nothing to ask about");
+        assert_eq!(family_for(None, &names, Some(&t)), no_family());
 
-        // 2. Unanswered: nil, and the ask goes out once.
+        // 2. Unanswered: nil. Nothing is asked here: the record is the unit's, which its create
+        // looked up (`0x60b15b`).
         let pet = ObjectStore(ObjectFields::from_pairs(&[
             (ENTRY, IMP_ENTRY),
             (PETNUMBER, 7),
         ]));
         assert_eq!(
-            family_for(Some(&pet), &names, &cmds, Some(&t)),
+            family_for(Some(&pet), &names, Some(&t)),
             no_family(),
             "un-queried is nil, not a guess"
         );
-        assert!(
-            matches!(
-                rx.try_recv(),
-                Ok(crate::net::ClientCommand::CreatureQuery { entry, .. }) if entry == IMP_ENTRY
-            ),
-            "the pet's DESCRIPTOR entry is what gets queried"
-        );
-        assert!(rx.try_recv().is_err(), "ask-once");
 
         // 3. Family 0, a template with no family: nil.
         let names = cache_with(IMP_ENTRY, 0);
-        assert_eq!(family_for(Some(&pet), &names, &cmds, Some(&t)), no_family());
+        assert_eq!(family_for(Some(&pet), &names, Some(&t)), no_family());
 
         // 4. The Imp's family 23: a word and an empty diet, food mask 0 in the shipped DBC.
         let names = cache_with(IMP_ENTRY, 23);
         assert_eq!(
-            family_for(Some(&pet), &names, &cmds, Some(&t)),
+            family_for(Some(&pet), &names, Some(&t)),
             (
                 Some("Imp".into()),
                 // Rows 15 (Felhunter) and 23 (Imp) ship this placeholder; the stable, the
@@ -492,7 +475,7 @@ mod tests {
 
         // 5. A boar (family 5): the word and six diets, in bit order.
         let names = cache_with(BOAR_ENTRY, 5);
-        let (name, icon, diet) = family_for(Some(&boar()), &names, &cmds, Some(&t));
+        let (name, icon, diet) = family_for(Some(&boar()), &names, Some(&t));
         assert_eq!(name.as_deref(), Some("Boar"));
         assert_eq!(
             icon.as_deref(),
@@ -502,7 +485,7 @@ mod tests {
 
         // 6. No DBC tables: nil.
         let names = cache_with(BOAR_ENTRY, 5);
-        assert_eq!(family_for(Some(&boar()), &names, &cmds, None), no_family());
+        assert_eq!(family_for(Some(&boar()), &names, None), no_family());
     }
 
     /// A boar under a non-hunter (family 5, food mask 63) is the one case that shows the split, as
@@ -574,11 +557,13 @@ mod tests {
             .init_resource::<crate::net::Reputations>()
             .init_resource::<crate::spell::QueuedMeleeSpell>()
             .init_resource::<crate::spell::AutoRepeatActive>()
+            .init_resource::<crate::creature_anim::UnitEdits>()
+            .add_message::<crate::player::StandStateRequest>()
             .init_resource::<crate::ui_loot::LootState>()
             .init_resource::<crate::ui_loot::LootLatch>()
             .add_message::<crate::creature_anim::SheathRequest>()
             .add_message::<crate::net::FieldChanged>()
-            .insert_resource(NetCommands(tx))
+            .insert_resource(crate::net::NetCommands(tx))
             .add_plugins((UiPetStatsPlugin, UiPetPlugin));
 
         // The pet is in the world when the bar's guid lands: a cold summon.

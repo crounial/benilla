@@ -25,6 +25,7 @@ pub(crate) use latch::{
     dispatch, fire, note_closed, queue, register, release, with_script, CoreCloses, InteractLatch,
     LatchApp, LatchVocal, LatchedWindow, NpcWindow,
 };
+pub(crate) use release::form_bars_interaction;
 
 /// Owns [`InteractLatch`], its watchdog and [`InteractNpc`], read by the `"npc"` portrait and the
 /// interaction face-me.
@@ -380,7 +381,8 @@ mod tests {
         ];
 
         // The chain's own source says what is wired.
-        let this_file = include_str!("ui_session.rs");
+        // Line endings normalised first: the end of the function is found on `\n`.
+        let this_file = include_str!("ui_session.rs").replace("\r\n", "\n");
         let chain = this_file
             .split_once("pub(crate) fn feed_interact_npc")
             .expect("feed_interact_npc")

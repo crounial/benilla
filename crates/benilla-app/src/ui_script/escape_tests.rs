@@ -40,10 +40,11 @@ fn one_item_backpack() -> ContainerState {
             flags: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         },
     );
     ContainerState {
-        name: Some("Backpack".into()),
+        name: None,
         num_slots: 16,
         slots,
     }
@@ -184,6 +185,7 @@ fn escape_is_consumed_by_a_focused_editbox_and_leaves_windows_open() {
 fn escape_closes_the_options_window_before_opening_the_menu() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_xml(&s, r"Interface\FrameXML\GlobalStrings.lua");
     load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
@@ -292,12 +294,13 @@ fn escape_closes_an_open_stack_split_frame() {
             flags: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         },
     );
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots,
         }),
@@ -330,6 +333,7 @@ fn escape_ladder_cast_then_windows_then_target_one_eater_per_press() {
 
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     for file in crate::ui_script::test_ui::production_order(&[
         BAG_UI,
@@ -358,7 +362,10 @@ fn escape_ladder_cast_then_windows_then_target_one_eater_per_press() {
     );
 
     // Press 0, mid-cast with a dropdown open: `CloseMenus` eats it.
-    s.set_casting(true);
+    s.set_cast_view(benilla_ui::script::CastView {
+        slot: Some(133),
+        ..Default::default()
+    });
     // Stock `DropDownList` `OnShow` sizes its buttons from `maxWidth`, which
     // `UIDropDownMenu_Initialize` normally sets (`UIDropDownMenuTemplates.xml:237-245`).
     s.run("DropDownList1.maxWidth = 100 DropDownList1:Show()")
@@ -380,7 +387,10 @@ fn escape_ladder_cast_then_windows_then_target_one_eater_per_press() {
     assert!(!s.take_target_clear());
 
     // Press 1, mid-cast: `SpellStopCasting` eats it.
-    s.set_casting(true);
+    s.set_cast_view(benilla_ui::script::CastView {
+        slot: Some(133),
+        ..Default::default()
+    });
     s.run("ToggleGameMenu()").unwrap();
     assert!(
         bag_open(&s, 0),
@@ -396,7 +406,7 @@ fn escape_ladder_cast_then_windows_then_target_one_eater_per_press() {
     );
 
     // Press 2, the cast over: `CloseAllWindows` eats it.
-    s.set_casting(false);
+    s.set_cast_view(Default::default());
     s.run("ToggleGameMenu()").unwrap();
     assert!(
         !bag_open(&s, 0),
@@ -436,6 +446,7 @@ fn escape_ladder_cast_then_windows_then_target_one_eater_per_press() {
 fn escape_ladder_targeting_rung_after_cast_before_windows() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     for file in crate::ui_script::test_ui::production_order(&[
         BAG_UI,
@@ -475,7 +486,10 @@ fn escape_ladder_targeting_rung_after_cast_before_windows() {
 
     // Press 2, casting and targeting both (the state the app pushes while the cursor is up, the
     // targeting spell being in flight): the cast rung is first.
-    s.set_casting(true);
+    s.set_cast_view(benilla_ui::script::CastView {
+        slot: Some(133),
+        ..Default::default()
+    });
     s.run("ToggleGameMenu()").unwrap();
     assert!(s.take_spell_stop(), "the cast rung eats first");
     assert!(
@@ -484,7 +498,7 @@ fn escape_ladder_targeting_rung_after_cast_before_windows() {
     );
 
     // Press 3, idle: both rungs answer nil and `CloseAllWindows` eats it.
-    s.set_casting(false);
+    s.set_cast_view(Default::default());
     s.set_spell_targeting(false);
     s.run("ToggleGameMenu()").unwrap();
     assert!(!s.take_stop_targeting(), "no stray trigger when idle");
@@ -501,6 +515,7 @@ fn escape_ladder_targeting_rung_after_cast_before_windows() {
 fn an_addon_frame_registered_in_uispecialframes_closes_on_escape() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_xml(&s, r"Interface\FrameXML\GlobalStrings.lua");
     load_xml(&s, "Interface\\FrameXML\\Fonts.xml");

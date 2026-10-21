@@ -1,7 +1,7 @@
 //! The engine verbs stock `ChatFrame.lua`'s slash handlers call that are not sends, channels or
 //! window state: `DoEmote` (`0x49fd30`), `RandomRoll` (`0x48c7b0`), `AssistByName` (`0x489c40`),
-//! `UninviteByName` (`0x48a610`), `ConsoleExec`, `LoggingChat` and `LoggingCombat`. Each is a
-//! queue or a flag the app drains.
+//! `UninviteByName` (`0x48a610`), `LoggingChat` and `LoggingCombat`. Each is a queue or a flag the
+//! app drains.
 
 use mlua::{Lua, MultiValue, Value};
 
@@ -48,7 +48,8 @@ impl super::UiScript {
         std::mem::take(&mut self.model_mut().uninvite_requests)
     }
 
-    /// `ConsoleExec` lines that write no CVar: the app's console commands (`reloadui`, …).
+    /// `ConsoleExec` lines its own CVar commands did not run ([`super::console_exec`]): the app's
+    /// console commands (`reloadui`, …), a bare CVar name, an unknown word.
     pub fn take_console_lines(&mut self) -> Vec<String> {
         std::mem::take(&mut self.model_mut().console_lines)
     }
@@ -65,42 +66,6 @@ impl super::UiScript {
     }
 }
 
-/// `ConsoleExec` (`0x515f10`) is in the registrar both states call (`0x51bb20`, from the glue
-/// registrar `0x46abb0` and the in-game `0x51bb60`), so it installs apart from this file's in-game
-/// verbs.
-pub(super) fn install_console_exec(lua: &Lua) -> mlua::Result<()> {
-    // `ConsoleExec("name value")`: a registered CVar with a value is written at once, as `SetCVar`
-    // writes it; anything else, a bare CVar name included (the reference answers it with
-    // `CVar "%s" is "%s"`, `0x63dde0`), goes to the app's command registry.
-    lua.globals().set(
-        "ConsoleExec",
-        lua.create_function(|lua, line: Option<String>| {
-            let Some(line) = line.map(|l| l.trim().to_string()).filter(|l| !l.is_empty()) else {
-                return Ok(());
-            };
-            let (name, value) = line
-                .split_once(char::is_whitespace)
-                .map_or((line.as_str(), ""), |(n, v)| (n, v.trim()));
-            // `reloadUI` is `ReloadUiCommand` (`0x4035f0`), which asks `CGGameUI::Reload`'s gate,
-            // tag 10 (`0x4035fa` → `0x491380`), inside the call: refused, it does nothing.
-            if name.eq_ignore_ascii_case("reloadui")
-                && !super::protected::gate(lua, super::protected::Tag::RELOAD)
-            {
-                return Ok(());
-            }
-            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            let is_cvar = model.cvars.contains_key(&name.to_ascii_lowercase());
-            if is_cvar && !value.is_empty() {
-                super::cvars::write_cvar(&mut model, name, value.to_string());
-            } else {
-                model.console_lines.push(line.clone());
-            }
-            Ok(())
-        })?,
-    )?;
-    Ok(())
-}
-
 pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     let g = lua.globals();
 
@@ -113,13 +78,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
             model.emote_requests.push(EmoteRequest {
                 token: token.to_ascii_uppercase(),
-                target: match target {
-                    Value::String(s) => Some(s.to_string_lossy()),
-                    Value::Integer(i) => Some(i.to_string()),
-                    Value::Number(n) => Some(n.to_string()),
-                    _ => None,
-                }
-                .filter(|t| !t.is_empty()),
+                // `lua_tostring(2)` (`0x49fdc5`): a number is its `%.14g` text.
+                target: crate::script::binding_abi::optional_string(lua, &target)
+                    .filter(|t| !t.is_empty()),
             });
             Ok(())
         })?,
@@ -142,11 +103,13 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 return Ok(());
             };
             let may_cast = super::protected::select_may_cast(lua);
-            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            model.queue_call(super::ScriptCall::Select {
-                request: super::SelectionRequest::AssistByName(name),
-                may_cast,
-            });
+            super::calls::submit(
+                lua,
+                super::ScriptCall::Select {
+                    request: super::SelectionRequest::AssistByName(name),
+                    may_cast,
+                },
+            )?;
             Ok(())
         })?,
     )?;
@@ -252,6 +215,7 @@ mod tests {
     #[test]
     fn assist_and_uninvite_by_name_queue_their_names() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.run("AssistByName('Alice') AssistByName('') UninviteByName('Carol') UninviteByName()")
             .unwrap();
         assert_eq!(
@@ -259,43 +223,6 @@ mod tests {
             vec![SelectionRequest::AssistByName("Alice".into())]
         );
         assert_eq!(s.take_uninvite_requests(), vec!["Carol".to_string()]);
-    }
-
-    #[test]
-    fn console_exec_writes_a_registered_cvar_and_queues_anything_else() {
-        let mut s = UiScript::new().unwrap();
-        s.register_cvars([("uiScale", "1")]);
-        s.run("ConsoleExec('uiscale 0.8') ConsoleExec('reloadui') ConsoleExec('  ') ConsoleExec('uiScale')")
-            .unwrap();
-        assert_eq!(
-            s.eval::<String>("return GetCVar('uiScale')").unwrap(),
-            "0.8",
-            "the CVar store is the same one SetCVar writes, matched case-insensitively"
-        );
-        // A bare CVar name, whose value the reference prints, goes to the command lane.
-        assert_eq!(
-            s.take_console_lines(),
-            vec!["reloadui".to_string(), "uiScale".to_string()]
-        );
-        assert_eq!(
-            s.take_cvar_changes(),
-            vec![("uiScale".to_string(), "0.8".to_string())],
-            "a bare name writes nothing"
-        );
-    }
-
-    /// `reloadUI` is `ReloadUiCommand` (`0x4035f0`), which asks the gate's tag 10 (`0x4035fa`): a
-    /// macro's line outside an input event is ignored, a key's body or the client's own passes.
-    #[test]
-    fn console_exec_reload_ui_asks_the_gate() {
-        let mut s = UiScript::new().unwrap();
-        s.run(r#"RunScript("ConsoleExec('reloadUI')")"#).unwrap();
-        assert!(s.take_console_lines().is_empty());
-        s.run_binding(r#"RunScript("ConsoleExec('ReloadUI')")"#)
-            .unwrap();
-        assert_eq!(s.take_console_lines(), vec!["ReloadUI".to_string()]);
-        s.run("ConsoleExec('reloadui')").unwrap();
-        assert_eq!(s.take_console_lines(), vec!["reloadui".to_string()]);
     }
 
     #[test]
@@ -323,5 +250,18 @@ mod tests {
         assert_eq!(s.eval::<i64>("return LoggingChat(true)").unwrap(), 1);
         assert_eq!(s.arity("LoggingChat(nil)").unwrap(), 1);
         assert!(s.eval::<bool>("return LoggingChat(nil) == nil").unwrap());
+    }
+
+    /// `AssistByName` (`0x489c40`) selects inside its call with a host lent.
+    #[test]
+    fn assist_by_name_applies_in_the_call_with_a_host_lent() {
+        let mut s = UiScript::new().unwrap();
+        assert_eq!(
+            crate::script::host::test_support::applied_in_call(&mut s, "AssistByName('Alice')"),
+            vec![crate::script::ScriptCall::Select {
+                request: SelectionRequest::AssistByName("Alice".into()),
+                may_cast: true,
+            }]
+        );
     }
 }

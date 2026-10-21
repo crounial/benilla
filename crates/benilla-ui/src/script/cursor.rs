@@ -5,9 +5,9 @@
 //! ([`set_cursor`] from a Lua verb, one segment each, so the clear's `CURSOR_UPDATE` reads the
 //! emptied cursor before the set), and every verb that drops a payload clears through [`clear`].
 
-use mlua::Lua;
+use mlua::{Lua, Value};
 
-use super::binding_abi::flag;
+use super::binding_abi::{self, flag};
 use super::tick::verb;
 use super::{Model, ScriptValue};
 
@@ -19,7 +19,7 @@ pub(crate) mod equip;
 pub(crate) mod money;
 pub(super) mod pet;
 
-pub(crate) use bar::place_action;
+pub(crate) use bar::{clear_macro_slots, place_action};
 pub(crate) use drag::{
     abandon_drag, maybe_start_drag, press_drag, take_drag, DragGesture, DragRelease,
 };
@@ -83,9 +83,10 @@ impl CursorPayload {
                 texture: None,
                 count: 0,
                 consumable: false,
+                state: None,
             }),
             CursorPayload::Macro(_) => CursorPayload::Macro(CursorMacro {
-                index: 0,
+                id: 0,
                 texture: None,
             }),
             CursorPayload::PetAction(_) => CursorPayload::PetAction(CursorPetAction {
@@ -228,6 +229,10 @@ pub struct CursorAction {
     /// so the slot's `ACTIONBAR_SLOT_CHANGED` handler reads them before the app's re-feed.
     pub count: u32,
     pub consumable: bool,
+    /// The source slot's per-frame state, which a place writes back with the slot for the same
+    /// handler: the reference answers `IsEquippedAction` and kin for the slot's action at call
+    /// time (`0x4e74e0`), so the moved item's green border goes with it.
+    pub(crate) state: Option<super::action::StoredActionState>,
 }
 
 /// A pet-bar payload, mode 4, from `PickupPetAction` or the pet spellbook: the packed action word
@@ -251,8 +256,8 @@ pub struct CursorPetAction {
 /// `PlaceAction` accepts (`0x4e62e0`). It has no source slot, so a refused place leaves it held.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CursorMacro {
-    /// The 1-based macro index: 1..=18 account, 19..=36 character.
-    pub index: u32,
+    /// The macro's id (`[0xb4e2fc]`), not its position: the table re-sorts under a held macro.
+    pub id: u32,
     pub texture: Option<String>,
 }
 
@@ -551,17 +556,22 @@ pub(crate) fn world_drop_click(model: &mut Model) -> bool {
 /// clears with `ClearCursor(1,1)` (`0x4fa078`), whatever is held, stops spell targeting
 /// (`0x4fa07d`, `0x6e4900`), then picks up ([`pick_up_item`], `0x4fa0aa`), so its handlers see
 /// two clears and the set. Returns whether anything was picked up.
-pub(crate) fn split_container_item(lua: &Lua, bag: i64, slot: u32, count: i64) -> bool {
+pub(crate) fn split_container_item(
+    lua: &Lua,
+    bag: i64,
+    slot: u32,
+    count: i64,
+) -> mlua::Result<bool> {
     let item = {
         let model = lua.app_data_ref::<Model>().expect("model app_data");
         let Some(s) = model.containers.get(&bag).and_then(|c| c.slots.get(&slot)) else {
-            return false;
+            return Ok(false);
         };
         if s.item_id == 0 || item_locked(&model, s.guid) {
-            return false;
+            return Ok(false);
         }
         if count < 1 || count > i64::from(s.count) {
-            return false;
+            return Ok(false);
         }
         let n = count as u32;
         let whole = n == s.count;
@@ -580,15 +590,16 @@ pub(crate) fn split_container_item(lua: &Lua, bag: i64, slot: u32, count: i64) -
             equip_slots: s.equip_slots.clone(),
         }
     };
-    verb(lua, |model| {
+    let targeting = verb(lua, |model| {
         clear_cursor(model);
-        // `StopTargeting` ends an armed spell's targeting, as `SpellStopTargeting` does.
-        if model.spell_targeting {
-            model.queue_call(super::ScriptCall::SpellStopTargeting);
-        }
+        model.spell_targeting
     });
+    // `StopTargeting` ends an armed spell's targeting, as `SpellStopTargeting` does.
+    if targeting {
+        super::calls::submit(lua, super::ScriptCall::SpellStopTargeting)?;
+    }
     pick_up_item(lua, item);
-    true
+    Ok(true)
 }
 
 /// `DeleteCursorItem()` (`0x4897b0`), the delete popup's accept: a held item queues its
@@ -798,6 +809,19 @@ impl super::UiScript {
         clear_cursor(&mut self.model_mut());
     }
 
+    /// The world click router's object leg (`0x492ce0`): `ClearCursor(1, 1)` only while a preview
+    /// payload is held, `[0xb4b41c]` set, which is a vendor row (mode 5) or an item action lifted
+    /// off the bar (mode 7); any other payload stays held.
+    pub fn clear_preview_payload(&mut self) {
+        let preview = matches!(
+            self.model_ref().cursor,
+            Some(CursorPayload::Merchant(_) | CursorPayload::Action(_))
+        );
+        if preview {
+            clear_cursor(&mut self.model_mut());
+        }
+    }
+
     /// Test-only: set the payload directly, bypassing the Lua bindings.
     #[cfg(test)]
     pub(crate) fn set_cursor_for_test(&mut self, payload: CursorPayload) {
@@ -918,8 +942,25 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     g.set(
         "SplitContainerItem",
-        lua.create_function(|lua, (bag, slot, count): (i64, u32, i64)| {
-            split_container_item(lua, bag, slot, count);
+        lua.create_function(|lua, (bag, slot, count): (Value, Value, Value)| {
+            // `is-number` on args 1, 2 and 3 else `Usage: SplitContainerItem(index, slot, amount)`
+            // (`0x84d910`, `0x4fa0bf`).
+            let bag = i64::from(binding_abi::number_arg(
+                lua,
+                bag,
+                "Usage: SplitContainerItem(index, slot, amount)",
+            )?);
+            let slot = binding_abi::index_arg32(
+                lua,
+                slot,
+                "Usage: SplitContainerItem(index, slot, amount)",
+            )?;
+            let count = i64::from(binding_abi::number_arg(
+                lua,
+                count,
+                "Usage: SplitContainerItem(index, slot, amount)",
+            )?);
+            split_container_item(lua, bag, slot, count)?;
             Ok(())
         })?,
     )?;
@@ -979,7 +1020,7 @@ pub(crate) fn two_item_bag() -> super::container::ContainerState {
         ..Default::default()
     };
     super::container::ContainerState {
-        name: Some("Backpack".into()),
+        name: None,
         num_slots: 16,
         slots: [
             (1, item(117, "Tough Jerky")),
@@ -1036,10 +1077,11 @@ mod tests {
                 flags: 0,
                 enchants: Vec::new(),
                 spell_0: false,
+                spell_charges: [0; 5],
             },
         );
         crate::script::container::ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots,
         }
@@ -1147,6 +1189,7 @@ mod tests {
             texture: None,
             count: 0,
             consumable: false,
+            state: None,
         }));
         assert_eq!(ask(&mut s, "CursorHasItem"), NO);
         assert_eq!(ask(&mut s, "CursorHasSpell"), NO);
@@ -1438,6 +1481,7 @@ mod tests {
             texture: None,
             count: 0,
             consumable: false,
+            state: None,
         }));
         s.run("DeleteCursorItem()").unwrap();
         assert!(
@@ -1451,7 +1495,7 @@ mod tests {
     fn split_of_the_whole_stack_degrades_to_a_plain_pickup() {
         let mut s = UiScript::new().unwrap();
         s.set_container(0, Some(one_item_backpack())); // slot 1: a 5-stack
-        assert!(split_container_item(&s.lua, 0, 1, 5));
+        assert!(split_container_item(&s.lua, 0, 1, 5).unwrap());
         let held = s.cursor_item().expect("picked up");
         assert_eq!(held.count, None, "count == stack ⇒ whole-stack pickup");
     }
@@ -1463,6 +1507,7 @@ mod tests {
     #[test]
     fn a_clear_with_coins_held_signals_player_money() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_money(1_000);
         s.set_container(0, Some(one_item_backpack()));
         heard::listen(
@@ -1544,7 +1589,7 @@ mod tests {
         s.set_container(0, Some(one_item_backpack()));
         super::install_kind_probe(&s);
         s.set_cursor_for_test(CursorPayload::Macro(super::CursorMacro {
-            index: 1,
+            id: 1,
             texture: None,
         }));
         heard::listen(
@@ -1588,6 +1633,22 @@ mod tests {
                 "ACTIONBAR_HIDEGRID 1 nil",
                 "CURSOR_UPDATE nil nil"
             ]
+        );
+    }
+
+    /// `SplitContainerItem` stops an armed spell's targeting inside the call (`0x4fa07d`,
+    /// `0x6e4900`) with a host lent.
+    #[test]
+    fn a_split_stops_targeting_in_the_call_with_a_host_lent() {
+        let mut s = UiScript::new().unwrap();
+        s.set_container(0, Some(one_item_backpack()));
+        s.set_spell_targeting(true);
+        assert_eq!(
+            crate::script::host::test_support::applied_in_call(
+                &mut s,
+                "SplitContainerItem(0, 1, 2)"
+            ),
+            vec![crate::script::ScriptCall::SpellStopTargeting]
         );
     }
 }

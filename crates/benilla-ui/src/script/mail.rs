@@ -4,10 +4,9 @@
 
 use mlua::{Lua, MultiValue, Value};
 
-use super::binding_abi::flag;
+use super::binding_abi::{self, flag};
 use super::cursor;
 use super::Model;
-use crate::script::binding_abi::Idx;
 
 /// `CheckInbox`'s throttle window, 60 000 ms (`0x4aeb06`).
 const CHECK_INBOX_WINDOW_SECS: f64 = 60.0;
@@ -59,6 +58,11 @@ pub struct MailInboxRow {
     /// The enclosed item's random-suffix id (the wire `randomPropId`), 0 for none, which the
     /// reference's `SetInboxItem` hands the tooltip (`+0x424`); `item_name` carries its suffix.
     pub item_random_property_id: u32,
+    /// The enclosed item's charges and `(current, max)` durability off the wire, which
+    /// `SetInboxItem` writes into the tooltip's `+0x428` and `+0x438`/`+0x434` (`0x53566f`,
+    /// `0x535699`, `0x53568d`).
+    pub item_charges: i32,
+    pub item_durability: (u32, u32),
     /// The enclosed item's name; `None` while its template is in flight.
     pub item_name: Option<String>,
     pub item_texture: Option<String>,
@@ -388,7 +392,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // (`0x4aeff0`..`0x4af05e`): four nils, 0 for money, COD amount and days left, six nils.
     g.set(
         "GetInboxHeaderInfo",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetInboxHeaderInfo(index)` (`0x8463b8`, `0x4aebee`).
+            let index = binding_abi::index_arg(lua, index, "Usage: GetInboxHeaderInfo(index)")?;
             let row = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
                 row_at(&model, index)
@@ -435,7 +441,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // (`MailFrame.lua:366`), the pair vmangos requires (`MailHandler.cpp:867`).
     g.set(
         "GetInboxText",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetInboxText(index)` (`0x8463dc`, `0x4af142`).
+            let index = binding_abi::index_arg(lua, index, "Usage: GetInboxText(index)")?;
             let row = {
                 let mut model = lua.app_data_mut::<Model>().expect("model app_data");
                 let row = row_at(&model, index);
@@ -471,7 +479,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // being three nils and four zeros (`0x4af559`).
     g.set(
         "GetInboxInvoiceInfo",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetInboxInvoiceInfo(index)` (`0x84642c`, `0x4af38e`).
+            let index = binding_abi::index_arg(lua, index, "Usage: GetInboxInvoiceInfo(index)")?;
             let row = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
                 row_at(&model, index)
@@ -506,7 +516,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // the shared item-usable gate, true while the template is in flight.
     g.set(
         "GetInboxItem",
-        lua.create_function(|lua, Idx(index): Idx| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: GetInboxItem(index)` (`0x846450`, `0x4af5fe`).
+            let index = binding_abi::index_arg(lua, index, "Usage: GetInboxItem(index)")?;
             let (row, usable) = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
                 let row = row_at(&model, index);
@@ -547,7 +559,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     g.set(
         "InboxItemCanDelete",
-        lua.create_function(|lua, index: usize| {
+        lua.create_function(|lua, index: Value| {
+            // `is-number` else `Usage: InboxItemCanDelete(index)` (`0x846508`, `0x4afe11`).
+            let index = binding_abi::index_arg(lua, index, "Usage: InboxItemCanDelete(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             Ok(flag(row_at(&model, index).is_some_and(|r| r.can_delete)))
         })?,
@@ -690,7 +704,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 // An attached item whose object is gone (`0x4ae92e` resolves its guid):
                 // `ERR_ITEM_NOT_FOUND` (equip error 0x17, `0x4ae957`), the attachment dropped and
                 // `MAIL_SEND_INFO_UPDATE` (`0x4ae98d`), no packet. Checked before the money
-                // (`0x4ae917` ahead of `0x4ae99e`). The attachment is locked, so it cannot have moved.
+                // (`0x4ae917` ahead of `0x4ae99e`). The attachment is locked, so it cannot have
+                // moved.
                 if let Some(item) = model.mail_send_item.as_ref() {
                     let held = model
                         .containers
@@ -1128,6 +1143,8 @@ mod tests {
             item_quality: (item_id != 0).then_some(1),
             can_delete: false, // a player's unreturned mail is returned, not deleted
             item_random_property_id: 0,
+            item_charges: 0,
+            item_durability: (0, 0),
             cod_payment: false,
             message_type: 0,
             mail_template_id: 0,
@@ -1913,7 +1930,7 @@ mod tests {
         // Nothing held and nothing attached: a plain clear, here of a held macro.
         s.run("ClearCursor()").unwrap();
         s.set_cursor_for_test(CursorPayload::Macro(CursorMacro {
-            index: 1,
+            id: 1,
             texture: None,
         }));
         heard::take(&s);

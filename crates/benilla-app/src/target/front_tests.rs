@@ -11,23 +11,23 @@ use crate::net::{ClientCommand, Guid, GuidIndex, NetCommands, ObjectStore, SelfG
 use crate::vplates::PlateClicks;
 use benilla_world::interact::WorldClick;
 
-const ME: u64 = 0x10;
+pub(super) const ME: u64 = 0x10;
 /// Selected before each writer runs.
-const OLD: u64 = 0x21;
+pub(super) const OLD: u64 = 0x21;
 /// The unit each writer finds: the plate, the click, the attacker.
-const MOB: u64 = 0x31;
+pub(super) const MOB: u64 = 0x31;
 /// A spell the library does not know, so any unit binds under its `TARGET_FLAG_UNIT` word.
-const HEAL: u32 = 2050;
+pub(super) const HEAL: u32 = 2050;
 
-struct Fix {
-    app: App,
-    rx: Receiver<ClientCommand>,
-    mob: Entity,
+pub(super) struct Fix {
+    pub(super) app: App,
+    pub(super) rx: Receiver<ClientCommand>,
+    pub(super) mob: Entity,
 }
 
 /// The whole client, headless, with us, `OLD` selected and `MOB` beside; `charmed` has someone
 /// charm us (`UNIT_FIELD_CHARMEDBY`, a guid of two fields).
-fn fix(charmed: bool) -> Fix {
+pub(super) fn fix(charmed: bool) -> Fix {
     let mut app = crate::game_plugins::schedule_tests::headless_client();
     let (tx, rx) = crossbeam_channel::unbounded();
     app.insert_resource(NetCommands(tx));
@@ -72,25 +72,25 @@ fn fix(charmed: bool) -> Fix {
 }
 
 impl Fix {
-    fn cursor_up(&mut self) {
+    pub(super) fn cursor_up(&mut self) {
         self.app
             .world_mut()
             .resource_mut::<crate::spell::SpellTargeting>()
             .enter(HEAL, crate::spell::CastCommit::Spell, 0x0002);
     }
 
-    fn cursor_is_up(&self) -> bool {
+    pub(super) fn cursor_is_up(&self) -> bool {
         self.app
             .world()
             .resource::<crate::spell::SpellTargeting>()
             .active()
     }
 
-    fn selected(&self) -> Option<u64> {
+    pub(super) fn selected(&self) -> Option<u64> {
         self.app.world().resource::<Selection>().guid
     }
 
-    fn click(&mut self, pick: Hovered) {
+    pub(super) fn click(&mut self, pick: Hovered) {
         let world = self.app.world_mut();
         world.resource_mut::<PressPick>().hovered = pick;
         world
@@ -99,7 +99,7 @@ impl Fix {
     }
 
     /// A unit the TAB scan can pick, `x` yards along.
-    fn scannable_at(&mut self, guid: u64, x: f32) -> Entity {
+    pub(super) fn scannable_at(&mut self, guid: u64, x: f32) -> Entity {
         let world = self.app.world_mut();
         let e = world
             .spawn((
@@ -121,18 +121,17 @@ impl Fix {
         e
     }
 
-    /// One TAB from a key's body, applied.
-    fn tab(&mut self) {
-        self.app
-            .world_mut()
-            .non_send_resource_mut::<benilla_ui::script::UiScript>()
-            .run_binding("TargetNearestEnemy()")
-            .expect("the key runs");
+    /// One TAB from a key's body, with the host lent as the bindings pass lends it.
+    pub(super) fn tab(&mut self) {
+        crate::script_calls::with_hosted_vm(self.app.world_mut(), |s| {
+            s.expect("a VM").run_binding("TargetNearestEnemy()")
+        })
+        .expect("the key runs");
         self.bind();
     }
 
     /// The `NpcGreetingRequest`s written since the last look.
-    fn greetings(&mut self) -> Vec<Entity> {
+    pub(super) fn greetings(&mut self) -> Vec<Entity> {
         self.app
             .world_mut()
             .resource_mut::<Messages<crate::sound::NpcGreetingRequest>>()
@@ -141,7 +140,7 @@ impl Fix {
             .collect()
     }
 
-    fn over_the_mob(&self) -> Hovered {
+    pub(super) fn over_the_mob(&self) -> Hovered {
         Hovered {
             target: Some(self.mob),
             guid: Some(MOB),
@@ -150,16 +149,16 @@ impl Fix {
         }
     }
 
-    /// The calls pass, whose head binds what the writers parked.
-    fn bind(&mut self) {
+    /// The target chain's bind of what the writers parked.
+    pub(super) fn bind(&mut self) {
         self.app
             .world_mut()
-            .run_system_once(crate::script_calls::apply_script_calls)
-            .expect("the calls apply as a one-shot system");
+            .run_system_once(crate::script_calls::bind_parked_picks)
+            .expect("the bind runs as a one-shot system");
     }
 
     /// What went on the wire: the casts' targets and the selections.
-    fn wire(&self) -> (Vec<Option<u64>>, Vec<u64>) {
+    pub(super) fn wire(&self) -> (Vec<Option<u64>>, Vec<u64>) {
         let sent: Vec<_> = self.rx.try_iter().collect();
         let casts = sent
             .iter()
@@ -313,8 +312,11 @@ fn a_charmed_player_is_refused_by_every_selector() {
             false,
             |f| {
                 let script = benilla_ui::script::UiScript::new().expect("a VM");
-                script.run("ClearTarget()").expect("the script runs");
                 f.app.world_mut().insert_non_send_resource(script);
+                crate::script_calls::with_hosted_vm(f.app.world_mut(), |s| {
+                    s.expect("a VM").run("ClearTarget()")
+                })
+                .expect("the script runs");
                 f.bind();
             },
             None,
@@ -430,6 +432,86 @@ fn a_tab_goes_on_past_a_unit_the_cursor_refused() {
         "the second press has moved on to the next"
     );
     assert_eq!(f.selected(), Some(OLD), "the target never moved");
+}
+
+/// A left click with the cursor up and no object under the press: the terrain leg
+/// (`HandleGroundClick 0x492580`) tries `BindLocation 0x6e60f0`, which for a word with no location
+/// bit signals (`0x6e615d`) and returns 0, so the click falls to `OnWorldClick 0x5e0320` and
+/// deselects (`0x5e03cf`), sending `CMSG_SET_SELECTION` 0 with the cursor still up; the sky's
+/// nothing leg deselects with no signal (`0x492e5d`). A word with a location bit binds and keeps
+/// the target.
+#[test]
+fn a_click_the_cursor_cannot_bind_deselects() {
+    for (label, point, word, deselects, changes) in [
+        (
+            "terrain, a unit word",
+            Some(Vec3::new(1.0, 2.0, 3.0)),
+            0x0002,
+            true,
+            1,
+        ),
+        ("the sky, a unit word", None, 0x0002, true, 0),
+        (
+            "terrain, a location word",
+            Some(Vec3::new(1.0, 2.0, 3.0)),
+            0x0040,
+            false,
+            2,
+        ),
+    ] {
+        let mut f = fix(false);
+        let world = f.app.world_mut();
+        world.resource_mut::<crate::spell::SpellTargeting>().enter(
+            HEAL,
+            crate::spell::CastCommit::Spell,
+            word,
+        );
+        world.resource_mut::<PressPick>().occlusion = super::PickOcclusion {
+            distance: if point.is_some() { 5.0 } else { f32::INFINITY },
+            point,
+            ray: None,
+        };
+        world
+            .resource_mut::<crate::ui_cast::CastReports>()
+            .0
+            .clear();
+        f.click(Hovered::default());
+        f.app
+            .world_mut()
+            .run_system_once(click::select_on_click)
+            .expect("the click runs");
+        f.app
+            .world_mut()
+            .run_system_once(crate::spell::targeting::commit_ground_cast_on_click)
+            .expect("the terrain commit runs");
+        let sent: Vec<_> = f.rx.try_iter().collect();
+        let selections: Vec<_> = sent
+            .iter()
+            .filter_map(|c| match c {
+                ClientCommand::SetSelection { guid } => Some(*guid),
+                _ => None,
+            })
+            .collect();
+        let reports = &f.app.world().resource::<crate::ui_cast::CastReports>().0;
+        let signalled = reports
+            .iter()
+            .filter(|r| matches!(r, crate::ui_cast::CastReport::Changed))
+            .count();
+        if deselects {
+            assert_eq!(f.selected(), None, "{label}");
+            assert_eq!(selections, [0], "{label}");
+            assert!(f.cursor_is_up(), "{label}: the cursor stays");
+        } else {
+            assert_eq!(f.selected(), Some(OLD), "{label}");
+            assert!(selections.is_empty(), "{label}");
+            assert!(
+                sent.iter()
+                    .any(|c| matches!(c, ClientCommand::CastSpellAtDest { .. })),
+                "{label}: the bind sends"
+            );
+        }
+        assert_eq!(signalled, changes, "{label}");
+    }
 }
 
 /// The greeter (`PlayGreetingSound`, `0x60c270`) runs at `0x4927fd` for every unit a body click

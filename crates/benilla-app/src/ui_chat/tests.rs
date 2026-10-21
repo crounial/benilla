@@ -153,72 +153,55 @@ fn text_emote_lines_are_verbatim_and_never_wear_the_senders_name() {
 /// `DoEmote` sends a self-target as guid 0 (`0x5ef611`), so 1.12 has no self-emote sentence.
 #[test]
 fn emoting_at_your_own_selection_sends_an_untargeted_emote() {
-    let _data = benilla_formats::wow_data_or_skip!();
     use crate::target::Selection;
-    use bevy::prelude::Entity;
-
-    let me = Entity::from_raw_u32(7).unwrap();
-    let them = Entity::from_raw_u32(9).unwrap();
 
     let sel = Selection {
-        target: Some(me),
-        guid: Some(0xdead_beef),
+        guid: Some(0x111),
         ..Default::default()
     };
-    assert_eq!(emote_target(None, &sel, no_name, Some(me)), 0);
+    assert_eq!(emote_target(None, &sel, no_name, Some(0x111)), 0);
+    assert_eq!(emote_target(None, &sel, no_name, Some(0x222)), 0x111);
 
-    let sel = Selection {
-        target: Some(them),
-        guid: Some(0xdead_beef),
-        ..Default::default()
-    };
-    assert_eq!(emote_target(None, &sel, no_name, Some(me)), 0xdead_beef);
-
-    // No selection is untargeted, and with no self entity yet a selection goes out untouched.
+    // No selection is untargeted, and with no self guid yet a selection goes out untouched.
     assert_eq!(
-        emote_target(None, &Selection::default(), no_name, Some(me)),
+        emote_target(None, &Selection::default(), no_name, Some(0x111)),
         0
     );
-    let sel = Selection {
-        target: Some(them),
-        guid: Some(0xdead_beef),
-        ..Default::default()
-    };
-    assert_eq!(emote_target(None, &sel, no_name, None), 0xdead_beef);
+    assert_eq!(emote_target(None, &sel, no_name, None), 0x111);
 }
 
-fn no_name(_: &str) -> Option<(bevy::prelude::Entity, u64)> {
+fn no_name(_: &str) -> Option<u64> {
     None
 }
 
-/// `0x49fdb1`: a word not starting with `%` names a player and replaces the selection; a miss is
-/// guid 0; no argument or a `%` word is the selection.
+/// `0x49fdb1`: a word not starting with `%` (`0x49fdd4`) names a player and replaces the
+/// selection; a miss is guid 0; no argument or a `%` word is the selection.
 #[test]
 fn an_emote_argument_targets_the_named_player_and_not_the_selection() {
     use crate::target::Selection;
-    use bevy::prelude::Entity;
 
-    let me = Entity::from_raw_u32(7).unwrap();
-    let bob = Entity::from_raw_u32(9).unwrap();
     let sel = Selection {
-        target: Some(Entity::from_raw_u32(11).unwrap()),
         guid: Some(0x5e1),
         ..Default::default()
     };
-    let find = |n: &str| (n == "Bob").then_some((bob, 0xb0b));
-    assert_eq!(emote_target(Some("Bob"), &sel, find, Some(me)), 0xb0b);
+    let find = |n: &str| (n == "Bob").then_some(0xb0b);
+    assert_eq!(emote_target(Some("Bob"), &sel, find, Some(0x111)), 0xb0b);
     assert_eq!(
-        emote_target(Some("Nobody"), &sel, find, Some(me)),
+        emote_target(Some("Nobody"), &sel, find, Some(0x111)),
         0,
         "a miss is untargeted"
     );
     for arg in [None, Some(""), Some("%t"), Some("%x")] {
-        let panics = |_: &str| -> Option<(Entity, u64)> { panic!("no search for {arg:?}") };
-        assert_eq!(emote_target(arg, &sel, panics, Some(me)), 0x5e1, "{arg:?}");
+        let panics = |_: &str| -> Option<u64> { panic!("no search for {arg:?}") };
+        assert_eq!(
+            emote_target(arg, &sel, panics, Some(0x111)),
+            0x5e1,
+            "{arg:?}"
+        );
     }
     // Naming yourself is the self-target edge: untargeted.
-    let own = |_: &str| Some((me, 0x111));
-    assert_eq!(emote_target(Some("Me"), &sel, own, Some(me)), 0);
+    let own = |_: &str| Some(0x111);
+    assert_eq!(emote_target(Some("Me"), &sel, own, Some(0x111)), 0);
 }
 
 #[test]
@@ -306,22 +289,111 @@ fn honor_gain_lines_pick_the_reference_form() {
 #[test]
 fn xp_gain_lines_pick_the_reference_form() {
     let _data = benilla_formats::wow_data_or_skip!();
+    use super::feed::{xp_gain_line, RestState};
+    let normal = || {
+        Some(RestState {
+            state: 2,
+            row: Some(("Normal", 1.0)),
+        })
+    };
+    let rested = || {
+        Some(RestState {
+            state: 1,
+            row: Some(("Rested", 2.0)),
+        })
+    };
     // `COMBATLOG_XPGAIN_FIRSTPERSON`, `COMBATLOG_XPGAIN_EXHAUSTION1` (rested) and
     // `COMBATLOG_XPGAIN_FIRSTPERSON_UNNAMED` (`GlobalStrings.lua:801`, `:789`, `:804`).
     assert_eq!(
-        with_strings(|g| super::feed::xp_gain_line(Some("Kobold Vermin"), 35, 0, g)).as_deref(),
+        with_strings(|g| xp_gain_line(Some("Kobold Vermin"), 35, 35, 1.0, normal(), g)).as_deref(),
         Some("Kobold Vermin dies, you gain 35 experience.")
     );
     assert_eq!(
-        with_strings(|g| super::feed::xp_gain_line(Some("Kobold Vermin"), 52, 17, g)).as_deref(),
+        with_strings(|g| xp_gain_line(Some("Kobold Vermin"), 52, 35, 1.0, rested(), g)).as_deref(),
         Some("Kobold Vermin dies, you gain 52 experience. (+17 exp Rested bonus)")
     );
     assert_eq!(
-        with_strings(|g| super::feed::xp_gain_line(None, 120, 0, g)).as_deref(),
+        with_strings(|g| xp_gain_line(None, 120, 120, 1.0, None, g)).as_deref(),
         Some("You gain 120 experience.")
     );
     // The shipped lavender, 0x6F6FFF, chat-cache row 46.
     assert_eq!(default_color(K::CombatXpGain), [111, 111, 255]);
+}
+
+/// `0x637ac0`: a named kill's form is its rest state's, read off that state's `Exhaustion.dbc`
+/// row, never off the bonus. A factor of 0 or 1, or no row, is the plain line (`0x637b3e`,
+/// `0x637b54`, `0x637b38`); any other takes the state's key in `0x864330`, whose entry 3 names
+/// the global `NULL`, an empty template (`0x703c02`). No active player, no line (`0x637b06`).
+#[test]
+fn the_xp_line_follows_the_rest_states_exhaustion_row() {
+    use super::feed::{xp_gain_line, RestState};
+    let get = |key: &str| {
+        Some(
+            match key {
+                "COMBATLOG_XPGAIN_FIRSTPERSON" => "%s dies, you gain %d experience.",
+                "COMBATLOG_XPGAIN_FIRSTPERSON_UNNAMED" => "You gain %d experience.",
+                "COMBATLOG_XPLOSS_FIRSTPERSON_UNNAMED" => "You lose %d experience.",
+                "COMBATLOG_XPGAIN_EXHAUSTION1" => {
+                    "%s dies, you gain %d experience. (%s exp %s bonus)"
+                }
+                "COMBATLOG_XPGAIN_EXHAUSTION4" => {
+                    "%s dies, you gain %d experience. (%s exp %s penalty)"
+                }
+                _ => return None,
+            }
+            .to_string(),
+        )
+    };
+    let line = |total, base, state, row| {
+        xp_gain_line(
+            Some("Defias Thug"),
+            total,
+            base,
+            1.0,
+            Some(RestState { state, row }),
+            &get,
+        )
+    };
+    // A bonus with a factor-1 row is still the plain line.
+    assert_eq!(
+        line(60, 40, 2, Some(("Normal", 1.0))).as_deref(),
+        Some("Defias Thug dies, you gain 60 experience.")
+    );
+    // No row for the state, or a factor of 0: plain.
+    assert_eq!(
+        line(60, 40, 1, None).as_deref(),
+        Some("Defias Thug dies, you gain 60 experience.")
+    );
+    assert_eq!(
+        line(60, 40, 1, Some(("Rested", 0.0))).as_deref(),
+        Some("Defias Thug dies, you gain 60 experience.")
+    );
+    // A rested row with no bonus left still words the state, `+0`, with the row's own name.
+    assert_eq!(
+        line(40, 40, 1, Some(("Erholt", 2.0))).as_deref(),
+        Some("Defias Thug dies, you gain 40 experience. (+0 exp Erholt bonus)")
+    );
+    // A penalty state: the signed difference, no `+`.
+    assert_eq!(
+        line(20, 40, 4, Some(("Tired", 0.5))).as_deref(),
+        Some("Defias Thug dies, you gain 20 experience. (-20 exp Tired penalty)")
+    );
+    // State 3's key is `NULL`, no global: an empty template, and no empty line.
+    assert_eq!(line(60, 40, 3, Some(("Tired", 0.75))), None);
+    // A named kill with no active player writes nothing; the unnamed form needs none.
+    assert_eq!(
+        xp_gain_line(Some("Defias Thug"), 60, 40, 1.0, None, &get),
+        None
+    );
+    assert_eq!(
+        xp_gain_line(None, 60, 40, 1.0, None, &get).as_deref(),
+        Some("You gain 60 experience.")
+    );
+    // An XP loss prints the packet's value negated as a signed 32-bit number (`0x637f70`).
+    assert_eq!(
+        super::feed::xp_loss_line((-100i32) as u32, &get).as_deref(),
+        Some("You lose 100 experience.")
+    );
 }
 
 #[test]
@@ -594,7 +666,7 @@ fn a_mode_change_notice_never_becomes_an_event() {
     let _data = benilla_formats::wow_data_or_skip!();
     use benilla_protocol::messages::{channel_notice, ChannelNoticeTail};
 
-    let mut log = super::feed::ChatLog::default();
+    let log = super::feed::ChatLog::default();
     log.push_channel_notice(
         channel_notice::MODE_CHANGE,
         "World".into(),
@@ -1031,7 +1103,7 @@ fn a_session_end_empties_the_window_and_the_boxs_memory() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = chat_vm();
     let mut windows = super::frames::ChatWindows::default();
-    let mut log = super::ChatLog::default();
+    let log = super::ChatLog::default();
 
     super::frames::route(&mut s, &mut windows, &ev(K::Say, "hi there", "Bob"));
     super::frames::route(&mut s, &mut windows, &ev(K::Whisper, "psst", "Ann"));
@@ -1042,7 +1114,7 @@ fn a_session_end_empties_the_window_and_the_boxs_memory() {
         "the window has this session's lines"
     );
 
-    super::end_chat_session(Some(&mut s), &mut log);
+    super::end_chat_session(Some(&mut s), &log);
 
     assert_eq!(
         lines_in_window(&s),
@@ -1727,7 +1799,7 @@ fn an_inbound_addon_line_splits_on_the_first_tab_only() {
     #[allow(non_snake_case)]
     let (PARTY, RAID, GUILD, BATTLEGROUND, SAY) = (party, raid, guild, battleground, say);
 
-    let mut log = super::feed::ChatLog::default();
+    let log = super::feed::ChatLog::default();
     log.push_addon("oRA\tSYNC:1", PARTY, 7);
     // Tabs in the message: only the first divides.
     log.push_addon("CTRA\tA\tB\tC", RAID, 7);
@@ -1818,7 +1890,7 @@ fn an_addon_message_survives_its_own_send_and_receive() {
     assert_eq!(sent.distribution.token(), "PARTY");
 
     // The same text arrives as a PARTY line in LANG_ADDON.
-    let mut log = super::feed::ChatLog::default();
+    let log = super::feed::ChatLog::default();
     log.push_addon(&sent.text, 0x01, 7);
 
     assert_eq!(
@@ -2267,7 +2339,7 @@ fn the_posture_emotes_carry_no_swim_suppression_flag() {
 fn level_up_gains_are_matched_by_level_and_a_miss_is_not_an_absence() {
     use benilla_protocol::messages::LevelUpInfo;
 
-    let mut log = super::feed::ChatLog::default();
+    let log = super::feed::ChatLog::default();
     let ding = LevelUpInfo {
         level: 10,
         health: 22,
@@ -2465,6 +2537,7 @@ fn the_chat_cache_restore_is_finished_before_player_login() {
             class: 1, // Warrior
             gender: 0,
             level: 60,
+            new_character: false,
             skin: 0,
             face: 0,
             hair_style: 0,
@@ -2879,7 +2952,7 @@ fn chat_sends_as(
         .collect();
     let refused = world
         .resource::<crate::ui_action::UiErrorKeys>()
-        .0
+        .snapshot()
         .iter()
         .map(|e| e.key)
         .collect();
@@ -3087,4 +3160,277 @@ fn a_macro_script_line_that_moves_signals_the_macro_event() {
     );
     assert!(s.take_binding_input().is_empty(), "nothing moved");
     assert!(s.errors().is_empty(), "{:?}", s.errors());
+}
+
+/// A line the engine shows inside a verb carries the same ten arguments as a system line the
+/// chat feed fires, so `ChatFrame_OnEvent` cannot tell them apart.
+#[test]
+fn an_engine_shown_line_fires_the_feeds_system_arguments() {
+    let text = "Deliver the Message failed.".to_string();
+    assert_eq!(
+        ChatEvent::text_only(K::System, text.clone()).script_args(),
+        benilla_ui::script::system_chat_args(text)
+    );
+}
+
+/// A combat formatter raises its word right after it writes its line, and never without one: the
+/// word helper follows the write (`0x62862b`-`0x628696`), and a missing school name or template
+/// returns first (`0x62cd99`, `0x6286ab`). A name word is the line's own subject's.
+#[test]
+fn a_combat_word_follows_its_line_and_only_a_written_one() {
+    use super::combat::{
+        spell_kind, Fills, LineWord, Named, PendingCombat, UnitClass, Variant, HEALED,
+        SPELLLOGABSORB,
+    };
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut s = chat_vm();
+    let mut windows = super::frames::ChatWindows::default();
+    let damage = spell_kind(UnitClass::Creature, UnitClass::Me, false).unwrap();
+    let buffs = spell_kind(UnitClass::Creature, UnitClass::Me, true).unwrap();
+    s.run(&format!(
+        r#"
+        Seen = {{}}
+        Spy = CreateFrame("Frame", "BenillaWordSpy")
+        Spy:SetScript("OnEvent", function()
+            if event == "COMBAT_TEXT_UPDATE" then
+                table.insert(Seen, arg1.."|"..tostring(arg2).."|"..tostring(arg3))
+            else
+                table.insert(Seen, event)
+            end
+        end)
+        Spy:RegisterEvent("COMBAT_TEXT_UPDATE")
+        Spy:RegisterEvent("{}")
+        Spy:RegisterEvent("{}")
+    "#,
+        super::event::event_name(damage),
+        super::event::event_name(buffs),
+    ))
+    .unwrap();
+    let line = |kind, family, school, word| PendingCombat {
+        kind,
+        family,
+        variant: Variant::OtherSelf,
+        subject: 2,
+        object: 1,
+        fills: Fills {
+            attacker: "Shaman".into(),
+            spell: "Firebolt".into(),
+            school,
+            amount: 75,
+            ..Default::default()
+        },
+        named: Named::Ready,
+        tries: 0,
+        word: Some(word),
+    };
+    let seen = |s: &benilla_ui::script::UiScript| s.eval::<Vec<String>>("return Seen").unwrap();
+
+    let absorbed = LineWord::with("SPELL_ABSORBED", "Firebolt");
+    super::feed::write_combat_line(
+        &mut s,
+        &mut windows,
+        &line(damage, SPELLLOGABSORB, Some(2), absorbed.clone()),
+    );
+    assert_eq!(
+        seen(&s),
+        [
+            super::event::event_name(damage).to_string(),
+            "SPELL_ABSORBED|Firebolt|nil".into()
+        ]
+    );
+    // No school name, no line, no word.
+    super::feed::write_combat_line(
+        &mut s,
+        &mut windows,
+        &line(damage, SPELLLOGABSORB, Some(9), absorbed),
+    );
+    assert_eq!(seen(&s).len(), 2);
+    // The healer's name is the line's subject.
+    super::feed::write_combat_line(
+        &mut s,
+        &mut windows,
+        &line(buffs, HEALED, None, LineWord::named("HEAL", 75)),
+    );
+    assert_eq!(seen(&s)[3], "HEAL|Shaman|75");
+    assert!(s.errors().is_empty(), "handler errors: {:?}", s.errors());
+}
+
+/// `0x625270` raises `HONOR_GAINED` after its line, signed, and not at all when the line's
+/// template is missing (`0x6253ca`-`0x6253ee`).
+#[test]
+fn honor_gained_follows_its_line_and_only_a_written_one() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut s = chat_vm();
+    let mut windows = super::frames::ChatWindows::default();
+    s.run(
+        r#"
+        Seen = {}
+        Spy = CreateFrame("Frame", "BenillaHonorSpy")
+        Spy:SetScript("OnEvent", function()
+            if event == "COMBAT_TEXT_UPDATE" then
+                table.insert(Seen, arg1.."|"..tostring(arg2))
+            else
+                table.insert(Seen, event)
+            end
+        end)
+        Spy:RegisterEvent("COMBAT_TEXT_UPDATE")
+        Spy:RegisterEvent("CHAT_MSG_COMBAT_HONOR_GAIN")
+    "#,
+    )
+    .unwrap();
+    let seen = |s: &benilla_ui::script::UiScript| s.eval::<Vec<String>>("return Seen").unwrap();
+    super::feed::write_honor_line(&mut s, &mut windows, Some("Grimtusk"), None, -40);
+    assert_eq!(seen(&s), ["CHAT_MSG_COMBAT_HONOR_GAIN", "HONOR_GAINED|-40"]);
+    s.run("COMBATLOG_HONORAWARD = nil").unwrap();
+    super::feed::write_honor_line(&mut s, &mut windows, None, None, 25);
+    assert_eq!(seen(&s).len(), 2);
+    assert!(s.errors().is_empty(), "handler errors: {:?}", s.errors());
+}
+
+/// The drain fires a queued `UNIT_COMBAT` at its place among the lines queued beside it, so a
+/// handler's order reaches Lua: here a flash, a line, a flash. Only the tokens naming the unit
+/// fire, `"player"` for your own guid.
+#[test]
+fn unit_combat_fires_at_its_place_in_the_drain() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut feed = super::notice_tests::Feed::new();
+    feed.world.resource_mut::<crate::net::SelfGuid>().0 = Some(7);
+    feed.script()
+        .run(
+            r#"
+            Order = {}
+            Ord = CreateFrame("Frame", "BenillaOrderSpy")
+            Ord:SetScript("OnEvent", function()
+                local who = event == "UNIT_COMBAT" and (" " .. arg1 .. " " .. arg2) or ""
+                table.insert(Order, event .. who)
+            end)
+            Ord:RegisterEvent("UNIT_COMBAT")
+            Ord:RegisterEvent("CHAT_MSG_COMBAT_XP_GAIN")
+        "#,
+        )
+        .unwrap();
+    let flash = |guid, action| crate::ui_unit::UnitCombatFeedback {
+        guid,
+        action,
+        flags: "",
+        amount: 0,
+        school: 0,
+    };
+    {
+        let log = feed.world.resource_mut::<super::ChatLog>();
+        log.push_unit_combat(flash(7, "DODGE"));
+        log.push_xp_gain(0, 10, 10, 1.0);
+        log.push_unit_combat(flash(7, "PARRY"));
+        log.push_unit_combat(flash(8, "MISS"));
+    }
+    feed.drain();
+    let order = feed.script().eval::<Vec<String>>("return Order").unwrap();
+    assert_eq!(
+        order,
+        [
+            "UNIT_COMBAT player DODGE",
+            "CHAT_MSG_COMBAT_XP_GAIN",
+            "UNIT_COMBAT player PARRY"
+        ]
+    );
+}
+
+/// The honor line's rank title genders off the active player's own descriptor, `PLAYER_BYTES_3`
+/// byte 0 (`0x612bf0` on the active player calls `0x5ed5b0`), not the name cache.
+#[test]
+fn the_honor_title_genders_off_the_active_players_bytes() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut feed = super::notice_tests::Feed::new();
+    feed.script()
+        .run(
+            r#"
+            PVP_RANK_8_0 = "Sergeant Sir"
+            PVP_RANK_8_0_FEMALE = "Sergeant Madam"
+            Honor = {}
+            Hon = CreateFrame("Frame", "BenillaHonorTitleSpy")
+            Hon:SetScript("OnEvent", function() table.insert(Honor, arg1) end)
+            Hon:RegisterEvent("CHAT_MSG_COMBAT_HONOR_GAIN")
+        "#,
+        )
+        .unwrap();
+    const ME: u64 = 7;
+    const VICTIM: u64 = 8;
+    let me = feed
+        .world
+        .spawn(crate::net::ObjectStore(
+            benilla_protocol::ObjectFields::from_pairs(&[(2, 0x19), (195, 1)]),
+        ))
+        .id();
+    let victim = feed
+        .world
+        .spawn(crate::net::ObjectStore(
+            benilla_protocol::ObjectFields::from_pairs(&[(2, 0x19)]),
+        ))
+        .id();
+    {
+        let mut index = feed.world.resource_mut::<crate::net::GuidIndex>();
+        index.0.insert(ME, me);
+        index.0.insert(VICTIM, victim);
+    }
+    feed.world.resource_mut::<crate::net::SelfGuid>().0 = Some(ME);
+    // The name cache says male; the descriptor wins.
+    feed.world
+        .resource_mut::<crate::names::NameCache>()
+        .insert_player(ME, "Probe".into(), Some((1, 1, 0)));
+    feed.world
+        .resource_mut::<super::ChatLog>()
+        .push_pvp_credit(30, VICTIM, 8, 0);
+    feed.drain();
+    let lines = feed.script().eval::<Vec<String>>("return Honor").unwrap();
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("Sergeant Madam"), "{lines:?}");
+}
+
+/// The XP and honor lines name their victim through `GetUnitName` (`0x609210`, from `0x637ac0`
+/// and `0x625387`), whose miss without `UNKNOWNOBJECT` is "Unknown Being" (`0x60933c`), never
+/// `GetObjectName`'s `UKNOWNOBJECT`.
+#[test]
+fn a_kills_unnamed_victim_is_the_unit_getters_miss() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut feed = super::notice_tests::Feed::new();
+    feed.script()
+        .run(
+            r#"
+            UNKNOWNOBJECT = nil
+            Kills = {}
+            Kill = CreateFrame("Frame", "BenillaKillNameSpy")
+            Kill:SetScript("OnEvent", function() table.insert(Kills, arg1) end)
+            Kill:RegisterEvent("CHAT_MSG_COMBAT_XP_GAIN")
+            Kill:RegisterEvent("CHAT_MSG_COMBAT_HONOR_GAIN")
+        "#,
+        )
+        .unwrap();
+    const ME: u64 = 7;
+    const VICTIM: u64 = 8;
+    let mut hold = |guid: u64| {
+        let e = feed
+            .world
+            .spawn(crate::net::ObjectStore(
+                benilla_protocol::ObjectFields::from_pairs(&[(2, 0x19)]),
+            ))
+            .id();
+        feed.world
+            .resource_mut::<crate::net::GuidIndex>()
+            .0
+            .insert(guid, e);
+    };
+    hold(ME);
+    hold(VICTIM);
+    feed.world.resource_mut::<crate::net::SelfGuid>().0 = Some(ME);
+    {
+        let log = feed.world.resource_mut::<super::ChatLog>();
+        log.push_xp_gain(VICTIM, 60, 60, 1.0);
+        log.push_pvp_credit(30, VICTIM, 8, 0);
+    }
+    feed.drain();
+    let lines = feed.script().eval::<Vec<String>>("return Kills").unwrap();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    for line in &lines {
+        assert!(line.starts_with("Unknown Being "), "{lines:?}");
+    }
 }
