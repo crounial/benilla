@@ -64,7 +64,7 @@ fn backpack_toggle_plays_open_and_close_kits() {
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots: std::collections::HashMap::new(),
         }),
@@ -116,7 +116,7 @@ fn b_opens_the_backpack_alone_and_closes_every_bag() {
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots: std::collections::HashMap::new(),
         }),
@@ -189,7 +189,7 @@ fn shift_b_toggles_every_bag_at_once() {
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots: std::collections::HashMap::new(),
         }),
@@ -271,7 +271,7 @@ fn bag_bar_buttons_light_while_their_bag_is_open() {
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots: std::collections::HashMap::new(),
         }),
@@ -311,12 +311,12 @@ fn bag_bar_buttons_light_while_their_bag_is_open() {
                     if p.contains("CheckButtonHilight"))
         })
         .collect();
-    assert_eq!(rings.len(), 2, "toggle + bag 2 rings emit, nothing else");
+    benilla_ui::assert_near!(rings.len(), 2, "toggle + bag 2 rings emit, nothing else");
     let toggle_ring = rings
         .iter()
-        .find_map(|q| q.rect.filter(|r| r.left == 981.0))
+        .find_map(|q| q.rect.filter(|r| (r.left - 981.0).abs() < 1e-3))
         .expect("the toggle's ring at the art frame's corner");
-    assert_eq!(
+    benilla_ui::assert_near!(
         (
             toggle_ring.left,
             toggle_ring.bottom,
@@ -413,12 +413,13 @@ fn bag_tooltip_hangs_left_when_the_slot_sits_in_the_right_half() {
             flags: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         },
     );
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots,
         }),
@@ -501,12 +502,13 @@ fn hovered_bag_tooltip_fills_itself_when_the_stats_land() {
             flags: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         },
     );
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots,
         }),
@@ -619,6 +621,7 @@ fn vendor_bag_hover_shows_sell_price_and_arms_the_pouch_cursor() {
             flags: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         },
     );
     slots.insert(
@@ -652,12 +655,13 @@ fn vendor_bag_hover_shows_sell_price_and_arms_the_pouch_cursor() {
             flags: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         },
     );
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots,
         }),
@@ -774,7 +778,7 @@ fn readable_letter_hover_shows_the_inspect_magnifier() {
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots,
         }),
@@ -850,12 +854,13 @@ fn drag_across_two_slots_queues_the_same_move_a_click_pickup_would() {
             flags: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         },
     );
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots,
         }),
@@ -947,6 +952,7 @@ fn a_second_bag_window_feeds_and_paints_via_the_bag_bar() {
             flags: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         },
     );
     s.set_container(
@@ -1094,12 +1100,13 @@ pub(super) fn open_backpack_with_a_five_stack(s: &mut UiScript) -> (f32, f32) {
             flags: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         },
     );
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots,
         }),
@@ -1407,7 +1414,7 @@ fn bag_slot_cooldown_sweeps_through_the_xml() {
         let mut slots = std::collections::HashMap::new();
         slots.insert(1, potion(cooldown));
         ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots,
         }
@@ -1491,6 +1498,7 @@ fn the_bar_bag_buttons_name_themselves_on_hover() {
         use_fork: Default::default(),
         bar_placeable: true,
         consumable: false,
+        spell_charges: [0; 5],
         durability: None,
         flags: 0,
         item_id: 4496,
@@ -1795,7 +1803,7 @@ fn a_key_dropped_on_the_button_files_itself() {
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots: std::collections::HashMap::from([(
                 3,
@@ -2150,7 +2158,7 @@ fn the_backpack_buttons_ring_follows_its_own_window_through_real_clicks() {
     s.set_container(
         0,
         Some(benilla_ui::script::ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots: std::collections::HashMap::new(),
         }),

@@ -11,10 +11,12 @@
 use benilla_protocol::messages::{friend_result, friend_status, FriendEntry, FriendStatusUpdate};
 use bevy::prelude::*;
 
-use crate::ui_script::{UiFeed, UiInput};
+use crate::console::ConsoleCommandApp;
+use crate::ui_script::UiFeed;
 
 mod feed;
 mod query;
+mod whois;
 
 pub(crate) use query::parse as who_query;
 
@@ -42,6 +44,10 @@ pub(crate) struct SocialState {
     who_to_ui: bool,
     /// Results whose line waits on a name query (the reference formats from the name cache).
     pending_lines: Vec<FriendStatusUpdate>,
+    /// The players whose name a packet looked up since the last feed: every row of
+    /// `SMSG_FRIEND_LIST` (`0x5ae438`) and `SMSG_IGNORE_LIST` (`0x5af59a`), and the subject of each
+    /// `SMSG_FRIEND_STATUS` (`0x5acb97`, an added ignore `0x5af627`), each with a callback.
+    name_events: std::collections::HashSet<u64>,
     /// Set when the friend list changed, so the feed fires its list event.
     friends_dirty: bool,
     ignores_dirty: bool,
@@ -73,6 +79,7 @@ impl SocialState {
 
     /// `SMSG_FRIEND_LIST`: the whole list, never a delta.
     fn apply_friend_list(&mut self, friends: Vec<FriendEntry>) {
+        self.name_events.extend(friends.iter().map(|f| f.guid));
         self.friends = friends;
         self.friends_dirty = true;
     }
@@ -85,6 +92,7 @@ impl SocialState {
 
     /// `SMSG_IGNORE_LIST`: the whole list.
     fn apply_ignore_list(&mut self, guids: Vec<u64>) {
+        self.name_events.extend(guids.iter().copied());
         self.ignores = guids;
         self.ignores_dirty = true;
     }
@@ -149,6 +157,7 @@ impl SocialState {
             // Every other code is a refusal: a line, no change.
             _ => {}
         }
+        self.name_events.insert(update.guid);
         self.pending_lines.push(update);
     }
 
@@ -289,6 +298,13 @@ pub(crate) struct UiSocialPlugin;
 impl Plugin for UiSocialPlugin {
     fn build(&self, app: &mut App) {
         net::register(app);
+        // Category 0 (`0x5adcfd`).
+        app.console_command(
+            "whois",
+            crate::console::DEBUG,
+            Some(whois::HELP),
+            whois::whois,
+        );
         app.init_resource::<SocialState>()
             .add_systems(
                 Startup,
@@ -298,7 +314,7 @@ impl Plugin for UiSocialPlugin {
                 Update,
                 (
                     feed::feed_social.in_set(UiFeed),
-                    feed::drain_social.after(UiInput),
+                    feed::drain_social.in_set(crate::ui_script::UiDrain),
                 ),
             );
     }

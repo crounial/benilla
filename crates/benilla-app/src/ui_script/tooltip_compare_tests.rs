@@ -72,6 +72,7 @@ fn seed_items(s: &mut UiScript) {
         use_fork: Default::default(),
         bar_placeable: true,
         consumable: false,
+        spell_charges: [0; 5],
         durability: None,
         flags: 0,
         item_id: 1234,
@@ -148,12 +149,13 @@ fn seed_items(s: &mut UiScript) {
             flags: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         },
     );
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots,
         }),
@@ -176,7 +178,7 @@ fn item_ref_tooltip_renders_a_chat_link() {
             "local p, rel, rp, x, y = ItemRefTooltip:GetPoint() \
              return ItemRefTooltip:IsShown() \
                and ItemRefTooltipTextLeft1:GetText() == \"Another Helm\" \
-               and p == \"BOTTOM\" and y == 80",
+               and p == \"BOTTOM\" and math.abs(y - 80) < 1e-3",
         )
         .unwrap();
     assert!(ok, "the link tooltip shows at its parked seat");
@@ -208,6 +210,7 @@ fn doll_hover_renders_the_live_instance() {
         use_fork: Default::default(),
         bar_placeable: true,
         consumable: false,
+        spell_charges: [0; 5],
         durability: Some((0, 40)),
         flags: 0,
         item_id: 1234,
@@ -303,7 +306,7 @@ fn repair_mode_hover_shows_the_items_repair_cost() {
     s.set_container(
         0,
         Some(ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots,
         }),
@@ -434,7 +437,7 @@ fn shipped_merchant_row_raises_the_compare_plates() {
                and ShoppingTooltip1TextLeft2:GetText() == \"Old Loop\" \
                and ShoppingTooltip2TextLeft2:GetText() == \"Older Loop\" \
                and p1 == \"TOPLEFT\" and r1:GetName() == \"GameTooltip\" \
-               and rp1 == \"TOPRIGHT\" and x1 == 0 and y1 == -10 \
+               and rp1 == \"TOPRIGHT\" and x1 == 0 and math.abs(y1 + 10) < 1e-3 \
                and p2 == \"TOPLEFT\" and r2:GetName() == \"ShoppingTooltip1\" \
                and rp2 == \"TOPRIGHT\" and x2 == 0 and y2 == 0",
         )
@@ -459,11 +462,13 @@ fn shipped_merchant_row_raises_the_compare_plates() {
         "the epic ring's plate reads purple and keeps its flavour text — no compact cut"
     );
     // The plate's small-font ladder is 10 px; the main tooltip's header face is larger.
+    // The height through the getter steps, `G(S(10))` at 4:3.
+    benilla_ui::test_support::install_law43(&s);
     let ok: bool = s
         .eval(
             "local _, sh = ShoppingTooltip1TextLeft1:GetFont() \
              local _, mh = GameTooltipTextLeft1:GetFont() \
-             return sh == 10 and mh > sh",
+             return sh == law(10) and mh > sh",
         )
         .unwrap();
     assert!(

@@ -20,6 +20,7 @@ use crate::net::{GuidIndex, NetCommands, ObjectStore};
 use crate::ui_script::gate;
 
 use super::GroupState;
+use crate::query_cache::Ask;
 
 /// Which roster a pet token counts its owner in: the two resolve the pet's guid apart
 /// (`0x4e81d0` behind the owner's online bit, `0x491960` with none).
@@ -54,6 +55,9 @@ pub(super) struct Lookup<'a, 'w, 's, 'q> {
     names: &'a NameCache,
     commands: &'a NetCommands,
     types: CreatureTypeSources<'a>,
+    /// `Spell.dbc`, which the tooltip's owner line reads a creating spell from.
+    catalog: Option<&'a benilla_formats::SpellCatalog>,
+    study: crate::ui_unit::tooltip_facts::StudySources<'a>,
 }
 
 impl<'a, 'w, 's, 'q> Lookup<'a, 'w, 's, 'q> {
@@ -62,6 +66,8 @@ impl<'a, 'w, 's, 'q> Lookup<'a, 'w, 's, 'q> {
         stores: &'a Query<'w, 's, &'q ObjectStore>,
         names: &'a Names,
         types: CreatureTypeSources<'a>,
+        catalog: Option<&'a benilla_formats::SpellCatalog>,
+        study: crate::ui_unit::tooltip_facts::StudySources<'a>,
     ) -> Self {
         Self {
             index,
@@ -69,6 +75,8 @@ impl<'a, 'w, 's, 'q> Lookup<'a, 'w, 's, 'q> {
             names: &names.cache,
             commands: &names.commands,
             types,
+            catalog,
+            study,
         }
     }
 
@@ -131,11 +139,25 @@ pub(super) fn member_pet(
         // `UnitIsConnected` answers 1 for any object (`0x517daf`), as `snapshot` does. No
         // reaction: the pet frame reads none, as the `"pet"` token's.
         Some(store) => {
+            // The unit's create looked its name up with a callback (`0x5dec12`); a frame asks only
+            // a name the cache holds nothing for, as one invalidated since, and a refused one waits
+            // for the next create.
             let name = look
                 .names
-                .resolve_unit(guid, Some(store), look.commands)
+                .resolve_unit(guid, Some(store), Ask::New(look.commands))
                 .map(str::to_string);
-            crate::ui_unit::snapshot(store, guid, name, 0, Default::default(), look.types)
+            let mut s =
+                crate::ui_unit::snapshot(store, guid, name, 0, Default::default(), look.types);
+            let object = |g: u64| look.store(g);
+            let sources = crate::ui_unit::tooltip_facts::TooltipSources {
+                names: look.names,
+                catalog: look.catalog,
+                object: &object,
+                study: look.study,
+            };
+            s.tooltip =
+                crate::ui_unit::tooltip_facts::tooltip_facts(store, s.creature_type, &sources);
+            s
         }
         None => record_state(
             group,
@@ -486,6 +508,58 @@ pub(in crate::ui_party) mod tests {
         }
     }
 
+    /// The reported shape: the record names the member's old pet from a stats packet; in view they
+    /// call another and walk out of range before its name is known. The snapshot takes the new
+    /// pet's name from `0x609210` (`0x5f0a63`), which misses and answers `UNKNOWNOBJECT`
+    /// (`0x609324`), and copies that (`0x5f0a70`): the old pet's name is not kept for the new one.
+    #[test]
+    fn a_member_leaving_view_with_an_unnamed_new_pet_names_it_unknownobject() {
+        let mut app = app();
+        app.world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .run(r#"UNKNOWNOBJECT = "Unknown""#)
+            .unwrap();
+        party(&mut app, 1, true);
+        let owner = stream(&mut app, member(1), &summon(pet(2)));
+        let new_pet = stream(
+            &mut app,
+            pet(2),
+            &[(HEALTH, 900), (MAXHEALTH, 1000), (PETNUMBER, 7)],
+        );
+        frame(&mut app);
+        assert_eq!(
+            text(&mut app, "UnitName('partypet1')").as_deref(),
+            Some("Unknown"),
+            "held, its name not yet answered"
+        );
+
+        let fields = |app: &App, e: Entity| app.world().get::<ObjectStore>(e).unwrap().clone();
+        let (store, pet_store) = (fields(&app, owner), fields(&app, new_pet));
+        app.world_mut()
+            .resource_scope(|world, mut group: Mut<GroupState>| {
+                super::super::net::member_deactivated(
+                    member(1),
+                    &mut group,
+                    Some(&store),
+                    |g| (g == pet(2)).then_some(&pet_store),
+                    world.resource::<NameCache>(),
+                    world.get_non_send_resource::<UiScript>(),
+                    world.resource::<NetCommands>(),
+                );
+            });
+        for (guid, e) in [(member(1), owner), (pet(2), new_pet)] {
+            app.world_mut().despawn(e);
+            app.world_mut().resource_mut::<GuidIndex>().0.remove(&guid);
+        }
+        frame(&mut app);
+        assert_eq!(
+            text(&mut app, "UnitName('partypet1')").as_deref(),
+            Some("Unknown"),
+            "out of view, the record's copy of the miss, not the old pet's \"Whelp\""
+        );
+        assert_eq!(num(&mut app, "UnitHealth('partypet1')"), 900.0);
+    }
+
     /// A pet is found only behind its owner's online bit (`0x4e8227`, `0x4e8884`): an offline
     /// member's record names nobody.
     #[test]
@@ -787,6 +861,7 @@ pub(in crate::ui_party) mod tests {
                 pet_family: 0,
                 rank: 0,
                 type_flags: 0,
+                pet_spell_list: 0,
                 civilian: false,
                 racial_leader: false,
                 display_id: 0,
@@ -881,19 +956,19 @@ pub(in crate::ui_party) mod tests {
         let creature_type =
             |app: &mut App, token: &str| text(app, &format!("UnitCreatureType('{token}')"));
         assert_eq!(
-            creature_type(&mut app, "raid1").as_deref(),
+            creature_type(&mut app, "raid2").as_deref(),
             Some("야수"),
-            "our own row"
+            "our own row, after the member's"
         );
         assert_eq!(
-            creature_type(&mut app, "raid2").as_deref(),
+            creature_type(&mut app, "raid1").as_deref(),
             Some("야수"),
             "a held member's row"
         );
         set_fields(&mut app, me, &[(BYTES_1, 0)]);
         frame(&mut app);
         assert_eq!(
-            creature_type(&mut app, "raid1").as_deref(),
+            creature_type(&mut app, "raid2").as_deref(),
             Some("인간형"),
             "out of form: our race's type"
         );

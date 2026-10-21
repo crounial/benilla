@@ -902,7 +902,11 @@ fn a_held_pet_reads_connected_and_its_stock_power_bar_shows_its_power() {
     );
     assert_eq!(
         (r, g, b),
-        (1.0, 0.5, 0.25),
+        (
+            benilla_ui::color::quant::read(1.0),
+            benilla_ui::color::quant::read(0.5),
+            benilla_ui::color::quant::read(0.25)
+        ),
         "FOCUS, not the disconnected grey"
     );
     let errors = script.errors();
@@ -929,6 +933,7 @@ fn a_held_pet_names_its_templates_creature_type() {
             pet_family: 0,
             rank: 0,
             type_flags: 0,
+            pet_spell_list: 0,
             civilian: false,
             racial_leader: false,
             display_id: 0,

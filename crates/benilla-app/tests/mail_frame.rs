@@ -67,6 +67,8 @@ fn row(sender: &str, subject: &str, was_read: bool, item_id: u32, cod: u32) -> M
         item_quality: (item_id != 0).then_some(1),
         can_delete: false,
         item_random_property_id: 0,
+        item_charges: 0,
+        item_durability: (0, 0),
         cod_payment: false,
         message_type: 0,
         mail_template_id: 0,
@@ -90,7 +92,7 @@ fn one_linen_backpack() -> benilla_ui::script::ContainerState {
         },
     );
     benilla_ui::script::ContainerState {
-        name: Some("Backpack".into()),
+        name: None,
         num_slots: 16,
         slots,
     }

@@ -212,11 +212,14 @@ fn serve_realmd(
     let mut reply = vec![0x01, 0x00];
     reply.extend_from_slice(&sha1(&[a_pub, m1, &key]));
     reply.extend_from_slice(&0u32.to_le_bytes()); // hardware_survey_id
+
+    // The key handed on and the logon counted before the client can see the proof, so neither
+    // reads behind what it has seen.
+    let _ = keys.send(key);
+    logons.fetch_add(1, Ordering::SeqCst);
     if s.write_all(&reply).is_err() {
         return;
     }
-    let _ = keys.send(key);
-    logons.fetch_add(1, Ordering::SeqCst);
 
     // CMD_REALM_LIST_Client (0x10 and a u32), answered every time, until the client closes the
     // link.
@@ -238,10 +241,11 @@ fn serve_realmd(
         list.extend_from_slice(&records);
         // vmangos's trailer (`AuthSocket.cpp:1088`).
         list.extend_from_slice(&0x0002u16.to_le_bytes());
+        // Counted before the write, so the count never reads behind a list the client has.
+        lists.fetch_add(1, Ordering::SeqCst);
         if s.write_all(&list).is_err() {
             return;
         }
-        lists.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -295,7 +299,8 @@ pub(crate) fn char_enum_body(characters: &[benilla_protocol::Character]) -> Vec<
             c.hair_style,
             c.hair_color,
             c.facial_hair,
-            c.level,
+            // The parse stores a wire level of 0 as level 1 and the new-character byte.
+            if c.new_character { 0 } else { c.level },
         ]);
         b.extend_from_slice(&c.zone.to_le_bytes());
         b.extend_from_slice(&c.map.to_le_bytes());
@@ -593,10 +598,13 @@ pub(crate) fn world(listener: TcpListener, keys: Receiver<Key>) -> World {
             let Some(key) = last else {
                 return;
             };
-            // Held before the client can see the session open, so a drop never misses it.
+            // Held and counted before the client can see the session open, so a drop never misses
+            // it and `open` never reads behind the client's authentication.
             if let Ok(link) = s.try_clone() {
                 link_log.lock().unwrap().push(link);
             }
+            let sessions = Arc::clone(&sessions);
+            sessions.fetch_add(1, Ordering::SeqCst);
             let mut crypto = HeaderCrypto::from_session_key(key);
             let reply = addon_reply.lock().unwrap().clone();
             if let Some((body, false)) = &reply {
@@ -637,8 +645,6 @@ pub(crate) fn world(listener: TcpListener, keys: Receiver<Key>) -> World {
                 all.push(Vec::new());
                 all.len() - 1
             };
-            let sessions = Arc::clone(&sessions);
-            sessions.fetch_add(1, Ordering::SeqCst);
             thread::spawn(move || {
                 while let Some(packet) = recv_packet(&mut s, Some(&mut crypto)) {
                     let op = u16::from_le_bytes([packet[2], packet[3]]);

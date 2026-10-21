@@ -6,10 +6,9 @@
 
 use mlua::{Lua, MultiValue, Value};
 
-use super::binding_abi::flag;
+use super::binding_abi::{self, flag};
 use super::cursor::{self, CursorPayload};
 use super::Model;
-use crate::script::binding_abi::Idx;
 
 /// Slots per side, six traded and the non-traded enchant slot: vmangos `TRADE_SLOT_COUNT`
 /// (`TradeData.h`), kept equal to the protocol crate's, which this crate does not depend on.
@@ -34,10 +33,6 @@ pub struct TradeSlotItem {
     /// The wire's `lock_id`: the trade target's tooltip draws LOCKED off it (`0x534563`,
     /// `0x52bdd2`). 0 for none; the player's side ignores it.
     pub lock_id: u32,
-    /// The player's own side only: the placed item's `ITEM_FIELD_FLAGS`. Its presence means the
-    /// slot holds a live item object, which the tooltip builder's LOCKED gate reads (`0x5342ed`);
-    /// the partner's side has none.
-    pub object_flags: Option<u32>,
     /// The wire's wrapped word: the partner's block `+0x42c` (`0x534559`), which the tooltip's
     /// wrapped gates read (`0x52c991`, `0x52cc5b`). The player's side reads its object's
     /// `ITEM_FIELD_FLAGS` instead, so this only mirrors them there.
@@ -49,9 +44,21 @@ pub struct TradeSlotItem {
     /// The giver's guid, 0 for none: with no [`Self::gift_creator`] yet, the name the tooltip
     /// waits for.
     pub gift_creator_guid: u64,
+    /// The resolved name of the item's creator (`ITEM_FIELD_CREATOR` on the player's side, the
+    /// block's `+0x410` on the partner's, `0x53453e`), the "Made by" line; `None` while unresolved
+    /// or when the guid is 0.
+    pub creator: Option<String>,
+    /// The creator's guid, 0 for none: with no [`Self::creator`] yet, the name the tooltip waits
+    /// for.
+    pub creator_guid: u64,
     /// Slot 7 only: the name of the spell being cast on the item, which stock shows in green
-    /// (`TradeFrame.lua:62`); `None` on every other slot and while nothing is cast.
+    /// (`TradeFrame.lua:62`) and the slot's tooltip proposes (`0x534397`, `0x53459a`); `None` on
+    /// every other slot and while nothing is cast.
     pub enchantment: Option<String>,
+    /// The partner's side only: the wire's charges and `(current, max)` durability, the block's
+    /// `+0x428` (`0x534595`) and `+0x438`/`+0x434` (`0x5345c0`, `0x5345b4`).
+    pub charges: i32,
+    pub durability: (u32, u32),
     /// The escaped item link the link verbs answer; `None` while the template is in flight, since
     /// it embeds the name and the quality.
     pub link: Option<String>,
@@ -487,11 +494,14 @@ fn trade_slot_item(model: &Model, item: &cursor::CursorItem) -> TradeSlotItem {
             quality: s.quality,
             inventory_type: s.inventory_type,
             lock_id: 0,
-            object_flags: Some(s.flags),
             wrapped: s.flags & 0x8 != 0,
             gift_creator: s.gift_creator.clone(),
             gift_creator_guid: s.gift_creator_guid,
+            creator: s.creator.clone(),
+            creator_guid: s.creator_guid,
             enchantment: None,
+            charges: 0,
+            durability: (0, 0),
             link: s.link.clone(),
         })
         .unwrap_or_else(|| TradeSlotItem {
@@ -510,12 +520,15 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     let g = lua.globals();
 
     // GetTradePlayerItemInfo(id): name, texture, numItems, quality, enchantment; an empty slot is
-    // nil, nil, 0, 0, nil (`0x4c0613`), and a filled one's texture is a string. The fourth is the quality, -1 unless the template is cached
+    // nil, nil, 0, 0, nil (`0x4c0613`), and a filled one's texture is a string. The fourth is the
+    // quality, -1 unless the template is cached
     // and equippable (`0x4c059c`), never a usable flag; `TradeFrame.lua:55` names it `isUsable` and
     // never reads it.
     g.set(
         "GetTradePlayerItemInfo",
-        lua.create_function(|lua, Idx(id): Idx| {
+        lua.create_function(|lua, id: Value| {
+            // `is-number` else `Usage: GetTradePlayerItemInfo(index)` (`0x847c44`, `0x4c047e`).
+            let id = binding_abi::index_arg(lua, id, "Usage: GetTradePlayerItemInfo(index)")?;
             let slot = {
                 let mut model = lua.app_data_mut::<Model>().expect("model app_data");
                 let slot = slot_at(&model, id, |t| &t.player);
@@ -558,13 +571,24 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     // The link verbs, for a slot's ctrl and shift clicks (`TradeFrame.xml:129`, `:95`).
-    for (name, side) in [
-        ("GetTradePlayerItemLink", true),
-        ("GetTradeTargetItemLink", false),
+    // Each `is-number` else its own usage line (`0x847c6c` at `0x4c0661`, `0x847c1c` at
+    // `0x4c0391`).
+    for (name, side, usage) in [
+        (
+            "GetTradePlayerItemLink",
+            true,
+            "Usage: GetTradePlayerItemLink(index)",
+        ),
+        (
+            "GetTradeTargetItemLink",
+            false,
+            "Usage: GetTradeTargetItemLink(index)",
+        ),
     ] {
         g.set(
             name,
-            lua.create_function(move |lua, Idx(id): Idx| {
+            lua.create_function(move |lua, id: Value| {
+                let id = binding_abi::index_arg(lua, id, usage)?;
                 let link = {
                     let model = lua.app_data_ref::<Model>().expect("model app_data");
                     let slot = if side {
@@ -587,7 +611,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // the player's (`0x4c0241`).
     g.set(
         "GetTradeTargetItemInfo",
-        lua.create_function(|lua, Idx(id): Idx| {
+        lua.create_function(|lua, id: Value| {
+            // `is-number` else `Usage: GetTradeTargetItemInfo(index)` (`0x847bf4`, `0x4c011e`).
+            let id = binding_abi::index_arg(lua, id, "Usage: GetTradeTargetItemInfo(index)")?;
             let (slot, usable) = {
                 let mut model = lua.app_data_mut::<Model>().expect("model app_data");
                 let slot = slot_at(&model, id, |t| &t.target);
@@ -749,7 +775,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // ClickTargetTradeButton(id) (`TradeFrame.xml:101`): the partner's column takes nothing.
     g.set(
         "ClickTargetTradeButton",
-        lua.create_function(|lua, _id: u32| {
+        lua.create_function(|lua, _id: Value| {
+            // `is-number` else `Usage: ClickTargetTradeButton(index)` (`0x847bcc`, `0x4c0091`).
+            let _id = binding_abi::index_arg32(lua, _id, "Usage: ClickTargetTradeButton(index)")?;
             // Coins on the cursor still go into our offer, the index unread (`0x4c00a3`).
             super::tick::verb(lua, cursor::money::add_trade_money);
             Ok(())
@@ -773,11 +801,14 @@ mod tests {
             quality: Some(quality),
             inventory_type: 0,
             lock_id: 0,
-            object_flags: None,
             wrapped: false,
             gift_creator: None,
             gift_creator_guid: 0,
+            creator: None,
+            creator_guid: 0,
             enchantment: None,
+            charges: 0,
+            durability: (0, 0),
             link: Some(format!(
                 "|cffffffff|Hitem:{item_id}:0:0:0|h[Linen Cloth]|h|r"
             )),
@@ -820,11 +851,14 @@ mod tests {
             quality: None,
             inventory_type: 0,
             lock_id: 0,
-            object_flags: None,
             wrapped: false,
             gift_creator: None,
             gift_creator_guid: 0,
+            creator: None,
+            creator_guid: 0,
             enchantment: None,
+            charges: 0,
+            durability: (0, 0),
             link: None,
         });
         s.set_trade(Some(st));

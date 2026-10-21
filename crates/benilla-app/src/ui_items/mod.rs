@@ -14,8 +14,8 @@ use benilla_ui::script::EQUIPMENT_BAG;
 use bevy::prelude::*;
 
 use crate::items::Items;
-use crate::net::{NetCommands, ObjectStore, Objects};
-use crate::ui_script::UiInput;
+use crate::net::{ObjectStore, Objects};
+use crate::query_cache::Ask;
 use crate::ui_unit::UnitFeed;
 
 mod drain;
@@ -33,7 +33,8 @@ use drain::{
 // `UseContainerItem` and `UseInventoryItem`, applied in call order by `crate::script_calls`.
 pub(crate) use drain::ScriptItemUse;
 use feed::{
-    feed_containers, feed_item_sets, feed_item_stats, feed_player_req, feed_random_properties,
+    ask_item_build_lookups, feed_containers, feed_item_sets, feed_item_stats, feed_player_req,
+    feed_random_properties,
 };
 
 /// The backpack's capacity (`PLAYER_FIELD_PACK_SLOT_1..`).
@@ -514,12 +515,7 @@ pub(crate) fn collect_inventory(
 /// walker (`0x6223a0` → `0x622420`) with predicate `0x6223d0`, `BagFamily == 9` (`template+0x1d0`),
 /// at mode `0x4f`, so a key in the bank counts. A slot whose template is still in flight reads as
 /// no key until the answer lands.
-pub(crate) fn has_key(
-    store: &ObjectFields,
-    objects: &Objects,
-    items: &Items,
-    commands: &NetCommands,
-) -> bool {
+pub(crate) fn has_key(store: &ObjectFields, objects: &Objects, items: &Items) -> bool {
     // Every guid mode `0x4f` reaches, in the walker's order: each bag's contents follow its slot.
     fn contents(bag_guid: u64, objects: &Objects, out: &mut Vec<u64>) {
         let Some(f) = objects.object(bag_guid) else {
@@ -558,8 +554,9 @@ pub(crate) fn has_key(
         let Some(entry) = objects.object(guid).and_then(|f| f.object_entry()) else {
             return false;
         };
+        // The bag family getter only reads (`0x5da08d`).
         items
-            .template(entry, guid, commands)
+            .template(entry, guid, Ask::Read)
             .is_some_and(|t| t.bag_family == BAG_FAMILY_KEYS)
     })
 }
@@ -718,14 +715,14 @@ pub(crate) fn send_item_use(
     gate: &mut crate::ui_bind_confirm::BindGate,
     suppress: bool,
     // Passed in, not carried on `CastLadder`, so no system reaches it twice.
-    ui_errors: &mut crate::ui_action::UiErrorKeys,
+    ui_errors: &crate::ui_action::UiErrorKeys,
 ) -> bool {
     // `0x5d8d00`'s requirement check (`0x5d8e0e`) and control gate (`0x5d8eaa`), past the
     // quest-starter arm (`0x5d8dcc`), which runs before them.
     if it.start_quest == 0 {
         if let Some(key) = script.item_use_refusal(it.entry, it.use_spell.unwrap_or(0)) {
             debug!("ui_items: item use refused — {key}");
-            ui_errors.0.push(crate::ui_action::UiError::key(key));
+            ui_errors.push(crate::ui_action::UiError::key(key));
             return false;
         }
     }
@@ -740,12 +737,7 @@ pub(crate) fn send_item_use(
     };
     // The disarm ladder, asked of the caster's own inventory.
     let disarmed_hand = ctx.rel.self_store.and_then(|store| {
-        crate::items::disarmed_equipment_slot(
-            store,
-            &ladder.objects,
-            &ladder.items,
-            &ladder.commands,
-        )
+        crate::items::disarmed_equipment_slot(store, &ladder.objects, &ladder.items)
     });
     match item_use_route(it, aura_cancels, disarmed_hand) {
         ItemUseRoute::CantUseDisarmed => {
@@ -753,9 +745,7 @@ pub(crate) fn send_item_use(
                 "ui_items: item use refused — that hand is disarmed (slot {})",
                 it.slot
             );
-            ui_errors
-                .0
-                .push(crate::ui_action::UiError::key("ERR_CANT_USE_DISARMED"));
+            ui_errors.push(crate::ui_action::UiError::key("ERR_CANT_USE_DISARMED"));
             false
         }
         ItemUseRoute::ToggleCancel(spell) => {
@@ -786,9 +776,9 @@ pub(crate) fn send_item_use(
         // are on-use spell lookup failures, so the reference asks with no usable on-use spell.
         ItemUseRoute::Nothing | ItemUseRoute::Cast(_)
             if !suppress
-                && it.guid.is_some_and(|g| {
-                    gate.use_binds(&ladder.objects, &ladder.items, &ladder.commands, g)
-                }) =>
+                && it
+                    .guid
+                    .is_some_and(|g| gate.use_binds(&ladder.objects, &ladder.items, g)) =>
         {
             gate.defer_use(script, it);
             false
@@ -808,6 +798,7 @@ pub(crate) fn send_item_use(
                     bag_index: it.bag_index,
                     slot: it.slot,
                     entry: it.entry,
+                    guid: it.guid,
                     spell_index: it.spell_index,
                     on_object: it.on_object,
                 },
@@ -1000,6 +991,7 @@ impl Plugin for UiItemsPlugin {
         net::register(app);
         // The icons come from the equipment renderer's `ItemDisplays`.
         app.init_resource::<EquipErrors>()
+            .init_resource::<feed::BagUpdates>()
             .init_resource::<crate::ui_items::locks::ItemReleases>()
             .init_resource::<crate::ui_items::locks::HeldItemLocks>()
             .init_resource::<crate::ui_items::locks::LockWatch>()
@@ -1022,37 +1014,46 @@ impl Plugin for UiItemsPlugin {
                         .in_set(crate::ui_script::UiFeed)
                         .before(feed_containers)
                         .before(crate::ui_char::feed_char),
-                    // The slot cooldowns must be in the VM before `feed_action_state`'s
-                    // synchronous `BAG_UPDATE_COOLDOWN` makes the bag handlers re-read them.
+                    // The slot cooldowns must be in the VM before the action feed's
+                    // `BAG_UPDATE_COOLDOWN` makes the bag handlers re-read them, and the action
+                    // feed counts this feed's `BAG_UPDATE`s (`crate::ui_action`'s schedule).
                     feed_containers
                         .in_set(UnitFeed)
                         .before(crate::ui_action::CooldownEvents),
                     // The item-tooltip store answers before the input pass, so a re-hover the
-                    // next frame sees the answer.
-                    feed_item_stats.in_set(UnitFeed),
+                    // next frame sees the answer, and seats a new VM before its world entry; a
+                    // refused cast's item name reads the store it leaves.
+                    feed_item_stats
+                        .in_set(UnitFeed)
+                        .in_set(crate::ui_unit::WorldEnterSeats)
+                        .before(crate::ui_cast::feed_cast_reports),
                     feed_item_sets.in_set(UnitFeed),
+                    ask_item_build_lookups.in_set(UnitFeed),
                     // The roll table, pushed whole once per VM, before the first hover.
                     feed_random_properties.in_set(UnitFeed),
-                    feed_player_req.in_set(UnitFeed),
+                    // After the latches, so a skinning spell learnt this frame colours the line now.
+                    feed_player_req
+                        .in_set(UnitFeed)
+                        .after(crate::ui_action::track_learned_abilities),
                     // The item tooltip's lock check: `Lock.dbc` once, the player's openers on change.
                     lock_openers::feed_lock_rows.in_set(UnitFeed),
                     lock_openers::feed_lock_openers.in_set(UnitFeed),
                     // After the input pass, so a repair-mode click goes out the same frame; a
                     // plain `UseContainerItem` is a script call.
-                    drain_container_repairs.after(UiInput),
+                    drain_container_repairs.in_set(crate::ui_script::UiDrain),
                     // Pick, place and split: `CMSG_SWAP_INV_ITEM`, `CMSG_SWAP_ITEM` or
                     // `CMSG_SPLIT_ITEM`.
-                    drain_container_moves.after(UiInput),
+                    drain_container_moves.in_set(crate::ui_script::UiDrain),
                     // The delete-confirm popup's accept: `CMSG_DESTROYITEM`.
-                    drain_container_destroys.after(UiInput),
+                    drain_container_destroys.in_set(crate::ui_script::UiDrain),
                     // `AutoEquipCursorItem`: `CMSG_AUTOEQUIP_ITEM`.
-                    drain_container_autoequips.after(UiInput),
-                    drain_bag_autostores.after(UiInput),
+                    drain_container_autoequips.in_set(crate::ui_script::UiDrain),
+                    drain_bag_autostores.in_set(crate::ui_script::UiDrain),
                     // The soulbind confirmations' answers (`EquipPendingItem`,
                     // `CancelPendingEquip`, `ConfirmBindOnUse`). A dialog is answered in a later
                     // frame than it was raised, so no order against the other drains is needed.
-                    drain::drain_bind_confirm_answers.after(UiInput),
-                    drain::drain_bind_on_use_confirms.after(UiInput),
+                    drain::drain_bind_confirm_answers.in_set(crate::ui_script::UiDrain),
+                    drain::drain_bind_on_use_confirms.in_set(crate::ui_script::UiDrain),
                 ),
             );
     }
@@ -1541,12 +1542,9 @@ mod find_item_tests {
     fn has_key_finds_a_key_anywhere_the_reference_looks() {
         use super::{has_key, BAG_FAMILY_KEYS};
         use crate::items::{test_template, Items};
-        use crate::net::NetCommands;
 
         const KEY: u32 = 7_146; // The Scarlet Key (bag_family 9)
         const BREAD: u32 = 4_540;
-        let (tx, _rx) = crossbeam_channel::unbounded();
-        let commands = NetCommands(tx);
 
         let mut objs = TestObjects::new();
         let mut items = Items::default();
@@ -1557,35 +1555,20 @@ mod find_item_tests {
         item(&mut objs, 0xF1, KEY, None);
         item(&mut objs, 0xF2, BREAD, None);
 
-        assert!(!has_key(&player(&[]), &objs.get(), &items, &commands));
+        assert!(!has_key(&player(&[]), &objs.get(), &items));
         // A non-key in the backpack is not a key.
-        assert!(!has_key(
-            &player(&[(23, 0xF2)]),
-            &objs.get(),
-            &items,
-            &commands
-        ));
+        assert!(!has_key(&player(&[(23, 0xF2)]), &objs.get(), &items));
         // A key in keyring slot 1.
-        assert!(has_key(
-            &player(&[(81, 0xF1)]),
-            &objs.get(),
-            &items,
-            &commands
-        ));
+        assert!(has_key(&player(&[(81, 0xF1)]), &objs.get(), &items));
         // And in the backpack, before it has been filed.
-        assert!(has_key(
-            &player(&[(23, 0xF1)]),
-            &objs.get(),
-            &items,
-            &commands
-        ));
+        assert!(has_key(&player(&[(23, 0xF1)]), &objs.get(), &items));
 
         // The bank: mode `0x4f` reaches it, `find_item`'s `0x47` does not.
         let mut banked = std::collections::HashMap::new();
         banked.insert(39u16, 0xF1u64);
         let store = bank_player(&banked);
         assert!(
-            has_key(&store, &objs.get(), &items, &commands),
+            has_key(&store, &objs.get(), &items),
             "a key in the bank still gives you a keyring"
         );
         assert_eq!(

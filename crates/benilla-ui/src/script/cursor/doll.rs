@@ -3,7 +3,7 @@
 
 use mlua::{Lua, Value};
 
-use crate::script::binding_abi::flag;
+use crate::script::binding_abi::{self, flag};
 use crate::script::container::ContainerMove;
 use crate::script::protected::{self, Tag};
 use crate::script::tick::verb;
@@ -194,17 +194,30 @@ pub(super) fn cursor_can_go_in_slot(model: &Model, id: u32) -> bool {
 /// events running first; then the app sends `CMSG_USE_ITEM` with bag 255 and the 0-based slot,
 /// dropping an empty slot unsent, or in repair mode a worn item is repaired, locked or not
 /// (`0x4c79c4`).
-pub(super) fn use_inventory_item(lua: &Lua, id: u32, on_self: bool) {
+pub(super) fn use_inventory_item(lua: &Lua, id: u32, on_self: bool) -> mlua::Result<()> {
     verb(lua, clear_cursor);
     // The item's on-use spell casts through `TryCastSpell`, behind the gate's tag 2.
     let may_cast = protected::gate(lua, Tag::CAST);
-    verb(lua, |model| use_cleared(model, id, on_self, may_cast));
+    let mut call = None;
+    verb(lua, |model| {
+        use_cleared(model, id, on_self, may_cast, &mut call)
+    });
+    if let Some(call) = call {
+        crate::script::calls::submit(lua, call)?;
+    }
+    Ok(())
 }
 
 /// `UseInventoryItem` past its clear. Outside repair mode a locked worn item is refused in the
 /// call, `CGItem::Use`'s first gate (`0x4c7af0` → `0x5d8d32`), so a later call's lock does not
 /// reach it.
-fn use_cleared(model: &mut Model, id: u32, on_self: bool, may_cast: bool) {
+fn use_cleared(
+    model: &mut Model,
+    id: u32,
+    on_self: bool,
+    may_cast: bool,
+    call: &mut Option<crate::script::ScriptCall>,
+) {
     if !model.repair_mode {
         let locked = model
             .inv_slot("player", id as usize)
@@ -227,7 +240,7 @@ fn use_cleared(model: &mut Model, id: u32, on_self: bool, may_cast: bool) {
         if let Some(key) = refusal.filter(|_| !locked) {
             model.push_ui_error(key);
         } else if !locked {
-            model.queue_call(crate::script::ScriptCall::UseInventoryItem {
+            *call = Some(crate::script::ScriptCall::UseInventoryItem {
                 slot: id,
                 on_self,
                 may_cast,
@@ -253,27 +266,42 @@ pub(super) fn is_inventory_item_locked(model: &Model, id: u32) -> bool {
         .is_some_and(|s| s.item_id != 0 && item_locked(model, s.guid))
 }
 
+/// The 1-based slot through the slot reader `0x4c8520`, which raises `message` for a non-number or
+/// a slot outside its whitelist; 0 for the ammo leg.
+fn inventory_slot(lua: &Lua, v: Value, message: &'static str) -> mlua::Result<u32> {
+    let slot0 = crate::script::inventory_verbs::inventory_slot_arg(lua, v, message)?;
+    Ok((slot0 + 1) as u32)
+}
+
 /// Register the paper-doll verbs as globals.
 pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     let g = lua.globals();
 
     g.set(
         "PickupInventoryItem",
-        lua.create_function(|lua, id: u32| {
+        lua.create_function(|lua, id: Value| {
+            // The slot reader (`0x4c8db3`) else `Invalid inventory slot in PickupInventoryItem`
+            // (`0x848af8`); Lua 0, the ammo leg, passes.
+            let id = inventory_slot(lua, id, "Invalid inventory slot in PickupInventoryItem")?;
             pickup_inventory_item(lua, id);
             Ok(())
         })?,
     )?;
     g.set(
         "EquipCursorItem",
-        lua.create_function(|lua, id: u32| {
+        lua.create_function(|lua, id: Value| {
+            // `is-number` else `Usage: EquipCursorItem(slot)` (`0x8425b4`, `0x489678`).
+            let id = binding_abi::index_arg32(lua, id, "Usage: EquipCursorItem(slot)")?;
             equip_cursor_item(lua, id);
             Ok(())
         })?,
     )?;
     g.set(
         "CursorCanGoInSlot",
-        lua.create_function(|lua, id: u32| {
+        lua.create_function(|lua, id: Value| {
+            // The slot reader (`0x4c9003`) else `Invalid inventory slot in CursorCanGoInSlot`
+            // (`0x848bd0`).
+            let id = inventory_slot(lua, id, "Invalid inventory slot in CursorCanGoInSlot")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             Ok(flag(cursor_can_go_in_slot(&model, id)))
         })?,
@@ -287,11 +315,13 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
     g.set(
         "UseInventoryItem",
-        lua.create_function(|lua, (id, rest): (u32, mlua::MultiValue)| {
+        lua.create_function(|lua, (id, rest): (Value, mlua::MultiValue)| {
+            // The slot reader (`0x4c8df6`) else `Invalid inventory slot in UseInventoryItem`
+            // (`0x848b28`).
+            let id = inventory_slot(lua, id, "Invalid inventory slot in UseInventoryItem")?;
             // `onSelf` through the client's flag coercion (`0x4c8e37`, `0x6f1c10`, default 0).
             let on_self = crate::script::binding_abi::bool_or_default(rest.front(), false);
-            use_inventory_item(lua, id, on_self);
-            Ok(())
+            use_inventory_item(lua, id, on_self)
         })?,
     )?;
     g.set(
@@ -380,6 +410,7 @@ mod tests {
             gift_creator_guid: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         });
         slots[11] = Some(InvSlotView {
             duration_ms: None,
@@ -407,6 +438,7 @@ mod tests {
             gift_creator_guid: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         });
         slots[19] = Some(InvSlotView {
             duration_ms: None,
@@ -434,6 +466,7 @@ mod tests {
             gift_creator_guid: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         });
         slots
     }
@@ -471,10 +504,11 @@ mod tests {
                 flags: 0,
                 enchants: Vec::new(),
                 spell_0: false,
+                spell_charges: [0; 5],
             },
         );
         ContainerState {
-            name: Some("Backpack".into()),
+            name: None,
             num_slots: 16,
             slots,
         }
@@ -632,6 +666,7 @@ mod tests {
             gift_creator_guid: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         });
         s.set_inventory_slots(slots);
 
@@ -681,12 +716,13 @@ mod tests {
                 flags: 0,
                 enchants: Vec::new(),
                 spell_0: false,
+                spell_charges: [0; 5],
             },
         );
         s.set_container(
             0,
             Some(ContainerState {
-                name: Some("Backpack".into()),
+                name: None,
                 num_slots: 16,
                 slots,
             }),
@@ -734,6 +770,7 @@ mod tests {
             texture: None,
             count: 0,
             consumable: false,
+            state: None,
         }));
         assert!(!s.eval::<bool>("return CursorCanGoInSlot(1)").unwrap());
     }
@@ -864,6 +901,7 @@ mod tests {
     #[test]
     fn use_inventory_item_reads_the_lock_in_its_call() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         let slots = doll_slots();
         let head = slots[1].as_ref().unwrap().guid;
         s.set_inventory_slots(slots);
@@ -879,6 +917,7 @@ mod tests {
     #[test]
     fn use_inventory_item_queues_the_id() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.run("UseInventoryItem(1)").unwrap();
         s.run("UseInventoryItem(19)").unwrap();
         assert_eq!(s.take_inventory_uses(), vec![1, 19]);
@@ -889,6 +928,7 @@ mod tests {
     #[test]
     fn use_inventory_item_carries_on_self() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         for (chunk, on_self) in [
             ("UseInventoryItem(1)", false),
             ("UseInventoryItem(1, nil)", false),
@@ -914,6 +954,7 @@ mod tests {
     #[test]
     fn right_click_puts_a_held_item_back_then_uses_the_worn_one() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_inventory_slots(doll_slots());
         s.run("PickupInventoryItem(11)").unwrap();
         assert!(s.cursor_item().is_some());
@@ -1050,6 +1091,7 @@ mod tests {
     #[test]
     fn doll_uses_and_picks_carry_what_the_gate_allowed() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_inventory_slots(doll_slots());
         s.run("UseInventoryItem(1)").unwrap();
         s.run(r#"RunScript("UseInventoryItem(1)")"#).unwrap();
@@ -1134,7 +1176,7 @@ mod tests {
         let mut s = UiScript::new().unwrap();
         s.set_inventory_slots(doll_slots());
         let macro_payload = CursorPayload::Macro(CursorMacro {
-            index: 1,
+            id: 1,
             texture: None,
         });
         s.set_cursor_for_test(macro_payload.clone());
@@ -1152,6 +1194,7 @@ mod tests {
                 texture: None,
                 count: 0,
                 consumable: false,
+                state: None,
             }),
             CursorPayload::Merchant(CursorMerchantItem {
                 item_id: 159,
@@ -1216,6 +1259,7 @@ mod tests {
     #[test]
     fn a_worn_item_use_meets_the_dispatchers_gates() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         let mut doll: crate::script::InventorySlots = Default::default();
         doll[13] = Some(InvSlotView {
             item_id: 871,
@@ -1261,6 +1305,7 @@ mod tests {
     #[test]
     fn a_worn_container_meets_no_gate() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         let mut doll: crate::script::InventorySlots = Default::default();
         doll[13] = Some(InvSlotView {
             item_id: 4500,
@@ -1273,5 +1318,20 @@ mod tests {
         s.set_player_control(false);
         s.run("UseInventoryItem(13)").unwrap();
         assert!(s.take_ui_errors().is_empty());
+    }
+
+    /// `UseInventoryItem` hands its use to the lent host inside the call (`0x4c79a9`).
+    #[test]
+    fn a_worn_item_use_applies_in_the_call_with_a_host_lent() {
+        let mut s = UiScript::new().unwrap();
+        s.set_inventory_slots(doll_slots());
+        assert_eq!(
+            crate::script::host::test_support::applied_in_call(&mut s, "UseInventoryItem(1)"),
+            vec![crate::script::ScriptCall::UseInventoryItem {
+                slot: 1,
+                on_self: false,
+                may_cast: true
+            }]
+        );
     }
 }

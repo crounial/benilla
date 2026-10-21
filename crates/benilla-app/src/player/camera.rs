@@ -720,77 +720,81 @@ pub(super) fn latch_world_mouse(
     // (`UiScript::set_nameplate_hit_test_veto`). The wheel still zooms over a plate.
     pointer_over_ui: Res<crate::ui_script::PointerOverUi>,
     egui: Option<Res<crate::ui_script::EguiPointerOver>>,
-    // A press the UI consumed with nothing hovered, the layout drag's: no frame saw it, the
-    // world's included (`0x766353`). A nameplate still takes the press.
+    // A press the UI consumed with nothing hovered, the layout drag's or a right press that
+    // dropped a payload: no frame saw it, the world's included (`0x766353`, `0x766370`).
+    // A nameplate still takes the press.
     press_consumed: Option<Res<crate::ui_script::PlayerUiPressConsumed>>,
     mut rig: ResMut<CameraControl>,
     cameras: Query<&Camera, With<FlyCam>>,
     window: Single<&Window, With<PrimaryWindow>>,
-    mut script: Option<NonSendMut<benilla_ui::script::UiScript>>,
+    mut hosted_vm: crate::script_calls::HostedVm,
     cover: Option<Res<crate::loading_screen::LoadingScreen>>,
 ) {
-    let calls = script
-        .as_mut()
-        .map(|s| s.take_mouselook_calls())
-        .unwrap_or_default();
-    let plate_key = script.as_ref().and_then(|s| s.hovered_nameplate());
-    let Ok(camera) = cameras.single() else {
-        return;
-    };
-    let over_ui = pointer_over_ui.0 || press_consumed.is_some_and(|c| c.0);
-    let in_view = cursor_in_viewport(&window, camera);
-    let looking = rig.look.is_some();
-    // The dev overlay is not the plate, even when the UI hit test still finds one under it.
-    let over_plate = plate_key.is_some() && !egui.as_ref().is_some_and(|e| e.0);
-    let right_world = looking || (in_view && (!over_ui || over_plate));
-    let left_world = looking || (in_view && (!over_ui || over_plate));
-    // The widget's mouse-up already ran this frame. Read it before borrowing the mouse word:
-    // a click it recorded is the plate's action, and the turn must not queue a second one.
-    let plate_button = rig.look.filter(|_| rig.plate_orbit);
-    let released_on_plate = match plate_button {
-        Some(LookButton::Left) => buttons.just_released(MouseButton::Left),
-        Some(LookButton::Right) => buttons.just_released(MouseButton::Right),
-        None => false,
-    };
-    let pending_plate_click = released_on_plate
-        && script.as_ref().is_some_and(|s| match plate_button {
-            Some(LookButton::Right) => s.has_pending_nameplate_right_click(),
-            _ => s.has_pending_nameplate_left_click(),
-        });
-    {
-        let wm = &mut rig.world_mouse;
-        wm.update(&buttons, right_world, left_world);
-        if wm.down(LookButton::Left) || wm.down(LookButton::Right) {
-            // A chord's second button is already a world press. Only the press that starts
-            // the turn is the plate's.
-            let starts = over_plate && !looking;
-            wm.plate_press = starts;
-            wm.plate_key = starts.then_some(plate_key).flatten();
+    hosted_vm.run(|mut script| {
+        let calls = script
+            .as_mut()
+            .map(|s| s.take_mouselook_calls())
+            .unwrap_or_default();
+        let plate_key = script.as_ref().and_then(|s| s.hovered_nameplate());
+        let Ok(camera) = cameras.single() else {
+            return;
+        };
+        let over_ui = pointer_over_ui.0 || press_consumed.is_some_and(|c| c.0);
+        let in_view = cursor_in_viewport(&window, camera);
+        let looking = rig.look.is_some();
+        // The dev overlay is not the plate, even when the UI hit test still finds one under it.
+        let over_plate = plate_key.is_some() && !egui.as_ref().is_some_and(|e| e.0);
+        let right_world = looking || (in_view && (!over_ui || over_plate));
+        let left_world = looking || (in_view && (!over_ui || over_plate));
+        // The widget's mouse-up already ran this frame. Read it before borrowing the mouse word:
+        // a click it recorded is the plate's action, and the turn must not queue a second one.
+        let plate_button = rig.look.filter(|_| rig.plate_orbit);
+        let released_on_plate = match plate_button {
+            Some(LookButton::Left) => buttons.just_released(MouseButton::Left),
+            Some(LookButton::Right) => buttons.just_released(MouseButton::Right),
+            None => false,
+        };
+        let pending_plate_click = released_on_plate
+            && script.as_ref().is_some_and(|s| match plate_button {
+                Some(LookButton::Right) => s.has_pending_nameplate_right_click(),
+                _ => s.has_pending_nameplate_left_click(),
+            });
+        {
+            let wm = &mut rig.world_mouse;
+            wm.update(&buttons, right_world, left_world);
+            if wm.down(LookButton::Left) || wm.down(LookButton::Right) {
+                // A chord's second button is already a world press. Only the press that starts
+                // the turn is the plate's.
+                let starts = over_plate && !looking;
+                wm.plate_press = starts;
+                wm.plate_key = starts.then_some(plate_key).flatten();
+            }
+            // The script's calls, made since the last latch, before this frame's release.
+            for on in calls {
+                wm.mouselook(on);
+            }
+            // The right button's release ends a scripted channel too, wherever its press went: in
+            // freelook every button event goes to the `WorldFrame` (`0x492b50`), whose TURNORACTION
+            // up runs `TurnOrActionStop` (`0x514160`), `0x515090(1, 0, …)`.
+            if buttons.just_released(MouseButton::Right) {
+                wm.scripted = false;
+            }
+            // The world enter behind the cover clears the whole word (`0x5144c0` → `0x514b70(-1, …)`).
+            // A window deactivate clears none of it (`0x5144a3 and eax,0xfffff00f` keeps the low
+            // bits): the session outlives the focus, and only the OS cursor goes back
+            // ([`sync_look_focus`]).
+            if cover.is_some_and(|c| c.covering()) {
+                wm.scripted = false;
+            }
         }
-        // The script's calls, made since the last latch, before this frame's release.
-        for on in calls {
-            wm.mouselook(on);
+        if released_on_plate {
+            rig.plate_click_from_ui = pending_plate_click;
         }
-        // The right button's release ends a scripted channel too, wherever its press went: in
-        // freelook every button event goes to the `WorldFrame` (`0x492b50`), whose TURNORACTION up
-        // runs `TurnOrActionStop` (`0x514160`), `0x515090(1, 0, …)`.
-        if buttons.just_released(MouseButton::Right) {
-            wm.scripted = false;
+        // `IsMouselooking` (`0x514270`) reads `[InputControl+4] & 1`, the TurnOrAction channel.
+        if let Some(script) = script {
+            script.set_turn_or_action_held(rig.world_mouse.turn());
         }
-        // The world enter behind the cover clears the whole word (`0x5144c0` → `0x514b70(-1, …)`).
-        // A window deactivate clears none of it (`0x5144a3 and eax,0xfffff00f` keeps the low bits):
-        // the session outlives the focus, and only the OS cursor goes back ([`sync_look_focus`]).
-        if cover.is_some_and(|c| c.covering()) {
-            wm.scripted = false;
-        }
-    }
-    if released_on_plate {
-        rig.plate_click_from_ui = pending_plate_click;
-    }
-    // `IsMouselooking` (`0x514270`) reads `[InputControl+4] & 1`, the TurnOrAction channel.
-    if let Some(mut script) = script {
-        script.set_turn_or_action_held(rig.world_mouse.turn());
-    }
+    })
 }
 
 /// The right button's down edge in the world, before the press is judged a click or a drag:

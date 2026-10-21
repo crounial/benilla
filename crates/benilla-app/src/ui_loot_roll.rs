@@ -33,14 +33,15 @@
 use benilla_protocol::messages::{roll_vote, LootAllPassed, LootRoll, LootRollWon, LootStartRoll};
 use bevy::prelude::*;
 
-use benilla_ui::script::{LootRollEntry, LootRollsState, ScriptValue, UiScript};
+use benilla_ui::script::{LootRollEntry, LootRollsState, ScriptValue};
 
 use crate::entities::ItemDisplays;
 use crate::items::Items;
 use crate::names::NameCache;
 use crate::net::{ClientCommand, NetCommands, SelfGuid};
+use crate::query_cache::Ask;
 use crate::ui_chat::{ChatEvent, ChatEventKind, ChatLog};
-use crate::ui_script::{UiFeed, UiInput};
+use crate::ui_script::UiFeed;
 
 /// Frames a pending line retries its names before dropping: a refused name never resolves.
 const LINE_MAX_TRIES: u16 = 120;
@@ -86,6 +87,9 @@ struct ActiveRoll {
     /// How long the roll has waited for its item template.
     held_ms: u32,
     phase: Phase,
+    /// The start packet's lookup of the item, with the callback `0x61b460` (`0x61b40e`), is made:
+    /// the frames after only read, as the getters do (`0x4c30d2`).
+    asked: bool,
 }
 
 /// One queued chat announcement, awaiting the names it needs.
@@ -140,6 +144,7 @@ impl LootRolls {
             remaining_ms: p.countdown_ms,
             held_ms: 0,
             phase: Phase::Waiting,
+            asked: false,
         });
     }
 
@@ -319,7 +324,7 @@ impl Plugin for UiLootRollPlugin {
                 // The feed before the input pass shows a new roll the same frame; the drain after
                 // it sends a vote the same frame.
                 feed_loot_rolls.in_set(UiFeed),
-                drain_loot_rolls.after(UiInput),
+                drain_loot_rolls.in_set(crate::ui_script::UiDrain),
             ),
         );
     }
@@ -418,7 +423,7 @@ fn render(
     self_guid: Option<u64>,
     items: &Items,
     names: &NameCache,
-    commands: &NetCommands,
+    ask: Ask<'_>,
     rolls: crate::items::RollCatalogs,
     detailed: bool,
 ) -> Option<String> {
@@ -428,7 +433,7 @@ fn render(
         RollLine::Won(p) => (p.item_id, p.random_property_id, Some(p.winner)),
         RollLine::AllPassed(p) => (p.item_id, p.random_property_id, None),
     };
-    let t = items.template(looted_item, 0, commands)?;
+    let t = items.template(looted_item, 0, ask)?;
     // The link names the rolled drop, suffix included, as the roll frame does.
     let link = crate::ui_items::item_link_full(
         looted_item,
@@ -448,7 +453,7 @@ fn render(
         RollLine::AllPassed(_) => false,
     };
     let name = match roller {
-        Some(g) if needs_name => Some(names.resolve_player(g, commands)?.to_string()),
+        Some(g) if needs_name => Some(names.resolve_player(g, ask)?.to_string()),
         _ => None,
     };
 
@@ -463,7 +468,7 @@ fn drain_lines(
     items: &Items,
     names: &NameCache,
     commands: &NetCommands,
-    chat: &mut ChatLog,
+    chat: &ChatLog,
     catalogs: crate::items::RollCatalogs,
     detailed: bool,
 ) {
@@ -474,9 +479,13 @@ fn drain_lines(
         if !detailed && matches!(p.line, RollLine::Announce(_)) {
             continue;
         }
-        match render(
-            &p.line, self_guid, items, names, commands, catalogs, detailed,
-        ) {
+        // The packet's lookups pass callbacks (`0x61c047`, `0x61c08e`, `0x61b96a`, `0x61b5c0`):
+        // a line's first render asks as they do, and its retries ask only what the cache holds
+        // nothing for. So the roller's name, if still unasked, goes at the first render after the
+        // item lands, where the item's answer asks it (`0x61c4b0` → `0x61c53e` → `0x61c070`,
+        // `0x61c08e`).
+        let ask = Ask::at(p.tries == 0, commands);
+        match render(&p.line, self_guid, items, names, ask, catalogs, detailed) {
             Some(text) => chat.push_event(ChatEvent::text_only(ChatEventKind::Loot, text)),
             None => {
                 p.tries += 1;
@@ -494,14 +503,13 @@ fn snapshot(
     rolls: &LootRolls,
     items: &Items,
     icons: Option<&ItemDisplays>,
-    commands: &NetCommands,
     catalogs: crate::items::RollCatalogs,
 ) -> LootRollsState {
     let entries = rolls
         .active
         .iter()
         .map(|r| {
-            let t = items.template(r.item_id, 0, commands);
+            let t = items.template(r.item_id, 0, Ask::Read);
             let texture = t
                 .and_then(|t| icons?.catalog.get(t.display_info_id))
                 .and_then(|d| d.icon.clone());
@@ -533,14 +541,14 @@ fn snapshot(
 
 /// Tick the open rolls, push them into the VM, fire their events and post their chat lines.
 fn feed_loot_rolls(
-    script: Option<NonSendMut<UiScript>>,
+    mut hosted_vm: crate::script_calls::HostedVm,
     mut rolls: ResMut<LootRolls>,
     items: Res<Items>,
     names: Res<NameCache>,
     icons: Option<Res<ItemDisplays>>,
     commands: Res<NetCommands>,
     self_guid: Res<SelfGuid>,
-    mut chat: ResMut<ChatLog>,
+    chat: Res<ChatLog>,
     time: Res<Time>,
     mut last: Local<crate::ui_script::VmMemo<LootRollsState>>,
     props: Option<Res<crate::items::RandomProperties>>,
@@ -549,109 +557,120 @@ fn feed_loot_rolls(
     // (`0x61ba3a`, `0x61bafe`, `0x61c0b9`).
     loot: Res<crate::ui_loot::LootConfig>,
 ) {
-    rolls.tick(time.delta().as_millis() as u32);
+    hosted_vm.run(|script| {
+        rolls.tick(time.delta().as_millis() as u32);
 
-    let Some(mut script) = script else {
-        return;
-    };
-    let last = last.get(&script);
-    let catalogs = crate::items::RollCatalogs {
-        props: props.as_deref(),
-        enchants: enchants.as_deref(),
-    };
-    drain_lines(
-        &mut rolls,
-        self_guid.0,
-        &items,
-        &names,
-        &commands,
-        &mut chat,
-        catalogs,
-        loot.show_loot_spam,
-    );
+        let Some(script) = script else {
+            return;
+        };
+        let last = last.get(script);
+        let catalogs = crate::items::RollCatalogs {
+            props: props.as_deref(),
+            enchants: enchants.as_deref(),
+        };
+        drain_lines(
+            &mut rolls,
+            self_guid.0,
+            &items,
+            &names,
+            &commands,
+            &chat,
+            catalogs,
+            loot.show_loot_spam,
+        );
 
-    // The snapshot goes in before the events: a `GroupLootFrame`'s `OnShow` reads its item from it.
-    let fresh = snapshot(&rolls, &items, icons.as_deref(), &commands, catalogs);
-    if fresh != *last {
-        script.set_loot_rolls(fresh.clone());
-        *last = fresh;
-    }
+        for r in rolls.active.iter_mut().filter(|r| !r.asked) {
+            items.template(r.item_id, 0, Ask::Event(&commands));
+            r.asked = true;
+        }
+        // The snapshot goes in before the events: a `GroupLootFrame`'s `OnShow` reads its item from
+        // it.
+        let fresh = snapshot(&rolls, &items, icons.as_deref(), catalogs);
+        if fresh != *last {
+            script.set_loot_rolls(fresh.clone());
+            *last = fresh;
+        }
 
-    // The hold: a fresh roll reaches `0x61b430` once its template is in the snapshot above, and
-    // takes a free slot or is deferred.
-    rolls.reach_ready(|r| {
-        if items.template(r.item_id, 0, &commands).is_none() {
-            // The module doc's deviation: an entry the server does not know, or an expired hold.
-            let unknown = items.template_answered_unknown(r.item_id);
-            if !unknown && r.held_ms < TEMPLATE_HOLD_MAX_MS {
-                return false;
-            }
-            debug!(
-                "ui_loot_roll: roll {} opening unresolved ({})",
-                r.roll_id,
-                if unknown {
-                    "the server does not know the entry"
-                } else {
-                    "template hold expired"
+        // The hold: a fresh roll reaches `0x61b430` once its template is in the snapshot above, and
+        // takes a free slot or is deferred.
+        rolls.reach_ready(|r| {
+            if items.template(r.item_id, 0, Ask::Read).is_none() {
+                // The module doc's deviation: an entry the server does not know, or an expired
+                // hold.
+                let unknown = items.template_answered_unknown(r.item_id);
+                if !unknown && r.held_ms < TEMPLATE_HOLD_MAX_MS {
+                    return false;
                 }
+                debug!(
+                    "ui_loot_roll: roll {} opening unresolved ({})",
+                    r.roll_id,
+                    if unknown {
+                        "the server does not know the entry"
+                    } else {
+                        "template hold expired"
+                    }
+                );
+            }
+            true
+        });
+        // Closes first: a promoted roll's frame needs the closed one's free, or the stock
+        // four-frame `GroupLootFrame_OpenNewFrame` drops it.
+        for roll_id in std::mem::take(&mut rolls.cancelled) {
+            debug!("ui_loot_roll: roll {roll_id} cancelled");
+            script.fire_event("CANCEL_LOOT_ROLL", vec![ScriptValue::Int(roll_id as i64)]);
+        }
+        for r in &mut rolls.active {
+            if r.phase != Phase::Starting {
+                continue;
+            }
+            r.phase = Phase::Open;
+            debug!(
+                "ui_loot_roll: roll {} opened ({} ms, held {} ms)",
+                r.roll_id, r.countdown_ms, r.held_ms
+            );
+            script.fire_event(
+                "START_LOOT_ROLL",
+                vec![
+                    ScriptValue::Int(r.roll_id as i64),
+                    ScriptValue::Int(r.countdown_ms as i64),
+                ],
             );
         }
-        true
-    });
-    // Closes first: a promoted roll's frame needs the closed one's free, or the stock four-frame
-    // `GroupLootFrame_OpenNewFrame` drops it.
-    for roll_id in std::mem::take(&mut rolls.cancelled) {
-        debug!("ui_loot_roll: roll {roll_id} cancelled");
-        script.fire_event("CANCEL_LOOT_ROLL", vec![ScriptValue::Int(roll_id as i64)]);
-    }
-    for r in &mut rolls.active {
-        if r.phase != Phase::Starting {
-            continue;
-        }
-        r.phase = Phase::Open;
-        debug!(
-            "ui_loot_roll: roll {} opened ({} ms, held {} ms)",
-            r.roll_id, r.countdown_ms, r.held_ms
-        );
-        script.fire_event(
-            "START_LOOT_ROLL",
-            vec![
-                ScriptValue::Int(r.roll_id as i64),
-                ScriptValue::Int(r.countdown_ms as i64),
-            ],
-        );
-    }
+    })
 }
 
 /// Drain the Lua votes: each `RollOnLoot` is one `CMSG_LOOT_ROLL` and closes our frame.
 fn drain_loot_rolls(
-    script: Option<NonSendMut<UiScript>>,
+    mut hosted_vm: crate::script_calls::HostedVm,
     mut rolls: ResMut<LootRolls>,
     commands: Res<NetCommands>,
 ) {
-    let Some(mut script) = script else {
-        return;
-    };
-    // The VM signalled each vote's `CANCEL_LOOT_ROLL`, and a bind-on-pickup Need or Greed's
-    // `CONFIRM_LOOT_ROLL`, inside the verb (`0x61bf2a`, `0x61be8b`).
-    for (roll_id, roll_type) in script.take_loot_roll_votes() {
-        match rolls.vote(roll_id) {
-            Some((looted_target, item_slot)) => {
-                debug!("ui_loot_roll: vote {roll_type} on roll {roll_id}");
-                let _ = commands.0.send(ClientCommand::LootRoll {
-                    looted_target,
-                    item_slot,
-                    roll_type,
-                });
+    hosted_vm.run(|script| {
+        let Some(script) = script else {
+            return;
+        };
+        // The VM signalled each vote's `CANCEL_LOOT_ROLL`, and a bind-on-pickup Need or Greed's
+        // `CONFIRM_LOOT_ROLL`, inside the verb (`0x61bf2a`, `0x61be8b`).
+        for (roll_id, roll_type) in script.take_loot_roll_votes() {
+            match rolls.vote(roll_id) {
+                Some((looted_target, item_slot)) => {
+                    debug!("ui_loot_roll: vote {roll_type} on roll {roll_id}");
+                    let _ = commands.0.send(ClientCommand::LootRoll {
+                        looted_target,
+                        item_slot,
+                        roll_type,
+                    });
+                }
+                None => debug!("ui_loot_roll: RollOnLoot({roll_id}) — no such roll, ignored"),
             }
-            None => debug!("ui_loot_roll: RollOnLoot({roll_id}) — no such roll, ignored"),
         }
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use benilla_ui::script::UiScript;
 
     fn start(target: u64, slot: u32, item_id: u32) -> LootStartRoll {
         LootStartRoll {
@@ -1053,6 +1072,38 @@ mod tests {
             .unwrap();
         app.insert_non_send_resource(script);
         (app, rx)
+    }
+
+    /// The start packet looks its item up with the callback `0x61b460` (`0x61b40e`); the frames
+    /// its roll waits through read, as `GetLootRollItemInfo` does (`0x4c30d2`). A refused item is
+    /// asked by no frame after it, only by the next start.
+    #[test]
+    fn a_refused_roll_item_is_asked_by_the_next_start_never_by_a_frame() {
+        let (mut app, rx) = hold_app();
+        let begin = |app: &mut App, slot: u32| {
+            app.world_mut()
+                .resource_mut::<LootRolls>()
+                .start(start(0x42, slot, ROLLED));
+            app.update();
+        };
+        begin(&mut app, 0);
+        assert_eq!(crate::query_cache::queries(&rx).len(), 1);
+        app.world_mut()
+            .resource_mut::<Items>()
+            .insert_template(ROLLED, None);
+        for _ in 0..600 {
+            app.update();
+        }
+        assert!(
+            crate::query_cache::queries(&rx).is_empty(),
+            "no frame asks a refusal"
+        );
+        begin(&mut app, 1);
+        assert_eq!(
+            crate::query_cache::queries(&rx).len(),
+            1,
+            "the next start asks again"
+        );
     }
 
     /// `rollID:rollTime:name` for each `START_LOOT_ROLL` seen so far, in order.

@@ -12,7 +12,6 @@ use benilla_protocol::messages::PetSpells;
 use crate::net::{GuidIndex, ObjectStore};
 use crate::spell::Cooldowns;
 use crate::ui_action::CooldownEvents;
-use crate::ui_script::UiInput;
 use crate::ui_unit::UnitFeed;
 
 mod bar;
@@ -22,9 +21,11 @@ mod menu;
 mod net;
 mod unit;
 mod usable;
+// The predicate `0x4bcf70` over what the caller already holds, for the action bar's pet legs.
+pub(crate) use usable::actions_usable as pet_actions_usable;
 
 use bar::{feed_pet_bar, fire_pet_cooldown_events};
-use drain::drain_pet_actions;
+pub(crate) use drain::drain_pet_actions;
 // A pet bar press, applied in call order by `crate::script_calls`.
 pub(crate) use drain::pet_stop_on_old_target_clear;
 pub(crate) use drain::PetPress;
@@ -116,10 +117,8 @@ impl Plugin for UiPetPlugin {
                 feed_pet_menu.in_set(UnitFeed),
                 // After this frame's presses, as the one drain before it ran them ahead of the
                 // toggles, stops and writes.
-                drain_pet_actions
-                    .after(UiInput)
-                    .after(crate::script_calls::apply_script_calls),
-                drain_pet_menu.after(UiInput),
+                drain_pet_actions.in_set(crate::ui_script::UiDrain),
+                drain_pet_menu.in_set(crate::ui_script::UiDrain),
             ),
         );
     }

@@ -14,6 +14,7 @@ use std::collections::HashMap;
 
 use mlua::{Lua, Value};
 
+use super::binding_abi;
 use super::char_stats::InventorySlots;
 use super::Model;
 
@@ -21,8 +22,8 @@ use super::Model;
 /// (`0x48ba00`, from the `.rdata` at `0x804498`, `0x804490`, `0x80448c`, `0x8044a4`).
 pub const INTERACT_DIST_SQ: [f64; 4] = [100.0, 123.45678, 100.0, 900.0];
 
-/// `CanInspect`'s threshold squared (`0xb4d918`, the `.rdata` 10.0 at `0x804498` squared by
-/// `0x48a1b0`); vmangos checks the same 10 yards (`INSPECT_DISTANCE`, `ObjectDefines.h:26`).
+/// `CanInspect`'s threshold squared (`0xb4d918`, the `.rdata` 10.0 at `0x804498` squared by the
+/// initialiser `0x48cc80`); vmangos checks the same 10 yards (`INSPECT_DISTANCE`, `ObjectDefines.h:26`).
 pub const CAN_INSPECT_DIST_SQ: f64 = 100.0;
 
 /// One unit this frame, as the two range verbs read it. An entry exists only for a live unit
@@ -33,9 +34,10 @@ pub const CAN_INSPECT_DIST_SQ: f64 = 100.0;
 pub struct UnitReach {
     /// Squared distance from the player.
     pub dist_sq: f64,
-    /// A player, and not a valid attack target: vmangos's inspect refusals besides distance
-    /// (`MiscHandler.cpp:945-956`). Only `CanInspect` reads it: `CheckInteractDistance` is a pure
-    /// distance test, so a creature or an enemy player still answers it.
+    /// `0x4944a0`'s legs besides distance: a player unit that is the active player or one it can
+    /// cooperate with (`CanCooperate 0x606ba0`, `0x4944e4`). Only `CanInspect` reads it:
+    /// `CheckInteractDistance` is a pure distance test, so a creature or an enemy player still
+    /// answers it.
     pub inspectable: bool,
 }
 
@@ -120,9 +122,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     let g = lua.globals();
 
     // CanInspect(unit) → 1/nil (`0x48a1b0`), the gate of `InspectFrame_Show`
-    // (`Blizzard_InspectUI.lua:8`): in range unless `100.0 < d²`, and `test ah,0x41; jne` counts an
-    // unordered compare as in range, so a NaN distance passes. The player and attackability legs
-    // ride in [`UnitReach::inspectable`].
+    // (`Blizzard_InspectUI.lua:8`), answered by `0x4944a0` (`0x48a2a1`): in range unless
+    // `100.0 < d²`, and `test ah,0x41; je` counts an unordered compare as in range, so a NaN
+    // distance passes. The player and cooperation legs ride in [`UnitReach::inspectable`].
     g.set(
         "CanInspect",
         lua.create_function(|lua, unit: Option<String>| {
@@ -144,20 +146,18 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // CheckInteractDistance(unit, type) → 1/nil (`0x48ba00`): in range only when
     // `d² < table[type-1]`, strictly, unlike `CanInspect` (`test ah,0x5; jp`). A token with no unit
     // answers nil (`0x48babe`), as does a `type` outside 1..=4 once truncated toward zero, the
-    // compare being unsigned (`0x48bac5`); a missing or non-number `type` raises (`0x48bb48`).
-    // The reference also raises for a missing unit (`0x48ba18`) or an unknown token (`0x515c14`),
-    // where this answers nil.
+    // compare being unsigned (`0x48bac5`). `is-number-or-string` on the unit and `is-number` on
+    // `type` gate both, else `Usage: CheckInteractDistance("unit", distIndex)` (`0x842900`,
+    // `0x48bb42`). The reference also raises for an unknown token (`0x515c14`), where this answers
+    // nil.
     g.set(
         "CheckInteractDistance",
-        lua.create_function(|lua, (unit, kind): (Option<String>, Option<f64>)| {
-            let Some(kind) = kind else {
-                return Err(mlua::Error::RuntimeError(
-                    "Usage: CheckInteractDistance(\"unit\", distIndex)".into(),
-                ));
-            };
-            let thr = usize::try_from(kind.trunc() as i64)
-                .ok()
-                .and_then(|k| k.checked_sub(1))
+        lua.create_function(|lua, (unit, kind): (Value, Value)| {
+            const USAGE: &str = r#"Usage: CheckInteractDistance("unit", distIndex)"#;
+            let unit = Some(binding_abi::string_arg(lua, unit, USAGE)?);
+            let kind = binding_abi::index_arg(lua, kind, USAGE)?;
+            let thr = kind
+                .checked_sub(1)
                 .and_then(|i| INTERACT_DIST_SQ.get(i).copied());
             let ok = match (reach(lua, &unit), thr) {
                 (Some(r), Some(thr)) => r.dist_sq < thr,

@@ -5,7 +5,7 @@
 
 use bevy::prelude::*;
 
-use crate::net::{ObjectStore, Reputations, SelfPlayer};
+use crate::net::{ObjectStore, SelfPlayer};
 
 use super::ring::Factions;
 use super::{go_is_nearest, Hovered, HoveredObject};
@@ -47,6 +47,9 @@ pub(crate) enum CursorKind {
     /// Cast(2): the spell-targeting cursor (`0x4820f0`), which pre-empts the whole object
     /// classifier while a spell awaits a target; the classifier here never sets it.
     Cast,
+    /// Custom(41): the texture FrameXML's `SetCursor` loaded by name (`0x523c40`), never set by
+    /// the classifier; its picture is [`crate::cursor::CustomCursorName`]'s path.
+    Custom,
 }
 
 impl CursorKind {
@@ -70,6 +73,8 @@ impl CursorKind {
             CursorKind::GatherHerbs => "GatherHerbs",
             CursorKind::PickLock => "PickLock",
             CursorKind::Cast => "Cast",
+            // No `Interface\Cursor` stem: the platform drivers key it by its path.
+            CursorKind::Custom => "Custom",
         }
     }
 }
@@ -122,7 +127,7 @@ pub(crate) mod npc_flags {
 }
 
 pub(super) const UNIT_FLAG_SKINNABLE: u32 = 0x0400_0000;
-const UNIT_FLAG_PACIFIED: u32 = 0x0002_0000;
+pub(crate) const UNIT_FLAG_PACIFIED: u32 = 0x0002_0000;
 
 /// The hovered unit is one the unit dispatcher `0x60bea0` forks to its attack arm for (`0x60c192`):
 /// alive or feigning, refused by `CanInteract` and passed by `CanAttack`. The sword also needs the
@@ -578,10 +583,10 @@ pub(super) fn classify_cursor(
 
 #[derive(bevy::ecs::system::SystemParam)]
 pub(super) struct CursorInputs<'w, 's> {
-    factions: Option<Res<'w, Factions>>,
-    reputations: Res<'w, Reputations>,
-    // `own_control_lost` is the attack leg's `[0xb4b3e4]` clear.
+    relations: super::RelationWorld<'w, 's>,
     player: Res<'w, crate::player::Player>,
+    // The attack leg's `[0xb4b3e4]` clear.
+    own_control: Res<'w, crate::player::OwnControlLost>,
     approach: Res<'w, crate::player::Approach>,
     #[allow(clippy::type_complexity)]
     units: Query<
@@ -614,9 +619,9 @@ pub(super) fn classify(
     hovered_object: &HoveredObject,
 ) -> (WorldCursor, AttackFork) {
     let CursorInputs {
-        factions,
-        reputations,
+        relations,
         player,
+        own_control,
         approach,
         units,
         self_q,
@@ -640,7 +645,7 @@ pub(super) fn classify(
         let store = store?;
         let (self_tf, self_store) = self_q.single().ok()?;
         let reaction = go_reaction(
-            factions.as_deref(),
+            relations.factions(),
             store.0.gameobject_faction(),
             Some(self_store),
         );
@@ -727,14 +732,11 @@ pub(super) fn classify(
             return None; // a plain corpse: Point
         }
 
+        let rel = relations.get();
+        let (me, unit) = (relations.me()?, relations.unit_of(hovered.guid?, store));
         // `CanInteract 0x6067f0`, asked at `0x482310` through `CanInteractNow 0x606880`, picks
         // the ladder; it is not a reaction threshold.
-        if super::can_interact(
-            Some(store),
-            factions.as_deref(),
-            reputations,
-            Some(self_store),
-        ) {
+        if rel.can_interact(&me, &unit) {
             let status = hovered.guid.and_then(|g| quest.status(g));
             // No matching bit clears the cursor (`je 0x4826cb`) without reaching the attack leg:
             // Point, never the sword.
@@ -743,16 +745,11 @@ pub(super) fn classify(
         }
         // `CanAttack 0x606980` (`0x482680`), the predicate TAB, the combat flash and
         // `UnitCanAttack` share; not attackable clears the cursor (`0x4826cb`): Point.
-        if !super::can_attack(
-            Some(store),
-            factions.as_deref(),
-            reputations,
-            Some(self_store),
-        ) {
+        if !rel.can_attack(&me, &unit) {
             return None;
         }
         attack_fork.set(true);
-        player_attack_legs(self_store, player.own_control_lost)
+        player_attack_legs(self_store, own_control.0)
             .then_some((CursorKind::Attack, dist_sq > ATTACK_RANGE_SQ))
     };
     // The corpse classifier `0x482740`.
