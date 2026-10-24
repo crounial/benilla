@@ -246,7 +246,7 @@ fn send(world: &mut World, blocks: impl IntoIterator<Item = SessionEvent>) {
 
 fn notices(world: &mut World) -> Vec<crate::field_watch::FieldNotice> {
     world
-        .resource_mut::<Messages<crate::field_watch::FieldNotice>>()
+        .resource_mut::<crate::field_watch::NoticeLane>()
         .drain()
         .collect()
 }
@@ -317,6 +317,146 @@ fn one_packets_blocks_for_one_object_notify_against_its_last_copy() {
     send(world, [values(ME, &[(XP, 40)]), values(ME, &[(XP, 50)])]);
     assert_eq!(notices(world), [FieldNotice::Player { id: 189 }; 2]);
     assert_eq!(edges(world), [(ME, XP, 40, 50); 2]);
+}
+
+/// One block's edges and notices take their stamps in the notify pass's one ascending walk: the
+/// health edge, the bridge's `UNIT_HEALTH` on field 22, then the aura edge, whose line the aura
+/// watcher `0x604d00` writes at field 47 after the notices of the lower fields and ahead of the
+/// bridge's `UNIT_AURA` there, the type watchers running first.
+#[test]
+fn a_blocks_edges_and_notices_are_stamped_in_field_order() {
+    use benilla_protocol::field::{FIELD_UNIT_AURA, FIELD_UNIT_HEALTH};
+    let mut app = client();
+    let world = app.world_mut();
+    world.resource_mut::<SelfGuid>().0 = Some(ME);
+    send(world, [unit(MOB, &[(FIELD_UNIT_HEALTH, 100)])]);
+    notices(world);
+    edges(world);
+
+    send(
+        world,
+        [values(
+            MOB,
+            &[(FIELD_UNIT_HEALTH, 50), (FIELD_UNIT_AURA, 1243)],
+        )],
+    );
+    let mut order: Vec<(crate::lanes::Stamp, String)> = world
+        .resource_mut::<crate::field_watch::NoticeLane>()
+        .drain_stamped()
+        .map(|(at, n)| (at, format!("{n:?}")))
+        .collect();
+    order.extend(
+        world
+            .resource_mut::<Messages<FieldChanged>>()
+            .drain()
+            .map(|e| (e.at, format!("edge {}", e.index))),
+    );
+    order.sort_by_key(|(at, _)| *at);
+    let order: Vec<String> = order.into_iter().map(|(_, s)| s).collect();
+    assert_eq!(
+        order,
+        [
+            "edge 22".to_string(),
+            format!(
+                "{:?}",
+                crate::field_watch::FieldNotice::Unit {
+                    guid: MOB,
+                    id: crate::field_watch::id::UNIT_HEALTH
+                }
+            ),
+            "edge 47".to_string(),
+            format!(
+                "{:?}",
+                crate::field_watch::FieldNotice::Unit {
+                    guid: MOB,
+                    id: crate::field_watch::id::UNIT_AURA
+                }
+            ),
+        ]
+    );
+}
+
+/// The active player's coinage watcher `OnMoneyChanged` (`0x5ddf30`) trims an own trade offer above
+/// the purse to the purse inside the packet that moved it (`0x5ddfab`, `0x5ddfda` →
+/// `TradeSubtractMoney 0x5d45f0`), with no system run after the handler; a rise trims nothing.
+#[test]
+fn the_coinage_watcher_trims_the_trade_offer_inside_its_packet() {
+    use benilla_protocol::field::FIELD_PLAYER_FIELD_COINAGE as COINAGE;
+    let mut app = client();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    app.insert_resource(NetCommands(tx));
+    let world = app.world_mut();
+    world.resource_mut::<SelfGuid>().0 = Some(ME);
+    send(world, [player(ME, &[(COINAGE, 500)])]);
+    world
+        .resource_mut::<crate::ui_trade::TradeSession>()
+        .set_own_gold(400);
+    let gold = |world: &World| {
+        world
+            .resource::<crate::ui_trade::TradeSession>()
+            .own_offer_for_test()
+            .0
+    };
+    let sent = |rx: &crossbeam_channel::Receiver<crate::net::ClientCommand>| -> Vec<String> {
+        rx.try_iter()
+            .filter(|c| matches!(c, crate::net::ClientCommand::SetTradeGold { .. }))
+            .map(|c| format!("{c:?}"))
+            .collect()
+    };
+    sent(&rx);
+
+    send(world, [values(ME, &[(COINAGE, 600)])]);
+    assert_eq!(gold(world), 400, "a rise leaves the offer");
+    assert!(sent(&rx).is_empty());
+
+    send(world, [values(ME, &[(COINAGE, 300)])]);
+    assert_eq!(gold(world), 300, "the offer is the purse");
+    assert_eq!(
+        sent(&rx),
+        [format!(
+            "{:?}",
+            crate::net::ClientCommand::SetTradeGold { copper: 300 }
+        )]
+    );
+}
+
+/// An item record's answer runs the callbacks of the auction pages waiting on it inside its
+/// handler (`0x4cc9bf` registered, `0x4cca10` at the answer): a page that now waits on nothing
+/// has its tail stamped there.
+#[test]
+fn an_item_answer_runs_a_waiting_auction_pages_tail_in_its_handler() {
+    let mut app = client();
+    let world = app.world_mut();
+    let row = benilla_protocol::messages::AuctionListEntry {
+        auction_id: 1,
+        item_entry: 77,
+        perm_enchant: 0,
+        random_property_id: 0,
+        suffix_factor: 0,
+        count: 1,
+        spell_charges: 0,
+        owner_guid: 0x55,
+        start_bid: 100,
+        min_increment: 0,
+        buyout: 0,
+        time_left_ms: 3_600_000,
+        bidder_guid: 0,
+        current_bid: 0,
+    };
+    world
+        .resource_mut::<crate::ui_auction::AuctionOpen>()
+        .set_list(benilla_ui::script::LIST, vec![row], 1);
+    super::super::handlers::dispatch(
+        world,
+        vec![SessionEvent::ItemTemplate {
+            entry: 77,
+            info: Some(Box::new(crate::items::test_template("Cloth"))),
+        }],
+    );
+    assert_eq!(
+        world.resource::<crate::ui_auction::HouseLane>().tails(),
+        [benilla_ui::script::LIST]
+    );
 }
 
 /// A create for a held object writes every field, clearing those it leaves out (`0x466582`
@@ -634,7 +774,8 @@ fn a_first_pass_guids_values_block_applies_behind_the_header_byte() {
 }
 
 /// A first create runs no watch (`0x465d80`), so the active player's flag tutorials wait for a
-/// change after it: a cross-map port creates the player afresh (`0x5dec7b`).
+/// change after it: a cross-map port creates the player afresh (`0x5dec7b`). The ghost tutorial's
+/// arrival leg is the arrival's own (`0x5deb2a`, `crate::tutorial`), no notice.
 #[test]
 fn a_first_create_raises_no_flag_tutorial() {
     use crate::field_watch::FieldNotice;
@@ -922,4 +1063,65 @@ fn a_state_change_to_a_motion_the_model_lacks_holds_through_the_destroy() {
         Some(0x55),
         "the object that left"
     );
+}
+
+/// `OnCharmOrSummonChanged` (`0x5e2660`), the player type watcher on the unit section's first 16
+/// bytes, `CHARM` then `SUMMON` (`0x5e257a`): for the active player or a party or raid member
+/// (`0x5e266b`, `0x4918e0`), an old guid the object manager does not hold that is no longer the
+/// field's value has its selection torn down (`0x5e2709` → `0x5e2719`). A player outside the group
+/// raises nothing, nor an old pet still held (`0x5e2702`).
+#[test]
+fn a_groupmates_pet_leaving_its_field_tears_down_that_pets_selection() {
+    use benilla_protocol::messages::{member_status, GroupMemberEntry};
+    const MATE: u64 = 0x51;
+    const STRANGER: u64 = 0x52;
+    const PET: u64 = 0xF140_0000_0000_0077;
+    const NEAR_PET: u64 = 0xF140_0000_0000_0078;
+    let guid = |g: u64, at: u16| [(at, g as u32), (at + 1, (g >> 32) as u32)];
+    let mut app = client();
+    let world = app.world_mut();
+    world.resource_mut::<SelfGuid>().0 = Some(ME);
+    world
+        .resource_mut::<crate::ui_party::GroupState>()
+        .apply_list(
+            0,
+            0,
+            vec![GroupMemberEntry {
+                name: "Brisca".into(),
+                guid: MATE,
+                status: member_status::ONLINE,
+                flags: 0,
+            }],
+            ME,
+            None,
+            Some(ME),
+        );
+    let torn = |world: &mut World| -> Vec<u64> {
+        world
+            .resource_mut::<Messages<crate::target::DeselectGuid>>()
+            .drain()
+            .map(|d| d.0)
+            .collect()
+    };
+    send(
+        world,
+        [
+            player(ME, &[]),
+            player(MATE, &guid(PET, 8)),
+            player(STRANGER, &guid(PET, 8)),
+            // `OBJECT_FIELD_TYPE`: a unit, which the old pet's lookup asks for (`0x5e26f7`).
+            unit(NEAR_PET, &[(2, 0x9)]),
+        ],
+    );
+    torn(world);
+
+    send(world, [values(MATE, &guid(0, 8))]);
+    assert_eq!(torn(world), [PET], "a groupmate's summon");
+    send(world, [values(STRANGER, &guid(0, 8))]);
+    assert!(torn(world).is_empty(), "a player outside the group");
+    send(world, [values(ME, &guid(PET, 6))]);
+    send(world, [values(ME, &guid(NEAR_PET, 6))]);
+    assert_eq!(torn(world), [PET], "our own charm, moved off");
+    send(world, [values(ME, &guid(0, 6))]);
+    assert!(torn(world).is_empty(), "an old pet still held");
 }

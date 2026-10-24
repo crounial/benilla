@@ -5,9 +5,9 @@ does that upstream does not. It is the current set, read by people and by agents
 before they change behaviour. Git holds the history. A modification adds, edits, or
 removes its row in the same change.
 
-The pin is `upstream/main` at `4d6f9ecc` (The target-of-target rows only write their
-globals, as 1.12's options do). When this tree takes new upstream commits, update the
-pin. Leave out any commit that is already on `upstream/main`.
+The pin is `upstream/main` at `32b4d437` (Spell text, cast gates, ranges and missiles
+follow 1.12.1). When this tree takes new upstream commits, update the pin. Leave out
+any commit that is already on `upstream/main`.
 
 A row states what 1.12.1 does, what upstream does when that differs, what this fork
 does, and the file that holds the departure. Name a companion that lives outside

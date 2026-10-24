@@ -54,7 +54,16 @@ pub(crate) struct ProbeClamPlugin;
 impl Plugin for ProbeClamPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ClamProbe>()
-            .add_systems(Update, clam_probe);
+            .add_systems(Update, (hold_auto_loot_off, clam_probe).chain());
+    }
+}
+
+/// The window must survive to be looked at: with auto-loot on, the single row is taken at the open
+/// edge and the last-row auto-release shuts it again immediately. Its own system, as the VM's call
+/// host reads the config the probe writes.
+fn hold_auto_loot_off(mut cfg: ResMut<LootConfig>) {
+    if cfg.auto_loot {
+        cfg.auto_loot = false;
     }
 }
 
@@ -143,7 +152,20 @@ fn slot_grey(script: &UiScript, slot: u32) -> bool {
 
 /// Whether the live `LootFrame` is shown, which needs `LOOT_OPENED` to have fired; falls back to
 /// the app-side session when the frame cannot be read.
-fn window_open(script: &UiScript, loot: &LootState) -> bool {
+/// The loot window's source as the step reads it, taken outside the VM: the loot verbs write the
+/// state in the host, which the step's Lua runs with.
+struct LootView(Option<u64>);
+
+impl LootView {
+    fn source(&self) -> Option<u64> {
+        self.0
+    }
+}
+
+/// The loot latch's guid ([`LootLatch`]), taken as [`LootView`] is.
+struct LatchView(Option<u64>);
+
+fn window_open(script: &UiScript, loot: &LootView) -> bool {
     script
         .eval::<bool>("return LootFrame:IsShown() and 1 or nil")
         .unwrap_or_else(|_| loot.source().is_some())
@@ -182,11 +204,15 @@ fn clam_probe(
     self_store: Query<&ObjectStore, With<SelfPlayer>>,
     objects: Objects,
     items: Res<Items>,
-    mut cfg: ResMut<LootConfig>,
     net: Res<NetCommands>,
     mut exit: MessageWriter<AppExit>,
 ) {
-    vm.turn(|script, (loot, latch)| {
+    // The step's Lua runs with the host lent, so the calls it makes apply inside their verbs.
+    let (loot, latch) = {
+        let (loot, latch) = vm.own();
+        (LootView(loot.source()), LatchView(latch.0))
+    };
+    vm.run(|script| {
         let Ok(store) = self_store.single() else {
             return; // not in-world yet
         };
@@ -198,9 +224,6 @@ fn clam_probe(
 
         match probe.phase {
             Phase::Wait => {
-                // The window must survive to be looked at: with auto-loot on, the single row is
-                // taken at the open edge and the last-row auto-release shuts it again immediately.
-                cfg.auto_loot = false;
                 info!(
                     "PROBE_CLAM: stocking one openable item (entry {entry}) — auto-loot forced off"
                 );

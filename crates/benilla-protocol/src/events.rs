@@ -438,6 +438,8 @@ pub enum SessionEvent {
     ForcedReactions { reactions: Vec<(u32, u32)> },
     /// `SMSG_SET_FACTION_VISIBLE`: sets the slot's visible flag, which decides if it is listed.
     ReputationVisible { list_id: u32 },
+    /// `SMSG_SET_FACTION_ATWAR`: the slot's at-war bit becomes bit `0x02` of `flags`.
+    ReputationAtWar { list_id: u32, flags: u8 },
     /// `SMSG_NAME_QUERY_RESPONSE`: names are never descriptor fields in 1.12, only query answers.
     /// An unknown guid answers with an empty `name`.
     PlayerName {
@@ -656,6 +658,10 @@ pub enum SessionEvent {
         target: Option<u64>,
         /// The GameObject an open-lock cast targets (`TARGET_FLAG_GAMEOBJECT`), a chest or door.
         go_target: Option<u64>,
+        /// The target block's mask (`SpellCastTargets::mask`), which the missile launcher gates on.
+        target_mask: u16,
+        /// The `TARGET_FLAG_SOURCE_LOCATION` point, raw WoW.
+        source: Option<[f32; 3]>,
         /// The ground point (`TARGET_FLAG_DEST_LOCATION`, raw WoW); the lasting effect is a
         /// DynamicObject.
         dest: Option<[f32; 3]>,
@@ -1121,6 +1127,9 @@ pub enum SessionEvent {
         nearest_node: u32,
         known_mask: TaxiMask,
     },
+    /// `SMSG_SHOWTAXINODES` in mode 0, which names no flight master: the known nodes for the
+    /// console, and no map (`0x5ecf7f`).
+    TaxiNodesListed { known_mask: TaxiMask },
     /// Whether the flight master's nearest node is known (`SMSG_TAXINODE_STATUS`); also sent with
     /// [`Self::NewTaxiPath`] on a first visit (vmangos `SendLearnNewTaxiNode`).
     TaxiNodeStatus { guid: u64, known: bool },

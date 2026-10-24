@@ -964,7 +964,7 @@ fn setup_entities(
     match benilla_formats::load_random_property_catalog(&mut chain) {
         Ok(props) => {
             info!("random-property catalog: {} suffix rows", props.len());
-            commands.insert_resource(crate::items::RandomProperties(props));
+            commands.insert_resource(crate::items::RandomProperties::new(props));
         }
         Err(e) => {
             warn!("random properties unavailable: no item name suffix, no suffix line: {e:#}")
@@ -984,11 +984,15 @@ fn setup_entities(
     }
     match benilla_formats::load_stationery_catalog(&mut chain) {
         Ok(catalog) => commands.insert_resource(crate::ui_mail::Stationery(catalog)),
-        Err(e) => warn!("stationery catalog unavailable, mail uses the default backdrop: {e:#}"),
+        Err(e) => warn!("stationery catalog unavailable, mail has no paper or texture: {e:#}"),
     }
     match benilla_formats::load_packages(&mut chain) {
         Ok(rows) => commands.insert_resource(crate::ui_mail::Packages(rows)),
         Err(e) => warn!("mail packages unavailable, GetNumPackages answers 0: {e:#}"),
+    }
+    match benilla_formats::load_mail_templates(&mut chain) {
+        Ok(rows) => commands.insert_resource(crate::ui_mail::MailTemplates(rows)),
+        Err(e) => warn!("mail templates unavailable, a template letter has no body: {e:#}"),
     }
     match benilla_formats::load_page_text_material_catalog(&mut chain) {
         Ok(catalog) => commands.insert_resource(crate::ui_item_text::PageMaterials(catalog)),

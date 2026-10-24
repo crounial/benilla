@@ -118,6 +118,9 @@ pub(crate) struct Row {
     /// registration keeps it (`0x63dc6c`); else the first value the CVar's own console command
     /// stored (`0x63de23`); else none, and the default stands in.
     pub(crate) reset: Option<String>,
+    /// The engine's value shown over the player's, `(shown, held)` ([`Cvars::show`]): the save
+    /// writes `held` while `value` is still `shown`.
+    overlay: Option<(String, String)>,
 }
 
 /// What a write did.
@@ -212,6 +215,7 @@ impl Cvars {
                 latched: r.latched,
                 check: r.check,
                 reset: None,
+                overlay: None,
             });
         }
         cvars
@@ -556,6 +560,7 @@ impl Cvars {
             check: None,
             // The saved value is the reset text of the record its line made.
             reset: saved,
+            overlay: None,
         });
     }
 
@@ -721,7 +726,12 @@ impl Cvars {
                 .keys()
                 .find(|k| k.eq_ignore_ascii_case(&row.name))
                 .cloned();
-            let text = row.pending.as_ref().unwrap_or(&row.value);
+            let held = row
+                .overlay
+                .as_ref()
+                .filter(|(shown, _)| *shown == row.value)
+                .map(|(_, held)| held);
+            let text = row.pending.as_ref().or(held).unwrap_or(&row.value);
             // `SaveConfig` skips a value equal to its default case-blind (`0x63da4a`).
             if same_text(text, &row.default) {
                 if let Some(k) = existing {
@@ -732,6 +742,48 @@ impl Cvars {
             }
         }
         out
+    }
+
+    /// The engine's value [`Self::show`] put over a row, while the row still answers it.
+    pub(crate) fn shown(&self, name: &str) -> Option<&str> {
+        let row = self.row(name)?;
+        row.overlay
+            .as_ref()
+            .filter(|(shown, _)| *shown == row.value)
+            .map(|(shown, _)| shown.as_str())
+    }
+
+    /// Show the engine's own value for a row over the player's, or end it with `None`: what the
+    /// row answers (`GetCVar`, the console, a new VM's mirror) is the shown value, the save writes
+    /// the player's, and nothing fires, as the engine already applied it. A write that moves the
+    /// row off the shown value is the player's own and ends the overlay; the next show holds it.
+    pub(crate) fn show(&mut self, name: &str, shown: Option<&str>) {
+        let Some(i) = self.slot(name) else {
+            warn!("cvar {name}: not registered — shown value ignored");
+            return;
+        };
+        let row = &mut self.rows[i];
+        // An overlay a write has moved the row off holds nothing any more.
+        if row
+            .overlay
+            .as_ref()
+            .is_some_and(|(was, _)| *was != row.value)
+        {
+            row.overlay = None;
+        }
+        let next = match (shown, row.overlay.take()) {
+            (Some(shown), held) => {
+                let held = held.map_or_else(|| row.value.clone(), |(_, held)| held);
+                row.overlay = Some((shown.to_string(), held));
+                shown.to_string()
+            }
+            (None, Some((_, held))) => held,
+            (None, None) => return,
+        };
+        if row.value != next {
+            row.value = next;
+            self.outbox.push((row.name.clone(), row.value.clone()));
+        }
     }
 
     /// The account name earlier builds kept in a file of its own
@@ -1075,8 +1127,8 @@ pub(crate) fn sync_cvars(
     })
 }
 
-/// Fold the dying VM's last writes into the registry. Called from
-/// [`crate::ui_script::end_ui_session`] after the shutdown events (a `PLAYER_LOGOUT` handler may
+/// Fold the dying VM's last writes into the registry. Called from the shutdown
+/// ([`crate::ui_script::SessionEnd::Shutdown`]) after its events (a `PLAYER_LOGOUT` handler may
 /// `SetCVar`, and the reference keeps that write) and before the VM is replaced, so a final-frame
 /// write is not lost to the next VM's seed. The observers fire here.
 pub(crate) fn fold_dying_vm_cvars(world: &mut World) {
@@ -1430,6 +1482,10 @@ mod tests {
         assert_eq!(d["mousespeed"], LookConfig::default().sensitivity);
         assert_eq!(d["cameraDistanceMax"], ZoomLimit::default().distance_max());
         assert_eq!(d["cameraDistanceMaxFactor"], ZoomLimit::default().factor());
+        assert_eq!(
+            d["cameraDistanceMoveSpeed"],
+            ZoomLimit::default().move_speed
+        );
         let follow = FollowConfig::default();
         assert_eq!(
             d["cameraSmoothStyle"],
@@ -1585,6 +1641,11 @@ mod tests {
         let mut app = cvar_app();
         apply(&mut app, "MusicVolume", "0.7");
         assert_eq!(res::<SoundConfig>(&app).music, 0.7);
+        // `widescreen`'s integer, as `0x48bcac` and `0x4901e0` read it.
+        apply(&mut app, "widescreen", "0");
+        assert!(!res::<crate::video::Widescreen>(&app).0);
+        apply(&mut app, "widescreen", "2");
+        assert!(res::<crate::video::Widescreen>(&app).0);
         // A string row reaches its knob; a value that is not an address leaves the knob alone.
         apply(&mut app, "realmList", "logon.example.org:3724");
         assert_eq!(
@@ -1727,6 +1788,14 @@ mod tests {
             );
             assert_eq!(res::<FollowConfig>(&app).yaw_speed, 30.0, "{text}");
         }
+        // The custom-view gate's switch (`0x50fc33`).
+        apply(&mut app, "cameraCustomViewSmoothing", "1");
+        assert!(res::<FollowConfig>(&app).custom_view_smoothing);
+        apply(&mut app, "cameraCustomViewSmoothing", "0");
+        assert!(!res::<FollowConfig>(&app).custom_view_smoothing);
+        // The distance axis's speed reaches the zoom (`0x5113d9`).
+        apply(&mut app, "cameraDistanceMoveSpeed", "20");
+        assert_eq!(res::<ZoomLimit>(&app).move_speed, 20.0);
         // The max orbit lands as yards on the knob: `cameraDistanceMax` x the factor, held to
         // [0, 50]; the factor is not held to its slider's 1 to 2.
         apply(&mut app, "cameraDistanceMaxFactor", "1");
@@ -2337,8 +2406,7 @@ mod tests {
         );
     }
 
-    /// A reference CVar nothing here reads (pfUI's afkcam sets `cameraCustomViewSmoothing`,
-    /// `0x50bad0`) is found by Lua's lookup, so `SetCVar` neither raises nor warns; it persists as
+    /// A reference CVar nothing here reads (`cameraDive`, `0x50be03`) is found by Lua's lookup, so `SetCVar` neither raises nor warns; it persists as
     /// a diff like any row, and its flag-bit1 neighbour stays latched.
     #[test]
     fn a_reference_cvar_nothing_reads_is_settable_and_persists_as_a_diff() {
@@ -2346,19 +2414,19 @@ mod tests {
         let mut script = UiScript::new().expect("VM");
         script.seed_cvars(cvars.vm_seed());
         script
-            .run(r#"SetCVar("cameraCustomViewSmoothing", "1") SetCVar("SoundOutputSystem", "1")"#)
+            .run(r#"SetCVar("cameraDive", "0") SetCVar("SoundOutputSystem", "1")"#)
             .expect("both names are the reference's registered ones");
         assert_eq!(
             script
-                .eval::<String>(r#"return GetCVarDefault("cameraCustomViewSmoothing")"#)
+                .eval::<String>(r#"return GetCVarDefault("cameraDive")"#)
                 .unwrap(),
-            "0"
+            "1"
         );
         assert_eq!(
             script
-                .eval::<String>(r#"return GetCVar("cameraCustomViewSmoothing")"#)
+                .eval::<String>(r#"return GetCVar("cameraDive")"#)
                 .unwrap(),
-            "1"
+            "0"
         );
         assert_eq!(
             script
@@ -2372,10 +2440,7 @@ mod tests {
             cvars.set_from_vm(&name, &value);
         }
         let out = cvars.compose();
-        assert_eq!(
-            out.get("cameraCustomViewSmoothing").map(String::as_str),
-            Some("1")
-        );
+        assert_eq!(out.get("cameraDive").map(String::as_str), Some("0"));
         assert_eq!(
             cvars.get("SoundOutputSystem"),
             Some("-1"),
@@ -2386,8 +2451,8 @@ mod tests {
             Some("1"),
             "but it is saved (`0x63da27`)"
         );
-        cvars.set("cameraCustomViewSmoothing", "0");
-        assert!(!cvars.compose().contains_key("cameraCustomViewSmoothing"));
+        cvars.set("cameraDive", "1");
+        assert!(!cvars.compose().contains_key("cameraDive"));
         // The camera block's range check rides along (`0x50c000`).
         let rate = cvars.set("cameraFoVSmoothSpeed", "9000");
         assert_eq!(rate, SetOutcome::Vetoed);
@@ -2625,6 +2690,7 @@ mod tests {
             .init_resource::<benilla_world::weather::WeatherState>()
             .init_resource::<benilla_world::particles::ParticleTuning>()
             .init_resource::<crate::video::SpellEffectLevel>()
+            .init_resource::<crate::video::Widescreen>()
             .init_resource::<crate::ui_gamma::DisplayGamma>()
             .init_resource::<ClickConfig>()
             .init_resource::<crate::target::AssistAttack>()
@@ -2746,6 +2812,65 @@ mod tests {
             world.trigger(event);
         }
         outcome
+    }
+
+    /// An engine value shown over a row (`gxResolution` in fullscreen, the screen's own size) is
+    /// what `GetCVar`, the console and a new VM read, fires nothing, and leaves the player's value
+    /// for the save; a player write replaces the held value, and ending the overlay brings the
+    /// held value back.
+    #[test]
+    fn a_shown_value_answers_and_the_held_one_saves() {
+        let mut cvars = registry(&[("gxResolution", "1280x720")]);
+        cvars.take_events();
+        cvars.show("gxResolution", Some("2880x1800"));
+        assert_eq!(cvars.get("gxResolution"), Some("2880x1800"));
+        assert!(!cvars.has_events(), "the engine's value fires no callback");
+        assert_eq!(
+            cvars.compose().get("gxResolution").map(String::as_str),
+            Some("1280x720")
+        );
+        let mut script = UiScript::new().unwrap();
+        cvars.seed_vm(&mut script);
+        assert_eq!(script.cvar("gxResolution").as_deref(), Some("2880x1800"));
+        assert_eq!(cvars.set("gxResolution", "1024x768"), SetOutcome::Staged);
+        assert_eq!(cvars.commit_latched(), 1);
+        assert_eq!(cvars.get("gxResolution"), Some("1024x768"));
+        cvars.show("gxResolution", Some("2880x1800"));
+        assert_eq!(
+            cvars.compose().get("gxResolution").map(String::as_str),
+            Some("1024x768"),
+            "the player's write is what saves"
+        );
+        cvars.show("gxResolution", None);
+        assert_eq!(cvars.get("gxResolution"), Some("1024x768"));
+        cvars.show("gxResolution", None);
+        assert_eq!(cvars.get("gxResolution"), Some("1024x768"));
+    }
+
+    /// `ffx`, `ffxGlow`, `ffxDeath` and `ffxRectangle` share the change callback `0x6cde30`: the
+    /// value's `atoi` (`0x41449c`), "enabled" (`0x853764`) when nonzero, else "disabled"
+    /// (`0x853758`), and the write taken (`mov al,1`), on the console write, `SetCVar` and the
+    /// host's own writes alike.
+    #[test]
+    fn the_ffx_rows_echo_their_state() {
+        let mut cvars = registry(&[]);
+        let mut script = UiScript::new().unwrap();
+        cvars.seed_vm(&mut script);
+        script
+            .run(
+                r#"ConsoleExec("ffxGlow 0") SetCVar("ffxDeath", " +2") ConsoleExec("ffx abc")
+                   SetCVar("ffxRectangle", "0")"#,
+            )
+            .unwrap();
+        assert_eq!(script.cvar("ffxGlow").as_deref(), Some("0"));
+        assert_eq!(script.cvar("ffx").as_deref(), Some("abc"));
+        cvars.drain_vm(&mut script);
+        assert_eq!(cvars.get("ffxDeath"), Some(" +2"));
+        cvars.set("ffxGlow", "1");
+        assert_eq!(
+            cvars.take_console_lines(),
+            ["disabled", "enabled", "disabled", "disabled", "enabled"]
+        );
     }
 
     /// `ConsoleExec(line)` as the typed `/console` runs it: on a VM seeded from the app's registry,

@@ -1,5 +1,6 @@
 //! The spellbook bindings, over a book the app pushes (tabs and a flat slot list, already resolved
-//! to name, rank, icon and passive); `CastSpell` and `PickupSpell` queue intents the app drains.
+//! to name, rank, icon and passive); `CastSpell`, `CastSpellByName` and the stops are script calls
+//! applied inside the verb ([`super::calls`]).
 //!
 //! FrameXML passes every binding a 1-based book id (`SpellBook_GetSpellID`), and the reference's
 //! marshaller (`0x4b3ec0`) subtracts 1, as [`slot_index`] does. `BOOKTYPE_PET` selects the pet's
@@ -17,8 +18,14 @@ use super::protected::{self, Tag};
 use super::tick::verb;
 use super::{Model, ScriptCall};
 
+mod by_name;
+pub use by_name::{resolve_spell_in_books, NamedSpell};
+
 const BOOKTYPE_SPELL: &str = "spell";
 const BOOKTYPE_PET: &str = "pet";
+
+/// `Usage: CastSpellByName(name [, onSelf])`, `0x846adc`.
+const USAGE_CAST_SPELL_BY_NAME: &str = "Usage: CastSpellByName(name [, onSelf])";
 
 /// `HasPetSpells`' second return when no token is resolved: the reference's literal (`0x846a40`),
 /// pushed at `0x4b44a6` when the player object does not resolve. FrameXML concatenates it, so
@@ -161,10 +168,14 @@ impl super::UiScript {
         })
     }
 
-    /// Drain the spell ids `ToggleSpellAutocast` queued: `CMSG_PET_SPELL_AUTOCAST` (0x2F3, sent by
-    /// `0x4bccb0`) names a spell id, where the pet bar's toggle sends `CMSG_PET_SET_ACTION`.
+    /// The spell ids the `ToggleSpellAutocast` calls a harness VM kept carry:
+    /// `CMSG_PET_SPELL_AUTOCAST` (0x2F3, sent by `0x4bccb0`) names a spell id, where the pet bar's
+    /// toggle sends `CMSG_PET_SET_ACTION`.
     pub fn take_pet_spell_autocasts(&mut self) -> Vec<u32> {
-        std::mem::take(&mut self.model_mut().pet_spell_autocasts)
+        self.take_calls_where(|c| match c {
+            ScriptCall::Pet(super::PetCall::SpellAutocast(spell_id)) => Some(*spell_id),
+            _ => None,
+        })
     }
 
     /// The pushed book, for resolving a macro's spell by the rule `CastSpellByName` uses, so the
@@ -277,102 +288,6 @@ pub(super) fn book_slot<'a>(
         &model.spellbook.slots
     };
     slots.get(slot_index(id)?)
-}
-
-/// Resolve a spell by name against the player's book, for `CastSpellByName` and so `/cast`, whose
-/// grammar the client's help text gives as `/cast <name> (<subtext>)` (`MACRO_HELP_TEXT_LINE4`):
-///
-/// - `Fireball`: the highest known rank, by the subtext's leading number (unranked is 0, and a tie
-///   goes to the later slot, the order the book lists ranks in);
-/// - `Fireball(Rank 1)` or `Fireball (Rank 1)`: that subtext, case-insensitively.
-///
-/// Names match whole and case-insensitively; passives never match. An unknown spell casts nothing
-/// and prints no error, as in the reference (`SlashCmdList["CAST"]` discards the result). The
-/// reference cuts the name at `(` untrimmed (`0x4b3950`), so its spaced form keeps a trailing space
-/// and misses, and it matches name and rank alone, across the pet's book too (`0x4b3a10`).
-pub fn resolve_spell_by_name<'a>(
-    book: &'a SpellBookState,
-    query: &str,
-) -> Option<&'a SpellSlotView> {
-    best_named(&book.slots, query)
-}
-
-/// A name resolved against both books: the spell and the book it came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NamedSpell {
-    pub spell_id: u32,
-    /// The pet's book, not the player's (`0x4b3b51` writes 1, `0x4b3b3d` writes 0).
-    pub pet: bool,
-}
-
-/// [`resolve_spell_by_name`]'s match over the player's book, then over the pet's when the player's
-/// holds none: the order `0x4b3a10` searches (`0x4b3a2d`-`0x4b3aa9`, then `0x4b3aad`-`0x4b3b2a`),
-/// which a macro's bound spell reads through `0x4b3bc0`. The name rules are the player book's
-/// for both, as `CastSpellByName`'s are.
-pub fn resolve_spell_in_books(
-    player: &SpellBookState,
-    pet: &PetBookState,
-    query: &str,
-) -> Option<NamedSpell> {
-    best_named(&player.slots, query)
-        .map(|s| NamedSpell {
-            spell_id: s.spell_id,
-            pet: false,
-        })
-        .or_else(|| {
-            best_named(&pet.slots, query).map(|s| NamedSpell {
-                spell_id: s.spell_id,
-                pet: true,
-            })
-        })
-}
-
-/// The slot of `slots` that `query` names, by [`resolve_spell_by_name`]'s rules.
-fn best_named<'a>(slots: &'a [SpellSlotView], query: &str) -> Option<&'a SpellSlotView> {
-    let (name, subtext) = split_subtext(query);
-    if name.is_empty() {
-        return None;
-    }
-    slots
-        .iter()
-        .filter(|s| !s.passive && s.name.eq_ignore_ascii_case(name))
-        .filter(|s| match subtext {
-            Some(want) => s
-                .rank
-                .as_deref()
-                .is_some_and(|r| r.eq_ignore_ascii_case(want)),
-            None => true,
-        })
-        .enumerate()
-        .max_by_key(|(i, s)| (rank_number(s.rank.as_deref()), *i))
-        .map(|(_, s)| s)
-}
-
-/// `Name(Subtext)` or `Name (Subtext)` to `("Name", Some("Subtext"))`; without a closing
-/// parenthesis after the opening one, the whole string is the name.
-fn split_subtext(query: &str) -> (&str, Option<&str>) {
-    let q = query.trim();
-    let Some(open) = q.find('(') else {
-        return (q, None);
-    };
-    let Some(close) = q.rfind(')') else {
-        return (q, None);
-    };
-    if close < open {
-        return (q, None);
-    }
-    (q[..open].trim(), Some(q[open + 1..close].trim()))
-}
-
-/// The rank in a `NameSubtext` (`"Rank 8"` is 8) by the reference's parse, the first digit run;
-/// a subtext without digits, or none, reads 0.
-fn rank_number(subtext: Option<&str>) -> u32 {
-    subtext
-        .unwrap_or("")
-        .chars()
-        .skip_while(|c| !c.is_ascii_digit())
-        .take_while(|c| c.is_ascii_digit())
-        .fold(0u32, |acc, c| acc * 10 + c.to_digit(10).unwrap_or(0))
 }
 
 /// `PickupSpell(id, bookType)` (`0x4b42a0` into `0x4b3260`), the spell button's drag and
@@ -678,9 +593,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     // ToggleSpellAutocast(id, bookType), the pet book's right click (`0x4b4240` → `0x4bccb0`): on a
     // usable pet (`0x4bccce`) an autocast-allowed word (`0x4bccf5`) flips bit 30, every bar slot
-    // holding the same action takes the bit (`0x4bcd20`-`0x4bcd5a`), the app's
-    // `CMSG_PET_SPELL_AUTOCAST` is queued, and `PET_BAR_UPDATE` fires before the verb returns
-    // (`0x4bcdcb`).
+    // holding the same action takes the bit (`0x4bcd20`-`0x4bcd5a`), the host sends
+    // `CMSG_PET_SPELL_AUTOCAST` inside the call, and `PET_BAR_UPDATE` fires before the verb
+    // returns (`0x4bcdcb`).
     g.set(
         "ToggleSpellAutocast",
         lua.create_function(|lua, (id, book_type): (Value, Value)| {
@@ -689,16 +604,13 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             if !is_pet_book(&book_type) || !protected::gate(lua, Tag::CAST) {
                 return Ok(());
             }
-            super::tick::verb(lua, |model| {
+            let flipped = super::tick::verb(lua, |model| {
                 if !model.pet_bar.actions_usable {
-                    return;
+                    return None;
                 }
-                let Some(book) = slot_index(id).and_then(|i| model.pet_book.slots.get_mut(i))
-                else {
-                    return;
-                };
+                let book = slot_index(id).and_then(|i| model.pet_book.slots.get_mut(i))?;
                 if !book.autocast.is_some_and(|(allowed, _)| allowed) {
-                    return;
+                    return None;
                 }
                 let word = book.packed ^ super::pet::AUTOCAST_ON;
                 super::pet::set_book_word(book, word);
@@ -711,42 +623,53 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                         view.autocast_enabled = view.packed & super::pet::AUTOCAST_ON != 0;
                     }
                 }
-                model.pet_spell_autocasts.push(spell_id);
-                model.raise("PET_BAR_UPDATE", Vec::new());
+                Some(spell_id)
             });
+            if let Some(spell_id) = flipped {
+                super::calls::submit(
+                    lua,
+                    ScriptCall::Pet(super::PetCall::SpellAutocast(spell_id)),
+                )?;
+                super::tick::verb(lua, |model| model.raise("PET_BAR_UPDATE", Vec::new()));
+            }
             Ok(())
         })?,
     )?;
 
-    // CastSpellByName(name [, onSelf]) (`0x4b4ab0`) shares the dispatcher `0x4b3300` with
-    // `CastSpell`, so it queues the same call; `SlashCmdList["CAST"]` calls it. The target guid
-    // defaults to the selection (`0x4b4adb`), and a nonzero `GetBoolOrDefault(L, 2, 0)`
-    // (`0x4b4aea`-`0x4b4af1`) swaps it for the active player's (`0x4b4afa`).
+    // CastSpellByName(name [, onSelf]) (`0x4b4ab0`), which `SlashCmdList["CAST"]` calls: the text
+    // must be a string or a number (`lua_isstring`, `0x4b4abc`), else the usage error
+    // (`0x846adc`). The target guid defaults to the selection (`0x4b4adb`), and a nonzero
+    // `GetBoolOrDefault(L, 2, 0)` (`0x4b4aea`-`0x4b4af1`) swaps it for the active player's
+    // (`0x4b4afa`). The name resolves in both books (`0x4b3950`), and the slot goes with its book
+    // to the dispatcher `CastSpell` shares (`0x4b3300`, called at `0x4b4b24`): a pet match is the
+    // `CMSG_PET_ACTION` fork (`0x4b34ce`), which tests no passive, and a player match the cast,
+    // whose `TryCastSpell` refuses a passive silently (`0x6e4bb2`) ahead of its gate.
     g.set(
         "CastSpellByName",
-        lua.create_function(|lua, (name, on_self): (String, Option<Value>)| {
+        lua.create_function(|lua, (name, on_self): (Value, Option<Value>)| {
+            let name = lua
+                .coerce_string(name)?
+                .ok_or_else(|| mlua::Error::runtime(USAGE_CAST_SPELL_BY_NAME))?;
             let on_self = bool_or_default(on_self.as_ref(), false);
-            // `TryCastSpell`'s gate, tag 2 (`0x6e4bc1`), behind the cancels as for `CastSpell`. The
-            // name resolves in the player book alone, whose leg is the gated one.
-            let may_cast = protected::gate(lua, Tag::CAST);
-            let spell_id = resolve_spell_by_name(
-                &lua.app_data_ref::<Model>()
-                    .expect("model app_data")
-                    .spellbook,
-                &name,
-            )
-            .map(|slot| slot.spell_id);
-            if let Some(spell_id) = spell_id {
-                super::calls::submit(
-                    lua,
-                    ScriptCall::CastSpell {
-                        spell_id,
-                        on_self,
-                        may_cast,
-                    },
-                )?;
-            }
-            Ok(())
+            let found = {
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                by_name::resolve_named(&model.spellbook, &model.pet_book, &name.as_bytes())
+            };
+            let call = match found {
+                Some(found) if found.pet => ScriptCall::CastPetSpell {
+                    spell_id: found.spell_id,
+                    on_self,
+                },
+                // `TryCastSpell`'s gate, tag 2 (`0x6e4bc1`), behind the cancels as for
+                // `CastSpell`.
+                Some(found) if !found.passive => ScriptCall::CastSpell {
+                    spell_id: found.spell_id,
+                    on_self,
+                    may_cast: protected::gate(lua, Tag::CAST),
+                },
+                _ => return Ok(()),
+            };
+            super::calls::submit(lua, call)
         })?,
     )?;
 
@@ -839,6 +762,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod by_name_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1481,6 +1407,7 @@ mod tests {
     #[test]
     fn a_book_autocast_toggle_repaints_book_and_bar_in_place() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_pet_book(pet_book());
         let growl = crate::script::PetActionView {
             name: Some("Growl".into()),
@@ -1519,6 +1446,7 @@ mod tests {
     #[test]
     fn only_an_autocastable_pet_slot_queues_a_toggle() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_spellbook(book());
         s.set_pet_book(pet_book());
         s.set_pet_actions(true, true, true, Vec::new());

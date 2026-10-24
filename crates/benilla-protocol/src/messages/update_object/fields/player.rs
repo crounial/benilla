@@ -13,6 +13,11 @@ impl ObjectFields {
     pub fn item_owner(&self) -> Option<u64> {
         self.get_guid(6)
     }
+    /// `ITEM_FIELD_CONTAINED` (field 8): the bag holding the item, or its owner for an item in
+    /// one of the player's own seats.
+    pub fn item_contained(&self) -> Option<u64> {
+        self.get_guid(8)
+    }
     /// `OBJECT_FIELD_TYPE` itself, the type mask: 9 for a creature or a pet, `0x19` for a player.
     /// The display resolve asks the creature cache only for 9 (`0x60b134`).
     pub fn object_type_mask(&self) -> Option<u32> {
@@ -32,6 +37,12 @@ impl ObjectFields {
         (i < 5)
             .then(|| self.get_u32(FIELD_ITEM_SPELL_CHARGES + u16::from(i)))?
             .map(|v| v as i32)
+    }
+    /// `ITEM_FIELD_DURATION` (field 15, the client's `[item+0x114]+0x24`): a timed item's
+    /// lifetime as the object carries it, 0 for none. The countdown a tooltip shows comes from
+    /// `SMSG_ITEM_TIME_UPDATE` instead.
+    pub fn item_duration(&self) -> Option<u32> {
+        self.get_u32(15)
     }
     /// `ITEM_FIELD_FLAGS` (field 21): `0x08` wrapped, never alerts; `0x10` forces red status 4.
     pub fn item_flags(&self) -> Option<u32> {
@@ -74,6 +85,11 @@ impl ObjectFields {
             .flatten()
             .unwrap_or(0)
     }
+    /// `ITEM_FIELD_PROPERTY_SEED` (field 43, the client's `[item+0x114]+0x94`): the fourth number
+    /// of the item's link (`0x52ae88`), 0 when unset.
+    pub fn item_property_seed(&self) -> u32 {
+        self.get_u32(43).unwrap_or(0)
+    }
     /// `ITEM_FIELD_RANDOM_PROPERTIES_ID` (field 44): the `ItemRandomProperties.dbc` suffix, 0 if
     /// none; only the name uses it (`0x5d8b00`), the roll's enchants fill enchant slots 2-6.
     pub fn item_random_properties_id(&self) -> u32 {
@@ -94,6 +110,14 @@ impl ObjectFields {
     /// `CONTAINER_FIELD_SLOT_1 + 2i`: the item guid in bag slot `i`, `Some(0)` when empty.
     pub fn container_slot(&self, i: u8) -> Option<u64> {
         (i < 36).then(|| self.get_guid(FIELD_CONTAINER_SLOT_1 + 2 * u16::from(i)))?
+    }
+    /// `PLAYER_VISIBLE_ITEM_<slot>_CREATOR`: the creator guid of the item worn in equipment slot
+    /// `i`, the visible-item block's first two dwords (`0x5333cd`), 0 for none.
+    pub fn player_visible_item_creator(&self, i: u8) -> u64 {
+        (i < 19)
+            .then(|| self.get_guid(FIELD_PLAYER_VISIBLE_ITEM_1_CREATOR + 12 * u16::from(i)))
+            .flatten()
+            .unwrap_or(0)
     }
     /// `PLAYER_VISIBLE_ITEM_<slot>_0`: the public entry worn in equipment slot `i`, which other
     /// clients render from; each slot is 12 dwords, the entry after a 2-dword creator.
@@ -218,6 +242,11 @@ impl ObjectFields {
     /// validator refuses a living player with it `0x61` (`0x60982b`, `[+0xe68]+0x1028`).
     pub fn player_logging_out(&self) -> bool {
         self.get_u32(FIELD_PLAYER_FIELD_BYTES).unwrap_or(0) & 0x4 != 0
+    }
+    /// `PLAYER_FIELD_BYTES` byte 0 bit `0x1` (vmangos `PLAYER_FIELD_BYTE_CONTROLLING_PET`): the
+    /// cast validator's tame rung refuses a no-active-pets spell with it `0x17` (`0x60a011`).
+    pub fn player_controlling_pet(&self) -> bool {
+        self.get_u32(FIELD_PLAYER_FIELD_BYTES).unwrap_or(0) & 0x1 != 0
     }
     /// `PLAYER_QUEST_LOG_<slot+1>_*`: one quest-log slot, `quest_id == 0` when the server cleared
     /// it; the count-state and timer are written with the id (`Player.h:1094-1099`).
@@ -467,7 +496,9 @@ impl ObjectFields {
             .map(|b| ((b >> 24) & 0xff) as u8)
     }
     /// `PLAYER_BYTES_3` byte 2 (public): the city-protector title, a race id (`Player.h:354`);
-    /// `UnitPVPName` (`0x609370`) appends `PVP_MEDAL<n>` when nonzero. vmangos never writes it.
+    /// `UnitPVPName` (`0x609370`) appends `PVP_MEDAL<n>` when nonzero. vmangos sets it to the
+    /// player's race in `Player::SetCityTitle` and clears it in `RemoveCityTitle`
+    /// (`Player.cpp:1092-1101`).
     pub fn player_pvp_medal(&self) -> Option<u8> {
         self.get_u32(FIELD_PLAYER_BYTES_3)
             .map(|b| ((b >> 16) & 0xff) as u8)
@@ -520,6 +551,13 @@ impl ObjectFields {
     /// dishonorable kills (`HonorMgr.cpp:935`).
     pub fn player_lifetime_dishonorable_kills(&self) -> Option<u32> {
         self.get_u32(FIELD_PLAYER_FIELD_LIFETIME_DISHONORABLE_KILLS)
+    }
+    /// `PLAYER_FIELD_BYTES2` byte 1: the auras the player can see, bit `n - 1` for a spell whose
+    /// `RequiredAuraVision` is `n` (`0x5198b0`); vmangos sets bit 0 for Detect Amore
+    /// (`PLAYER_FIELD_BYTE2_DETECT_AMORE`, `Player.h:388`). 0 when the field is absent.
+    pub fn player_aura_vision(&self) -> u8 {
+        self.get_u32(FIELD_PLAYER_FIELD_BYTES2)
+            .map_or(0, |b| (b >> 8) as u8)
     }
     /// `PLAYER_FIELD_BYTES2` byte 0 (private): progress through the current rank, 0-255
     /// (`HonorMgr.cpp:905-909`); a negative rank's `-255` scale wraps in the `uint8` cast.

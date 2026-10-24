@@ -129,8 +129,13 @@ impl NameKey {
     /// 24-47 (`guid::entry`), and a `HIGHGUID_PET` guid's slot is taken as the pet number, right
     /// only for a permanent pet.
     ///
-    /// Deviation: the combat-log namer keys an unstreamed creature by guid bits 32-47
-    /// (`0x6265c4`), which on the servers in use (entry at bits 24-47) names it wrongly.
+    /// Deviation: for a guid it does not hold, the reference's combat-log namer (`0x6264e0`) asks
+    /// the creature cache under guid bits 32-47 (`0x6265c4`-`0x6265e0`) for every guid whose top
+    /// nibble is 0xf and whose bits 32-47 are nonzero, a game object's and a pet's included, and
+    /// never the pet-name cache (only a held unit reaches it, `0x6092c7`). Here an unstreamed
+    /// creature is keyed by its entry, a pet guid by its pet number in the pet-name cache and a
+    /// game object's asks nothing, because on the servers in use (entry at bits 24-47) the
+    /// reference's key names each after an unrelated creature.
     fn of(guid_val: u64, unit: Option<&ObjectFields>) -> Option<Self> {
         if guid::is_player(guid_val) {
             return Some(Self::Player(guid_val));
@@ -367,6 +372,12 @@ impl NameCache {
         self.creatures.iter().map(|(&e, r)| (e, r.name.as_str()))
     }
 
+    /// Whether the server refused the player's name, an empty name answered for the guid, and
+    /// nothing has asked for it since.
+    pub(crate) fn player_answered_unknown(&self, guid: u64) -> bool {
+        self.players.answered_unknown(guid)
+    }
+
     /// Whether the server refused `entry` and nothing has asked for it since.
     pub(crate) fn creature_answered_unknown(&self, entry: u32) -> bool {
         self.creatures.answered_unknown(entry)
@@ -526,14 +537,16 @@ pub(crate) mod net {
     use bevy::prelude::*;
 
     use super::{CreatureRecord, NameCache};
-    use crate::field_watch::{id, FieldNotice};
+    use crate::field_watch::{id, FieldNotice, NoticeLane};
     use crate::net::{GuidIndex, NetHandlerApp, ObjectStore};
 
-    /// Register the four handlers.
+    /// Register the four handlers. A player-name answer's goes ahead of every other subsystem's:
+    /// the cache files the record and its valid byte (`0x55f310`, `0x55f413`) before it runs any
+    /// callback waiting on it (`0x55f426`-`0x55f452`), and those read the record it filed.
     pub(crate) fn register(app: &mut App) {
         use SessionEventKind as K;
-        app.add_message::<FieldNotice>()
-            .net_handler(K::PlayerName, on_player_name)
+        app.init_resource::<NoticeLane>()
+            .net_handler_ahead(K::PlayerName, on_player_name)
             .net_handler(K::PetName, on_pet_name)
             .net_handler(K::CreatureName, on_creature_name)
             .net_handler(K::InvalidatePlayer, on_invalidate_player);
@@ -573,13 +586,17 @@ pub(crate) mod net {
     }
 
     /// The name callback `0x5fb840` of a unit the answer names: for a found name (`0x5fb84b`) of a
-    /// held unit (`0x5fb86a`), `UNIT_NAME_UPDATE` through `0x491a00`. The callbacks are the
-    /// lookups that missed, so an answer for a name the cache already holds runs none.
+    /// held unit (`0x5fb86a`), `UNIT_NAME_UPDATE` through `0x491a00`; and the chat's `0x49ccc0`,
+    /// which shows the lines that waited on the name. The callbacks are the lookups that missed,
+    /// so an answer for a name the cache already holds runs none.
     fn on_player_name(
         In(ev): In<SessionEvent>,
         mut names: ResMut<NameCache>,
         units: HeldUnits,
-        mut notices: MessageWriter<FieldNotice>,
+        mut notices: ResMut<NoticeLane>,
+        chat: Option<Res<crate::ui_chat::ChatLog>>,
+        // The auction lists whose getters missed a name (`0x4cf167`, `0x4cf1c8`).
+        house: Option<ResMut<crate::ui_auction::HouseLane>>,
     ) {
         if let SessionEvent::PlayerName {
             guid,
@@ -592,6 +609,14 @@ pub(crate) mod net {
             // A guid already cached has no lookup waiting, so no callback runs.
             let found = !name.is_empty() && names.players.get(guid).is_none();
             player_name(guid, name, race, class, gender, &mut names);
+            if found {
+                if let Some(chat) = &chat {
+                    chat.answer_landed(crate::ui_chat::Answer::Player(guid));
+                }
+                if let Some(mut house) = house {
+                    house.name_landed(guid);
+                }
+            }
             if found && units.holds(guid) {
                 notices.write(FieldNotice::Signal {
                     guid,
@@ -607,7 +632,7 @@ pub(crate) mod net {
         In(ev): In<SessionEvent>,
         mut names: ResMut<NameCache>,
         units: HeldUnits,
-        mut notices: MessageWriter<FieldNotice>,
+        mut notices: ResMut<NoticeLane>,
     ) {
         if let SessionEvent::PetName { pet_number, name } = ev {
             let found = !name.is_empty() && names.pets.get(pet_number).is_none();
@@ -630,7 +655,7 @@ pub(crate) mod net {
         In(ev): In<SessionEvent>,
         mut names: ResMut<NameCache>,
         units: HeldUnits,
-        mut notices: MessageWriter<FieldNotice>,
+        mut notices: ResMut<NoticeLane>,
     ) {
         if let SessionEvent::CreatureName {
             entry,
@@ -759,7 +784,7 @@ pub(crate) mod net {
             let mut app = App::new();
             app.init_resource::<NameCache>()
                 .init_resource::<GuidIndex>()
-                .add_message::<FieldNotice>();
+                .init_resource::<crate::field_watch::NoticeLane>();
             for (guid, kind, pairs) in [
                 // `OBJECT_FIELD_TYPE` (2): the unit and player type masks.
                 (WOLF_A, ObjectType::Unit, vec![(2, 0x9), (3, 299)]),
@@ -780,7 +805,7 @@ pub(crate) mod net {
 
         fn notices(app: &mut App) -> Vec<FieldNotice> {
             app.world_mut()
-                .resource_mut::<Messages<FieldNotice>>()
+                .resource_mut::<crate::field_watch::NoticeLane>()
                 .drain()
                 .collect()
         }

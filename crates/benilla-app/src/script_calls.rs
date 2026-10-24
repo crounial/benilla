@@ -18,29 +18,19 @@
 use bevy::ecs::system::{SystemParam, SystemParamItem};
 use bevy::prelude::*;
 
-use benilla_ui::script::{CallHost, CallTail, ScriptCall, UiScript};
+use benilla_ui::script::{CallHost, CallTail, PetitionCall, ScriptCall, TabardCall, UiScript};
 
-/// The player's Attack (`0x6131a0`) in the reference's order: the validator's `SelectTarget`s bind a
-/// unit to a standing targeting cursor's cast inside the validator, so that cast is sent before the
-/// swing the validated target gets.
-macro_rules! attack_in_order {
-    ($appliers:expr, $may_pick:expr) => {{
-        let target = $appliers.p7().validate_attack($may_pick);
-        $appliers.p1().bind_parked();
-        if let Some(guid) = target {
-            $appliers.p7().start_attack(guid);
-        }
-    }};
-}
-
-/// The pet bar's Attack (`0x4bd40d`) runs the same validator, so a cast it binds to a standing
-/// targeting cursor goes out ahead of the `CMSG_PET_ACTION` it validated.
-macro_rules! pet_in_order {
-    ($appliers:expr, $begin:ident($arg:expr)) => {{
-        let send = $appliers.p6().$begin($arg);
-        $appliers.p1().bind_parked();
-        if let Some(send) = send {
-            $appliers.p6().finish_press(send);
+/// `DoEmote` (`0x5ef560`) in the reference's order: a posture emote's stand change to a state but 0
+/// runs its local apply's leave (`0x5f0790`), the loot close (`0x48f200` at `0x5f07d5`) then the
+/// attack stop (`0x5ecac0` at `0x5f07e7`), ahead of the emote's `CMSG_TEXT_EMOTE`.
+macro_rules! emote_in_order {
+    ($appliers:expr, $step:expr) => {{
+        if let Some(step) = $step {
+            if step.leave {
+                $appliers.p5().p1().close_for_stand();
+                $appliers.p7().stop_for_stand();
+            }
+            $appliers.p4().p2().finish(step);
         }
     }};
 }
@@ -56,7 +46,7 @@ pub(crate) struct ScriptCallHost<'w, 's> {
             crate::target::ScriptSelect<'w, 's>,
             crate::spell::ScriptCursor<'w, 's>,
             // The cast's own state: its cancel, the view the VM reads after each call, and the
-            // reports the call made.
+            // reports the call made; the character panel's verbs; and the session's.
             ParamSet<
                 'w,
                 's,
@@ -64,44 +54,436 @@ pub(crate) struct ScriptCallHost<'w, 's> {
                     crate::spell::SelfCancel<'w>,
                     crate::spell::CastState<'w, 's>,
                     crate::ui_cast::CallReports<'w, 's>,
+                    // The character panel's tabs: talents, skills and reputation. A further tab's
+                    // applier joins this set.
+                    ParamSet<
+                        'w,
+                        's,
+                        (
+                            crate::ui_talent::TalentSteps<'w, 's>,
+                            crate::ui_char::SkillSteps<'w>,
+                            crate::ui_reputation::ReputationSteps<'w, 's>,
+                        ),
+                    >,
+                    // The action slots' states, whose usable refresh a selection change runs
+                    // inside its call; absent in a harness without the action feed's inputs.
+                    Option<crate::ui_action::ActionStates<'w, 's>>,
+                    // The session's: the logout and the reload, the tutorial banks, and the
+                    // interaction latch the NPC windows' close cores release. A further
+                    // session-wide applier joins this set.
+                    ParamSet<
+                        'w,
+                        's,
+                        (
+                            crate::ui_logout::SessionSteps<'w>,
+                            crate::tutorial::TutorialSteps<'w>,
+                            crate::ui_session::LatchSteps<'w>,
+                        ),
+                    >,
                 ),
             >,
             crate::spell::ScriptCast<'w, 's>,
-            crate::ui_action::ActionPress<'w, 's>,
-            crate::ui_items::ScriptItemUse<'w, 's>,
-            crate::ui_pet::PetPress<'w, 's>,
+            ParamSet<
+                'w,
+                's,
+                (
+                    crate::ui_action::ActionPress<'w, 's>,
+                    crate::ui_chat::ChatSender<'w, 's>,
+                    crate::ui_chat::EmoteDoer<'w, 's>,
+                    crate::ui_auction::AuctionVerbs<'w, 's>,
+                    crate::ui_social::SocialSteps<'w>,
+                    crate::ui_party::PartyCalls<'w, 's>,
+                    crate::ui_trade::TradeSteps<'w, 's>,
+                    // The guild's windows: the roster, the charter and the tabard designer. A
+                    // further guild window's applier joins this set.
+                    ParamSet<
+                        'w,
+                        's,
+                        (
+                            crate::ui_guild::GuildSteps<'w>,
+                            crate::ui_petition::PetitionSteps<'w, 's>,
+                            crate::ui_tabard::TabardSteps<'w, 's>,
+                        ),
+                    >,
+                ),
+            >,
+            // The bags', the loot window's, the mailbox's, the questgiver's, the gossip menu's and
+            // the other NPC windows'.
+            ParamSet<
+                'w,
+                's,
+                (
+                    crate::ui_items::BagSteps<'w, 's>,
+                    crate::ui_loot::LootSteps<'w, 's>,
+                    crate::ui_mail::MailVerbs<'w>,
+                    crate::ui_quest::QuestVerbs<'w, 's>,
+                    crate::ui_gossip::GossipVerbs<'w, 's>,
+                    crate::ui_trainer::TrainerSteps<'w, 's>,
+                    crate::ui_taxi::TaxiSteps<'w, 's>,
+                    crate::ui_merchant::MerchantSteps<'w, 's>,
+                ),
+            >,
+            // The pet's: the bar's presses, its other verbs and the menu's, and the stable. A
+            // further pet window's applier joins this set.
+            ParamSet<
+                'w,
+                's,
+                (
+                    crate::ui_pet::PetPress<'w, 's>,
+                    crate::ui_pet::PetSteps<'w, 's>,
+                    crate::ui_stable::StableSteps<'w, 's>,
+                ),
+            >,
             crate::ui_action::AttackPress<'w, 's>,
         ),
     >,
+    /// The channel the census counts sends on ([`benilla_ui::script::census`]).
+    #[cfg(test)]
+    census: Option<Res<'w, crate::net::NetCommands>>,
+}
+
+/// What a call's apply carries across its signal points about the selection: the guid its last
+/// signal told the listeners of, the pet's attack latch as it stood then (the selection's release
+/// can lower it, `0x493a18`), and the reports signalled so far.
+struct Signalled {
+    selected: Option<u64>,
+    latched: bool,
+    mark: crate::ui_cast::ReportMark,
+}
+
+/// What an engine writer's `SetSelection` outside any call (a world click, a death's or a
+/// despawn's deselect) leaves for its signals ([`ScriptCallHost::engine_select`]): the selection
+/// and the pet's attack latch it found, the clock as it began, so the cast reports its teardown
+/// made are its own, and what its commit owes after its signals.
+pub(crate) struct EngineSelect {
+    pub(crate) before: Option<u64>,
+    pub(crate) latched: bool,
+    pub(crate) mark: crate::lanes::Mark,
+    pub(crate) owed: crate::target::SelectDebt,
 }
 
 impl ScriptCallHost<'_, '_> {
-    /// The selected unit, as the calls applied so far left it.
-    pub(crate) fn target(&mut self) -> Option<Entity> {
-        self.appliers.p0().target()
+    /// Count the census's sends on this host's channel ([`benilla_ui::script::census`]).
+    #[cfg(test)]
+    fn census_probe(&self) {
+        if let Some(net) = self.census.as_deref() {
+            let sent = net.0.clone();
+            benilla_ui::script::census::probe(move || sent.len());
+        }
+    }
+
+    /// An engine writer's selection outside any call, signalled in place as an engine turn, as
+    /// `SetSelection` (`0x493540`) signals inside whatever runs it: the teardown's
+    /// `PET_BAR_UPDATE` (`0x4bd6b4`) before the store and the send, the change's signals before
+    /// the re-swing (`0x4938c8`), each point running its listeners there, and what they left
+    /// applied once the turn ends, with the host lent. The unit, action and pet feeds take the
+    /// change as heard.
+    pub(crate) fn engine_select(&mut self, script: &mut UiScript, select: EngineSelect) {
+        #[cfg(test)]
+        self.census_probe();
+        script.host_out(|script| {
+            let mut at = Signalled {
+                selected: select.before,
+                latched: select.latched,
+                mark: self.appliers.p2().p2().mark_at(select.mark),
+            };
+            self.settle_selection(script, &mut at, select.owed);
+            self.commit_views(script);
+        });
+        script.hosted(self, |_| ());
+    }
+
+    /// An engine writer's StartAttack (`0x5ecb70`) at `guid` outside any call, such as a spell's
+    /// deferred melee start (`0x6e8402` → `0x6131a0`): its own select (`0x5eccaa`) signals in
+    /// place, before its swing, behind the cast reports made since `mark`.
+    pub(crate) fn engine_start_attack(
+        &mut self,
+        script: &mut UiScript,
+        guid: u64,
+        mark: crate::lanes::Mark,
+    ) {
+        #[cfg(test)]
+        self.census_probe();
+        script.host_out(|script| {
+            let mut at = Signalled {
+                selected: self.appliers.p0().selected(),
+                latched: self.appliers.p6().p1().attack_latched(),
+                mark: self.appliers.p2().p2().mark_at(mark),
+            };
+            let owed = self.appliers.p0().start_attack(guid);
+            self.settle_selection(script, &mut at, owed);
+            self.commit_views(script);
+        });
+        script.hosted(self, |_| ());
+    }
+
+    /// Push the views a call left for the script's next line, and for the listeners at a signal
+    /// point inside it.
+    fn commit_views(&mut self, script: &mut UiScript) {
+        let appliers = &mut self.appliers;
+        // The cast state: `SpellStopCasting` (`0x6e6e80`) finds the cast the call sent in flight
+        // (`0x6e5026`), and `IsCurrentAction` (`0x4e53a0`) checks its slot, as stock
+        // `ActionButtonUp` reads straight after `UseAction` (`ActionButton.lua:54-55`).
+        let view = appliers.p2().p1().view();
+        script.set_cast_view(view);
+        // The targeting word: `SpellIsTargeting` (`0x6e6cd0`) reads it, and `SpellTargetUnit`
+        // binds to it.
+        appliers.p1().push_view(script);
+    }
+
+    /// A signal point inside a call (`SignalEvent`, `0x703e50`, runs every listener before the
+    /// verb goes on): the views the call left are pushed, the reports it made since `mark` are
+    /// signalled behind its signals, as its tail would, and all of it runs here, in place
+    /// ([`UiScript::signal_point`]).
+    fn at_point(&mut self, script: &mut UiScript, mark: &mut crate::ui_cast::ReportMark) {
+        self.signal_reports(script, mark);
+        self.commit_views(script);
+        script.signal_point(self);
+    }
+
+    /// The reports the call made since `mark` signalled now, ahead of whatever it signals next:
+    /// a selection's teardown runs StopAttack (`0x493a08`), whose next-swing cancel
+    /// (`0x5ecb63` → `0x6e6f30`) reports there, ahead of the teardown's `PET_BAR_UPDATE`
+    /// (`0x493a18`) and the change's `PLAYER_TARGET_CHANGED`; TryCast's cancel reports ahead of
+    /// its pick (`0x6e4d71`, `0x6e4efb`).
+    fn signal_reports(&mut self, script: &mut UiScript, mark: &mut crate::ui_cast::ReportMark) {
+        let ready = self.appliers.p2().p2().ready_since(script, *mark);
+        crate::ui_cast::fire(script, ready);
+        *mark = self.appliers.p2().p2().mark();
+    }
+
+    /// What `SetSelection` (`0x493540`) signals for a selection this call moved since `at` last
+    /// signalled, in its order: the release's `PET_BAR_UPDATE` when it called a possessed unit off
+    /// (`0x493a18` → `0x4bd6b4`), the usable refresh (`0x493892`, `0x493a69`), then
+    /// `PLAYER_TARGET_CHANGED` (`0x49389c`, `0x493a73`), with `"target"` seated for the
+    /// listeners and the script's next line. The unit feed takes the change as heard. Whether
+    /// it signalled.
+    fn signal_selection(&mut self, script: &mut UiScript, at: &mut Signalled) -> bool {
+        let selected = self.appliers.p0().selected();
+        if selected == at.selected {
+            return false;
+        }
+        self.signal_reports(script, &mut at.mark);
+        let appliers = &mut self.appliers;
+        script.seat_selection(appliers.p0().seated());
+        if at.latched && !appliers.p6().p1().attack_latched() {
+            script.lower_pet_attack();
+            script.fire_event("PET_BAR_UPDATE", vec![]);
+        }
+        if let Some(states) = appliers.p2().p4().as_mut() {
+            states.usable_refresh(script).fire(script);
+        }
+        script.fire_event("PLAYER_TARGET_CHANGED", vec![]);
+        script.announce_selection(selected);
+        at.selected = selected;
+        at.latched = appliers.p6().p1().attack_latched();
+        true
+    }
+
+    /// A selection's `SetSelection` from its signals on, `owed` being what its commit owes after
+    /// them: the teardown's `PET_BAR_UPDATE` (`0x4bd6b4`) runs its listeners before the store and
+    /// the send (`0x4936e2`, `0x493871`), the change's signals run theirs before the re-swing
+    /// (`0x4938c8`), and a payment that selects again (StartAttack's own select, `0x5eccaa`)
+    /// signals in turn before what it owes. A selection a listener makes at a point signals
+    /// itself, nested, so each point moves the mark to the selection as the listeners left it.
+    fn settle_selection(
+        &mut self,
+        script: &mut UiScript,
+        at: &mut Signalled,
+        mut owed: crate::target::SelectDebt,
+    ) {
+        loop {
+            if let Some(send) = owed.take_send() {
+                // The teardown's StopAttack reported first (`0x493a08`); `PetStopAttack` lowered
+                // the latch and signals with the selection zeroed (`0x4bd6ae`, `0x4939d3`).
+                self.signal_reports(script, &mut at.mark);
+                script.lower_pet_attack();
+                script.fire_event("PET_BAR_UPDATE", vec![]);
+                at.latched = false;
+                script.seat_selection(self.appliers.p0().seated());
+                self.at_point(script, &mut at.mark);
+                // The store over a listener's pick (`0x4936e2`), or for a clear the send of the
+                // listener's pick, and either signals after (`0x49389c`, `0x493a73`), so the
+                // mark stays the selection the call found.
+                self.appliers.p0().pay_send(send);
+            }
+            let signalled = self.signal_selection(script, at);
+            if !signalled && !owed.owes_swings() {
+                return;
+            }
+            // `SetSelection` returns, or goes on to its re-swing, once its listeners ran. The
+            // re-swing pushes the selection's address (`0x4938c3`), so it goes at a listener's
+            // pick; StartAttack reads it after them (`0x5ecbcd`).
+            self.at_point(script, &mut at.mark);
+            self.listened(at);
+            if !owed.owes_swings() {
+                return;
+            }
+            owed = self.appliers.p0().pay(owed);
+        }
+    }
+
+    /// After a point: what its listeners selected they signalled themselves.
+    fn listened(&mut self, at: &mut Signalled) {
+        at.selected = self.appliers.p0().selected();
+        at.latched = self.appliers.p6().p1().attack_latched();
+    }
+
+    /// The player's Attack (`0x6131a0`): the validator (`0x6131aa` → `0x612df0`), whose pick's
+    /// `SetSelection` signals inside it, before the re-read (`0x6130c1`) and the final gate; then
+    /// the toggle at the target it settled. Its `SelectTarget`s bind a unit to a standing
+    /// targeting cursor's cast inside the validator, so that cast is sent ahead of the swing.
+    fn attack(&mut self, script: &mut UiScript, at: &mut Signalled, may_pick: bool) {
+        let Some(owed) = self.appliers.p7().pick_attack(may_pick) else {
+            return;
+        };
+        self.settle_selection(script, at, owed.into());
+        let target = self.appliers.p7().settle_attack();
+        self.appliers.p1().bind_parked();
+        if let Some(guid) = target {
+            self.appliers.p7().start_attack(guid);
+        }
+    }
+
+    /// A pet bar press past its dispatcher's gates (`0x4bd1d0`): Attack's validator (`0x4bd40d`)
+    /// signals its pick's selection in place, ahead of its latch (`0x4bd42e`) and its
+    /// `CMSG_PET_ACTION` (`0x4bd4a4`), and a cast the validator binds to a standing targeting
+    /// cursor goes out ahead of the packet. A spell press the bar hands to the attempt
+    /// (`0x4bd385`) casts through the ladder instead.
+    fn pet_step(
+        &mut self,
+        script: &mut UiScript,
+        at: &mut Signalled,
+        step: Option<crate::ui_pet::PetStep>,
+    ) {
+        use crate::ui_pet::PetStep;
+        let step = match step {
+            Some(PetStep::Attack(attack)) => {
+                let Some(owed) = self.appliers.p6().p0().pick_attack(&attack) else {
+                    return;
+                };
+                self.settle_selection(script, at, owed.into());
+                let finished = self.appliers.p6().p0().finish_attack(attack);
+                if finished.as_ref().is_some_and(|&(_, latched)| latched) {
+                    // The latch (`0x4bd42e`) signals `PET_BAR_UPDATE` (`0x4bd438`), whose
+                    // listeners run before the order goes (`0x4bd4a4`).
+                    script.raise_pet_attack();
+                    script.fire_event("PET_BAR_UPDATE", vec![]);
+                    self.at_point(script, &mut at.mark);
+                    self.listened(at);
+                }
+                finished.map(|(send, _)| PetStep::Order(send))
+            }
+            step => step,
+        };
+        let appliers = &mut self.appliers;
+        appliers.p1().bind_parked();
+        match step {
+            Some(PetStep::Order(send)) => appliers.p6().p0().finish_press(send),
+            Some(PetStep::Cast(cast)) => crate::ui_pet::cast_pet_press(&mut appliers.p3(), cast),
+            Some(PetStep::Attack(_)) | None => {}
+        }
+    }
+
+    /// TryCast's attack pick with a unit as its actor (`0x6e4efb`, `0x6e4ef4`), its selection
+    /// signalled in place: the guid the attempt or the tail's attack goes on at.
+    fn unit_pick(
+        &mut self,
+        script: &mut UiScript,
+        at: &mut Signalled,
+        press: crate::spell::UnitPress,
+    ) -> Option<u64> {
+        let owed = self.appliers.p6().p0().pick_for_unit_cast(press)?;
+        self.settle_selection(script, at, owed.into());
+        self.appliers.p6().p0().settle_pick()
+    }
+
+    /// The registrar's close core `0x4f5010` inside its call: with a registrar open, the latch
+    /// release (`0x4f5024`), which re-enters the core while the registrar holds the latch, then
+    /// the cell cleared (`0x4f502b`) and `GUILD_REGISTRAR_CLOSED` (`0x4f503a`), its signal once
+    /// per run of the core, as the call's tail.
+    fn close_registrar(&mut self) -> Option<CallTail> {
+        use crate::ui_session::NpcWindow;
+        let npc = self.appliers.p4().p7().p1().registrar_npc()?;
+        let reenters = self.appliers.p2().p5().p2().release(npc);
+        self.appliers.p4().p7().p1().clear_registrar();
+        let runs = 1 + usize::from(reenters);
+        let mut set = self.appliers.p2();
+        let mut session = set.p5();
+        let latch = session.p2();
+        for _ in 0..runs {
+            latch.note_closed(NpcWindow::Registrar);
+        }
+        Some(Box::new(move |script: &mut UiScript| {
+            for _ in 0..runs {
+                script.fire_event("GUILD_REGISTRAR_CLOSED", vec![]);
+            }
+        }))
+    }
+
+    /// The designer's close core `0x4f58a0` inside `CloseTabardCreation`'s call: with a vendor
+    /// stored, the latch release (`0x4f58da`), which re-enters the core while the designer holds
+    /// the latch, then the cell cleared (`0x4f58df`) and `CLOSE_TABARD_FRAME` (`0x4f58f8`), once
+    /// per run of the core, as the call's tail; an open not yet told goes first, as the reference
+    /// fired it at the open.
+    fn close_tabard(&mut self) -> Option<CallTail> {
+        use crate::ui_session::NpcWindow;
+        let vendor = self.appliers.p4().p7().p2().vendor()?;
+        let reenters = self.appliers.p2().p5().p2().release(vendor);
+        let opened = self.appliers.p4().p7().p2().clear_vendor();
+        let runs = 1 + usize::from(reenters);
+        let mut set = self.appliers.p2();
+        let mut session = set.p5();
+        let latch = session.p2();
+        for _ in 0..runs {
+            latch.note_closed(NpcWindow::Tabard);
+        }
+        Some(Box::new(move |script: &mut UiScript| {
+            if opened {
+                script.fire_event("OPEN_TABARD_FRAME", vec![]);
+            }
+            for _ in 0..runs {
+                script.fire_event("CLOSE_TABARD_FRAME", vec![]);
+            }
+        }))
+    }
+
+    /// A probe line's text emote, run as `DoEmote` runs it inside its call (`0x5ef560`).
+    pub(crate) fn emote(&mut self, script: &mut UiScript, text_id: u32, arg: Option<String>) {
+        let appliers = &mut self.appliers;
+        emote_in_order!(appliers, appliers.p4().p2().emote(script, text_id, arg));
     }
 }
 
 impl CallHost for ScriptCallHost<'_, '_> {
     fn apply(&mut self, script: &mut UiScript, call: ScriptCall) -> Option<CallTail> {
+        #[cfg(test)]
+        self.census_probe();
         let appliers = &mut self.appliers;
         // The gate's answer for this call, made where the Lua verb ran: its casts start only if
         // tag 2 passed there. The ladder reads it while this call applies.
-        appliers.p3().ladder.permit(call.may_cast());
-        let selected_before = appliers.p0().selected();
-        let report_mark = appliers.p2().p2().mark();
+        let outer_permit = appliers.p3().ladder.permit(call.may_cast());
+        let mut at = Signalled {
+            selected: appliers.p0().selected(),
+            latched: appliers.p6().p1().attack_latched(),
+            mark: appliers.p2().p2().mark(),
+        };
         let mut tail: Option<CallTail> = None;
+        // The confirm popup an item pick or a Yes raised, signalled with the call's reports.
+        let mut popup = None;
+        // What a selecting call owes after its signals (`0x493a18`, `0x4938c8`).
+        let mut owed = crate::target::SelectDebt::default();
         match call {
-            ScriptCall::Select { request, .. } => appliers.p0().select(request),
+            ScriptCall::Select { request, .. } => owed = appliers.p0().select(request),
             ScriptCall::TargetByName { name, exact, .. } => {
-                appliers.p0().target_by_name(&name, exact)
+                owed = appliers.p0().target_by_name(&name, exact);
             }
             ScriptCall::TargetNearest { mode, reverse, .. } => {
-                appliers.p0().target_nearest(mode, reverse);
+                owed = appliers.p0().target_nearest(mode, reverse);
             }
-            ScriptCall::TargetLastTarget { .. } => appliers.p0().target_last_target(),
-            ScriptCall::ClearTarget => appliers.p0().clear_target(),
-            ScriptCall::AttackTarget { may_pick, .. } => attack_in_order!(appliers, may_pick),
+            ScriptCall::TargetLastTarget { .. } => owed = appliers.p0().target_last_target(),
+            ScriptCall::ClearTarget => owed = appliers.p0().clear_target(),
+            ScriptCall::AttackTarget { may_pick, .. } => self.attack(script, &mut at, may_pick),
             ScriptCall::SpellTargetUnit(token) => appliers.p1().spell_target_unit(&token),
             ScriptCall::SpellStopTargeting => appliers.p1().stop_targeting(),
             ScriptCall::SpellStopCasting => appliers.p2().p0().stop_casting(),
@@ -114,10 +496,10 @@ impl CallHost for ScriptCallHost<'_, '_> {
                 crate::ui_shapeshift::cast_form(&mut appliers.p3(), spell_id);
             }
             ScriptCall::UseAction(press) => {
-                match crate::ui_action::use_action(&mut appliers.p4(), script, press) {
+                match crate::ui_action::use_action(&mut appliers.p4().p0(), script, press) {
                     // The Attack slot is a cast, so the gate's tag 4 (the pick) is asked only
                     // after tag 2 passed, and so passes as well.
-                    crate::ui_action::UseOutcome::Attack => attack_in_order!(appliers, true),
+                    crate::ui_action::UseOutcome::Attack => self.attack(script, &mut at, true),
                     crate::ui_action::UseOutcome::Macro(id) => {
                         tail = Some(Box::new(move |script: &mut UiScript| {
                             if !crate::ui_macro::run_macro(script, id) {
@@ -129,59 +511,178 @@ impl CallHost for ScriptCallHost<'_, '_> {
                 }
             }
             ScriptCall::UseContainerItem(call) => {
-                appliers.p5().use_container_item(script, call);
+                if let Some(open) = appliers.p5().p0().p0().use_container_item(script, call) {
+                    tail = appliers.p5().p1().open_item(script, open);
+                }
             }
-            ScriptCall::UseInventoryItem { slot, on_self, .. } => {
-                appliers.p5().use_inventory_item(script, slot, on_self)
-            }
+            ScriptCall::UseInventoryItem { slot, on_self, .. } => appliers
+                .p5()
+                .p0()
+                .p0()
+                .use_inventory_item(script, slot, on_self),
+            ScriptCall::Item(benilla_ui::script::ItemCall::BindOnUse { may_cast }) => appliers
+                .p5()
+                .p0()
+                .p0()
+                .confirm_bind_on_use(script, may_cast),
+            ScriptCall::Item(call) => appliers.p5().p0().p1().apply(script, call),
             ScriptCall::CastPetSpell { spell_id, on_self } => {
-                crate::ui_pet_book::cast_pet_spell(&mut appliers.p6(), spell_id, on_self);
+                let send = crate::ui_pet_book::begin_pet_book_cast(
+                    &mut appliers.p6().p0(),
+                    spell_id,
+                    on_self,
+                );
+                if let Some(send) = send {
+                    // `GetTargetingSpellId 0x6e48e0` is this spell: the press lowers the cursor
+                    // and sends nothing (`0x4b3474`-`0x4b347d`).
+                    if appliers.p3().ladder.ground.spell() == Some(spell_id) {
+                        appliers.p3().ladder.stop_targeting();
+                    } else {
+                        crate::ui_pet_book::finish_pet_book_cast(&mut appliers.p6().p0(), send);
+                    }
+                }
             }
-            ScriptCall::PetAction(slot) => pet_in_order!(appliers, begin_slot(slot)),
-            ScriptCall::PetOrder(packed) => pet_in_order!(appliers, begin_order(packed)),
+            ScriptCall::PetAction(slot) => {
+                let step = appliers.p6().p0().begin_slot(slot);
+                self.pet_step(script, &mut at, step);
+            }
+            ScriptCall::PetOrder(packed) => {
+                let step = appliers.p6().p0().begin_order(packed);
+                self.pet_step(script, &mut at, step);
+            }
+            ScriptCall::SendChat(send) => appliers.p4().p1().send_chat(script, send),
+            ScriptCall::DisplayError(key) => appliers.p4().p1().display_error(script, key),
+            ScriptCall::RandomRoll { min, max } => appliers.p4().p1().random_roll(min, max),
+            ScriptCall::Channel(cmd) => {
+                if let Some((packet, refused)) = appliers.p4().p1().channel(script, cmd) {
+                    // The join's refusal runs its listeners inside the claim (`0x49b9c5`),
+                    // before the body sends (`0x49ee02`).
+                    if refused {
+                        self.at_point(script, &mut at.mark);
+                    }
+                    self.appliers.p4().p1().send_channel(packet);
+                }
+            }
+            ScriptCall::DoEmote(request) => {
+                emote_in_order!(appliers, appliers.p4().p2().do_emote(script, request));
+            }
+            ScriptCall::Uninvite(name) => appliers.p4().p1().uninvite(name),
+            ScriptCall::RequestTimePlayed => appliers.p4().p1().request_time_played(),
+            ScriptCall::AddonMessage(send) => appliers.p4().p1().addon_message(send),
+            ScriptCall::PickItem(pick) => popup = appliers.p1().pick_item(pick),
+            ScriptCall::EnchantConfirm(answer) => popup = appliers.p1().confirm_enchant(answer),
+            ScriptCall::Loot(call) => tail = appliers.p5().p1().apply(script, call),
+            ScriptCall::Auction(call) => appliers.p4().p3().apply(script, call),
+            ScriptCall::Social(call) => appliers.p4().p4().apply(script, call),
+            ScriptCall::Party(request) => appliers.p4().p5().apply(script, request),
+            ScriptCall::Quest(call) => appliers.p5().p3().apply(script, call),
+            ScriptCall::Gossip(call) => appliers.p5().p4().apply(script, call),
+            ScriptCall::Mail(call) => appliers.p5().p2().apply(script, call),
+            // The partner's slot 7 is the trade's, the bind the targeting cursor's.
+            ScriptCall::Trade(
+                call @ (benilla_ui::script::TradeCall::TargetEnchant
+                | benilla_ui::script::TradeCall::ReplaceEnchant),
+            ) => {
+                let partner = appliers.p4().p6().partner_enchant_slot();
+                let check = call == benilla_ui::script::TradeCall::TargetEnchant;
+                appliers.p1().trade_enchant(script, partner, check);
+            }
+            ScriptCall::Trade(call) => tail = appliers.p4().p6().apply(call),
+            ScriptCall::Trainer(call) => tail = appliers.p5().p5().apply(call),
+            ScriptCall::Taxi(call) => tail = appliers.p5().p6().apply(call),
+            ScriptCall::Merchant(call) => appliers.p5().p7().apply(script, call),
+            ScriptCall::Guild(call) => appliers.p4().p7().p0().apply(script, call),
+            ScriptCall::Petition(PetitionCall::CloseRegistrar) => tail = self.close_registrar(),
+            // The designer's opener, then the registrar's close core (`0x4f5355` → `0x4f5010`).
+            ScriptCall::Petition(PetitionCall::TabardInfo) => {
+                appliers
+                    .p4()
+                    .p7()
+                    .p1()
+                    .apply(script, PetitionCall::TabardInfo);
+                tail = self.close_registrar();
+            }
+            ScriptCall::Petition(call) => tail = appliers.p4().p7().p1().apply(script, call),
+            ScriptCall::Tabard(TabardCall::Close) => tail = self.close_tabard(),
+            ScriptCall::Tabard(call) => appliers.p4().p7().p2().apply(script, call),
+            ScriptCall::Talent(call) => appliers.p2().p3().p0().apply(script, call),
+            ScriptCall::Skill(call) => appliers.p2().p3().p1().apply(call),
+            ScriptCall::Reputation(call) => tail = appliers.p2().p3().p2().apply(script, call),
+            ScriptCall::Pet(call) => appliers.p6().p1().apply(script, call),
+            ScriptCall::Stable(call) => appliers.p6().p2().apply(call),
+            ScriptCall::Session(request) => appliers.p2().p5().p0().apply(request),
+            ScriptCall::Tutorial(call) => appliers.p2().p5().p1().apply(script, call),
         }
+        self.settle_selection(script, &mut at, owed);
+        let appliers = &mut self.appliers;
         // A selection this call made with the targeting cursor up was handed to the cast
         // (`SelectTarget`, `0x4935d5`) and is bound now, before the next call reads either.
         appliers.p1().bind_parked();
-        // TryCast's attack pick can move the selection mid-cast (`0x6e4efb`), so a press held
-        // there is picked and resumed before the next call reads the selection.
+        // TryCast's attack pick (`0x6e4efb`) can move the selection mid-cast, and its
+        // `SetSelection` signals there, before the attempt goes on to its send (`0x6e585a`), so a
+        // press held there is picked, its selection signalled in place, and resumed.
         if let Some(held) = appliers.p3().ladder.take_held() {
             // A held press passed tag 2 to be held, so the pick's tag 4 passes as well.
-            if appliers.p7().pick_for_cast(held) {
-                let mut cast = appliers.p3();
-                let ctx = cast.targeting.context();
-                cast.ladder.resume_after_pick(held, &ctx);
+            match held.unit {
+                None => {
+                    if let Some(owed) = self.appliers.p7().pick_for_cast(held) {
+                        self.settle_selection(script, &mut at, owed.into());
+                        if self.appliers.p7().settle_attack().is_some() {
+                            let mut cast = self.appliers.p3();
+                            let ctx = cast.targeting.context();
+                            cast.ladder.resume_after_pick(held, &ctx);
+                        }
+                    }
+                }
+                // The pet bar's unit as the pick's actor (`0x6e4ef4`), which settles the guid the
+                // attempt goes on with (`0x6e4ef7`).
+                Some(press) => {
+                    if let Some(guid) = self.unit_pick(script, &mut at, press) {
+                        let mut cast = self.appliers.p3();
+                        if let Some(ctx) =
+                            cast.targeting.context_for_caster(press.caster, Some(guid))
+                        {
+                            cast.ladder.resume_after_pick(held, &ctx);
+                        }
+                    }
+                }
             }
         }
-        // Whatever casts next is the engine's own, which asks no gate.
-        appliers.p3().ladder.permit(true);
-        // The reference signals `PLAYER_TARGET_CHANGED` inside `SetSelection`, so inside this
-        // call's input events; the unit feed signals it a step later, and asks for them.
-        let selected_after = appliers.p0().selected();
-        let input = script.input_events();
-        if selected_after != selected_before {
-            script.note_selection_cause(selected_after, input);
+        // A unit caster's send owes its attack tail (`0x6e51de` → `0x6131a0`): its validator with
+        // the unit as the actor (`0x6131aa`), whose pick signals in place, then for the bar's unit
+        // the bar's Attack (`0x613217`) before the attempt returns.
+        if let Some((caster, guid)) = self.appliers.p3().ladder.take_unit_attack() {
+            let press = crate::spell::UnitPress {
+                caster,
+                target: Some(guid),
+            };
+            if let Some(guid) = self.unit_pick(script, &mut at, press) {
+                let step = self.appliers.p6().p0().attack_from_cast(caster, guid);
+                self.pet_step(script, &mut at, step);
+            }
         }
+        let appliers = &mut self.appliers;
+        // Whatever casts next is the caller's: the engine's own, which asks no gate, or the call
+        // whose signal point this call applied at.
+        appliers.p3().ladder.permit(outer_permit);
+        // A selection the call moved with no signal of its own yet is signalled as the call
+        // returns, inside it and under its input events.
+        self.signal_selection(script, &mut at);
         // The reports the call made, in its order: a refusal's `UI_ERROR_MESSAGE` and its
         // `SPELLCAST_FAILED` (`ReportCastFailure 0x6e1a00` inside `TryCast 0x6e4b60`), a cancel's
-        // event, `CURRENT_SPELL_CAST_CHANGED` at each of the attempt's signals, all signalled
-        // below as the call returns, under its input events.
-        let ready = appliers.p2().p2().ready_since(script, report_mark);
-        // The cast state the call left, for the script's next line: `SpellStopCasting`
-        // (`0x6e6e80`) finds the cast it sent in flight (`0x6e5026`), and `IsCurrentAction`
-        // (`0x4e53a0`) checks its slot, as stock `ActionButtonUp` reads straight after `UseAction`
-        // (`ActionButton.lua:54-55`).
-        let view = appliers.p2().p1().view();
-        script.set_cast_view(view);
-        // The word the call left: `SpellIsTargeting` (`0x6e6cd0`) reads it, and `SpellTargetUnit`
-        // binds to it.
-        appliers.p1().push_view(script);
-        if ready.is_empty() {
+        // event, `CURRENT_SPELL_CAST_CHANGED` at each of the attempt's signals, and the item gate's
+        // confirm (`0x495d60`), all signalled below as the call returns, under its input events.
+        let ready = self.appliers.p2().p2().ready_since(script, at.mark);
+        self.commit_views(script);
+        if ready.is_empty() && popup.is_none() {
             return tail;
         }
         let macro_lines = tail.take();
         Some(Box::new(move |script: &mut UiScript| {
             crate::ui_cast::fire(script, ready);
+            if let Some(popup) = popup {
+                popup.fire(script);
+            }
             if let Some(lines) = macro_lines {
                 lines(script);
             }
@@ -212,17 +713,11 @@ pub(crate) struct HostedVm<'w, 's> {
     host: Option<ScriptCallHost<'w, 's>>,
 }
 
-impl<'w, 's> HostedVm<'w, 's> {
+impl HostedVm<'_, '_> {
     /// Run `f` on the VM with the host lent around all of it ([`hosted`]); `f` gets `None` with
     /// no VM.
     pub(crate) fn run<R>(&mut self, f: impl FnOnce(Option<&mut UiScript>) -> R) -> R {
         hosted(&mut self.script, &mut self.host, f)
-    }
-
-    /// The VM and the host apart, for a drain that lends the host to each item's Lua in turn
-    /// ([`lent`]) and reads what the calls moved through the host between them.
-    pub(crate) fn parts(&mut self) -> (Option<&mut UiScript>, Option<&mut ScriptCallHost<'w, 's>>) {
-        (self.script.as_deref_mut(), self.host.as_mut())
     }
 }
 
@@ -271,6 +766,7 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
     /// Lua it runs makes waits, as one made while the host applies a call does, and applies as the
     /// turn ends, with the host lent. With no VM `f` gets `None`; with no host what waited is
     /// dropped.
+    #[track_caller]
     pub(crate) fn turn<R>(
         &mut self,
         f: impl FnOnce(Option<&mut UiScript>, SystemParamItem<'_, '_, P>) -> R,
@@ -278,6 +774,10 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
         let Some(script) = self.script.as_deref_mut() else {
             return f(None, self.set.p0());
         };
+        #[cfg(test)]
+        if let Some(host) = self.set.p1().as_ref() {
+            host.census_probe();
+        }
         let r = script.host_out(|script| f(Some(script), self.set.p0()));
         match self.set.p1().as_mut() {
             Some(host) => script.hosted(host, |_| ()),
@@ -292,6 +792,7 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
     /// leaves its events in `fires`, which are signalled in order once it returns, with the host
     /// lent, so the calls their handlers make apply inside the verb. For a feed whose events end
     /// its pass, so its handlers read every push it made.
+    #[track_caller]
     pub(crate) fn feed(
         &mut self,
         f: impl FnOnce(Option<&mut UiScript>, SystemParamItem<'_, '_, P>, &mut Fires),
@@ -308,6 +809,55 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
                 }
             }
         });
+    }
+}
+
+impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
+    /// Signal an engine writer's selection, which it committed on `P` ([`EngineSelect`]), in place
+    /// with the host ([`ScriptCallHost::engine_select`]); with no VM or no host to lend, nothing
+    /// listens, and `pay` pays what it owes on `P`.
+    pub(crate) fn engine_select(
+        &mut self,
+        select: EngineSelect,
+        pay: impl FnOnce(SystemParamItem<'_, '_, P>, crate::target::SelectDebt),
+    ) {
+        if let Some(script) = self.script.as_deref_mut() {
+            if let Some(host) = self.set.p1().as_mut() {
+                host.engine_select(script, select);
+                return;
+            }
+        }
+        pay(self.set.p0(), select.owed);
+    }
+
+    /// An engine writer's StartAttack at `guid`, its select signalled in place with the host
+    /// ([`ScriptCallHost::engine_start_attack`]); with no VM or no host, `start` runs it on `P`.
+    pub(crate) fn engine_start_attack(
+        &mut self,
+        guid: u64,
+        mark: crate::lanes::Mark,
+        start: impl FnOnce(SystemParamItem<'_, '_, P>),
+    ) {
+        if let Some(script) = self.script.as_deref_mut() {
+            if let Some(host) = self.set.p1().as_mut() {
+                host.engine_start_attack(script, guid, mark);
+                return;
+            }
+        }
+        start(self.set.p0());
+    }
+}
+
+impl<'w, 's, P: SystemParam + 'static> VmWith<'w, 's, P> {
+    /// The VM and the set apart, for a drain that lends the host to each item's Lua in turn
+    /// ([`lent`]) and reads or writes `P` between them, never while the host is lent.
+    pub(crate) fn parts(
+        &mut self,
+    ) -> (
+        Option<&mut UiScript>,
+        &mut ParamSet<'w, 's, (P, Option<ScriptCallHost<'w, 's>>)>,
+    ) {
+        (self.script.as_deref_mut(), &mut self.set)
     }
 }
 
@@ -336,21 +886,72 @@ pub(crate) fn with_hosted_vm<R>(
     r
 }
 
-/// Apply what an engine turn left waiting on `script`, a VM out of the world (the UI load runs on
-/// one, with the world in hand): through a host built off the world, or dropped with none.
-pub(crate) fn apply_waiting(world: &mut World, script: &mut UiScript) {
+/// A fresh VM in `world`, for a test of an engine entry outside the feeds.
+#[cfg(test)]
+pub(crate) fn insert_test_vm(world: &mut World) {
+    world.insert_non_send_resource(UiScript::new().expect("a VM"));
+}
+
+/// Defer what the world's VM fires while the guard lives ([`UiScript::defer`]), with the mark to
+/// park it from ([`park_since`]); `None` with no VM.
+pub(crate) fn defer_vm(world: &World) -> Option<(benilla_ui::script::Deferring, usize)> {
+    world
+        .get_non_send_resource::<UiScript>()
+        .map(|vm| (vm.defer(), vm.waiting_mark()))
+}
+
+/// Park what the world's VM has held since `mark` ([`UiScript::park_since`]); the VM's session
+/// and the key, `None` with nothing held or no VM.
+pub(crate) fn park_since(world: &mut World, mark: usize) -> Option<(u64, u64)> {
+    let mut vm = world.get_non_send_resource_mut::<UiScript>()?;
+    let key = vm.park_since(mark)?;
+    Some((vm.session(), key))
+}
+
+/// Run what the world's VM parked under `key` ([`UiScript::run_parked`]), with the host lent,
+/// if it is still the VM of `session`: a replaced VM's keys count from 0 again in the next.
+pub(crate) fn run_parked(world: &mut World, session: u64, key: u64) {
+    fn run(In((session, key)): In<(u64, u64)>, mut vm: HostedVm) {
+        vm.run(|script| {
+            if let Some(script) = script.filter(|s| s.session() == session) {
+                script.run_parked(key);
+            }
+        });
+    }
+    if let Err(err) = world.run_system_cached_with(run, (session, key)) {
+        debug!("script calls: parked signals did not run: {err}");
+    }
+}
+
+/// What the world's VM answers to `chunk`, for a test of an engine entry outside the feeds.
+#[cfg(test)]
+pub(crate) fn eval_in_vm<T: benilla_ui::mlua::FromLuaMulti>(world: &World, chunk: &str) -> T {
+    world
+        .non_send_resource::<UiScript>()
+        .eval(chunk)
+        .expect("the chunk runs")
+}
+
+/// Run `f` on `script`, a VM out of the world (the UI load runs on one, with the world in hand),
+/// with a host built off the world lent, as a system's would be, and apply what its calls queued
+/// after. A world without the appliers' state (a bare test world) lends none: the calls are
+/// dropped as `f` returns ([`UiScript::refusing`]).
+pub(crate) fn lent_by_world<R>(
+    world: &mut World,
+    script: &mut UiScript,
+    f: impl FnOnce(&mut UiScript) -> R,
+) -> R {
     let mut state = bevy::ecs::system::SystemState::<Option<ScriptCallHost>>::new(world);
-    {
+    let r = {
         let mut host = state.get_mut(world);
         match host.as_mut() {
-            Some(host) => script.hosted(host, |_| ()),
-            None => {
-                script.refuse_waiting();
-            }
+            Some(host) => script.hosted(host, f),
+            None => script.refusing(f),
         }
-    }
+    };
     state.apply(world);
     crate::creature_anim::apply_unit_edits(world);
+    r
 }
 
 /// Run `system` as a one-shot from an exclusive caller, as [`World::run_system_cached`] does, and
@@ -371,6 +972,10 @@ pub(crate) fn run_cached<O: 'static, M, S: IntoSystem<(), O, M> + 'static>(
 pub(crate) fn bind_parked_picks(mut cursor: crate::spell::ScriptCursor) {
     cursor.bind_parked();
 }
+
+/// The census list ([`benilla_ui::script::census`]).
+#[cfg(test)]
+pub(crate) mod census;
 
 /// A host that applies each call with `apply`, for a harness that lends its own engine half.
 #[cfg(test)]
@@ -399,6 +1004,10 @@ mod tests {
     use crossbeam_channel::Receiver;
 
     mod cast_reports;
+    mod census;
+    mod refusals;
+    mod selection;
+    mod systems;
 
     const ME: u64 = 0x10;
     /// The unit selected before the script runs.
@@ -662,6 +1271,11 @@ mod tests {
         (swings, stopped)
     }
 
+    /// The world points a probe line's drain reads ([`crate::ui_chat::drain_chat_input_once`]).
+    fn probe_line_world(world: &mut World) {
+        benilla_world::world_point::init_world_point_resources(world);
+    }
+
     /// The keys of the error lines shown, each defined as its own key ([`record_reports`]).
     fn errors(f: &Frame) -> Vec<String> {
         f.app
@@ -809,6 +1423,43 @@ mod tests {
         }
     }
 
+    /// `0x4b3300` stops the targeting cursor when the book spell pressed is the one awaiting its
+    /// click (`0x4b3474` `GetTargetingSpellId`, `0x4b347d` `StopTargeting`), ahead of its pet fork,
+    /// so `CastSpell(slot, "pet")` on the pet's own armed spell lowers the cursor and sends no order.
+    #[test]
+    fn a_pet_book_cast_of_the_armed_spell_stops_targeting() {
+        let mut f = frame(true);
+        let world = f.app.world_mut();
+        world
+            .resource_mut::<crate::ui_pet::PetBar>()
+            .spells
+            .pet_guid = PET;
+        world
+            .non_send_resource_mut::<UiScript>()
+            .set_pet_book(PetBookState {
+                token: Some("PET".into()),
+                slots: vec![SpellSlotView {
+                    spell_id: GROWL,
+                    name: "Growl".into(),
+                    ..Default::default()
+                }],
+            });
+        world.resource_mut::<crate::spell::SpellTargeting>().enter(
+            GROWL,
+            crate::spell::CastCommit::Pet { caster: PET },
+            0x0002,
+        );
+        run(&mut f, r#"CastSpell(1, "pet")"#);
+        assert_eq!(pet_actions(&f), vec![], "no order");
+        assert!(
+            !f.app
+                .world()
+                .resource::<crate::spell::SpellTargeting>()
+                .active(),
+            "the cursor is down"
+        );
+    }
+
     /// `/target` then `/cast`: `TargetUnit` commits through `SetSelection 0x493540` before it
     /// returns, and `CastSpellByName` (`0x4b4ab0`) casts at the selection as it stands then.
     #[test]
@@ -850,6 +1501,46 @@ mod tests {
         }
     }
 
+    /// The resolver reads the target's `UNIT_FIELD_TARGET` live (`0x515970`, the hop at
+    /// `0x515a0f`), so `"targettarget"` follows each selection a call commits: after
+    /// `TargetUnit` it names the new target's target, and after `ClearTarget` nobody, whatever
+    /// the frame pushed for the selection the chunk started on.
+    #[test]
+    fn target_of_target_follows_the_selection_a_call_commits() {
+        use benilla_ui::script::UnitState;
+        let mut f = frame(true);
+        let world = f.app.world_mut();
+        // `party1` targets us (`UNIT_FIELD_TARGET`, fields 16 and 17).
+        let new = world.resource::<GuidIndex>().0[&NEW];
+        world
+            .entity_mut(new)
+            .insert(ObjectStore(benilla_protocol::ObjectFields::from_pairs(&[
+                (22, 100),
+                (28, 100),
+                (16, ME as u32),
+                (17, 0),
+            ])));
+        let mut script = world.non_send_resource_mut::<UiScript>();
+        let named = |guid, name: &str| UnitState {
+            exists: true,
+            has_object: true,
+            guid,
+            name: Some(name.into()),
+            ..Default::default()
+        };
+        script.set_unit("player", Some(named(ME, "Me")));
+        // The frame's push for the old selection's target.
+        script.set_unit("targettarget", Some(named(0x77, "Stale")));
+        let tot = eval::<Option<String>>(
+            &mut f,
+            r#"TargetUnit("party1") return UnitName("targettarget")"#,
+        );
+        assert_eq!(tot.as_deref(), Some("Me"), "the new target's target");
+        let exists =
+            eval::<Option<i64>>(&mut f, r#"ClearTarget() return UnitExists("targettarget")"#);
+        assert_eq!(exists, None, "no target, so no target of target");
+    }
+
     /// `TargetNearestEnemy` (`0x489a80` → `0x493f60(0, 1)`) commits through `SetSelection` before
     /// it returns, so the cast after it in the same script goes to the unit the TAB cycle picked.
     #[test]
@@ -887,15 +1578,200 @@ mod tests {
     }
 
     /// `AttackTarget` (`0x489b50` → `0x6131a0`) swings at the selection as the calls before it
-    /// left it.
+    /// left it. Its send stores the attack target at once (`0x5ecd51` → `0x47bf70`), so the switch
+    /// after it is the attacking switch, whose StopAttack sends (`0x493a08`), and whose re-swing
+    /// StartAttack refuses at the party member (`0x5ecc37`).
     #[test]
     fn attack_target_swings_at_the_selection_in_call_order() {
         let mut f = frame(true);
         run(&mut f, r#"AttackTarget() TargetUnit("party1")"#);
-        assert_eq!(swings(&f), (vec![OLD], false));
+        assert_eq!(swings(&f), (vec![OLD], true));
         let mut f = frame(true);
         run(&mut f, r#"TargetUnit("party1") AttackTarget()"#);
         assert_eq!(swings(&f), (vec![NEW], false));
+    }
+
+    /// A seated player's `AttackTarget` stands first: StartAttack's `SetStandState(0)`
+    /// (`0x5ecc9b` → `0x5ed430`) sends `CMSG_STANDSTATECHANGE` in place, ahead of
+    /// `CMSG_ATTACKSWING` (`0x5ecd3c`).
+    #[test]
+    fn a_seated_attack_stands_before_the_swing() {
+        let mut f = frame(true);
+        let world = f.app.world_mut();
+        let me = world.resource::<GuidIndex>().0[&ME];
+        world.get_mut::<ObjectStore>(me).unwrap().0.merge(
+            benilla_protocol::ObjectFields::from_pairs(&[(
+                benilla_protocol::field::FIELD_UNIT_BYTES_1,
+                1,
+            )]),
+        );
+        run(&mut f, "AttackTarget()");
+        let sent: Vec<ClientCommand> =
+            f.rx.try_iter()
+                .filter(|c| {
+                    matches!(
+                        c,
+                        ClientCommand::StandStateChange { .. } | ClientCommand::AttackSwing { .. }
+                    )
+                })
+                .collect();
+        assert!(
+            matches!(
+                sent[..],
+                [
+                    ClientCommand::StandStateChange { state: 0 },
+                    ClientCommand::AttackSwing { guid: OLD }
+                ]
+            ),
+            "{sent:?}"
+        );
+    }
+
+    /// A second `AttackTarget` in the chunk is the toggle's stop (`0x6131ce` → `0x5ecac0`): the
+    /// first one's send stored the attack target locally (`0x5ecd51` → `0x47bf70`), so the stop's
+    /// gate passes and `CMSG_ATTACKSTOP` goes out before any echo.
+    #[test]
+    fn a_second_attack_target_in_the_chunk_stops_the_swing_the_first_sent() {
+        let mut f = frame(true);
+        run(&mut f, "AttackTarget() AttackTarget()");
+        assert_eq!(swings(&f), (vec![OLD], true));
+    }
+
+    /// `LOOT_OPENED` is signalled by the response's copier (`0x4c2ac0`), whose listeners run in
+    /// place (`SignalEvent`, `0x703e50`), so a selecting verb a handler calls has committed by its
+    /// next line, as every verb's has: `TargetUnit` then `UnitName("target")` names the new
+    /// target. The window's feed is an engine turn; its handlers run as the turn ends, with the
+    /// host lent.
+    #[test]
+    fn a_loot_opened_handlers_target_call_applies_inside_it() {
+        let mut f = frame(true);
+        let world = f.app.world_mut();
+        world
+            .resource_mut::<crate::names::NameCache>()
+            .insert_player(NEW, "Red Whelp".into(), None);
+        world
+            .run_system_once(crate::ui_unit::feed_name_candidates)
+            .expect("the candidate feed runs as a one-shot system");
+        run(
+            &mut f,
+            r#"local l = CreateFrame("Frame")
+            l:RegisterEvent("LOOT_OPENED")
+            l:SetScript("OnEvent", function() TargetUnit("party1") SEEN = UnitName("target") end)"#,
+        );
+        let world = f.app.world_mut();
+        world
+            .resource_mut::<crate::ui_loot::LootState>()
+            .open(MOB, 1, 0, Vec::new());
+        crate::ui_loot::feed_loot_once(world);
+        let seen = eval::<Option<String>>(&mut f, "return SEEN");
+        assert_eq!(seen.as_deref(), Some("Red Whelp"), "the new target");
+        assert_eq!(selected(&f), Some(NEW));
+    }
+
+    /// The plate driver hides each live plate in turn as it returns it to the pool (`0x608a10`),
+    /// so each plate's `OnHide` runs as its plate goes, with the plates after it still shown, and
+    /// a call it makes commits before its verb returns: `TargetUnit` then `UnitName("target")`
+    /// names the new target. The driver's turn leaves the widgets to change after it, with the
+    /// host lent.
+    #[test]
+    fn a_plates_on_hide_runs_as_it_goes_with_the_host_lent() {
+        use benilla_ui::script::{PlateGeometry, PlateState};
+        let mut f = frame(true);
+        let world = f.app.world_mut();
+        world
+            .resource_mut::<crate::names::NameCache>()
+            .insert_player(NEW, "Red Whelp".into(), None);
+        world
+            .run_system_once(crate::ui_unit::feed_name_candidates)
+            .expect("the candidate feed runs as a one-shot system");
+        let plate = |key: u64| PlateState {
+            key,
+            top_centre: (400.0, 400.0),
+            health: 30.0,
+            max_health: 40.0,
+            bar_colour: [1.0, 0.0, 0.0],
+            name: "Wolf".into(),
+            level: Some(12),
+            skull: false,
+            level_colour: [1.0, 1.0, 0.0],
+            raid_icon: None,
+            alpha: 255,
+            lit: false,
+            hovered: false,
+        };
+        let geometry = PlateGeometry {
+            width: 128.0,
+            height: 32.0,
+            bar_off_x: 4.0,
+            bar_off_y: 4.0,
+            bar_width: 103.0,
+            bar_height: 9.0,
+            level_off_x: 11.8,
+            level_off_y: 9.1,
+            skull_size: 12.8,
+            raid_size: 25.6,
+            name_height: 12.8,
+            level_height: 11.0,
+            shadow_offset: 1.0,
+        };
+        {
+            let mut script = world.non_send_resource_mut::<UiScript>();
+            script.run(r#"CreateFrame("Frame", "WorldFrame")"#).unwrap();
+            script.sync_nameplates(geometry, &[plate(OLD), plate(NEW)]);
+            script
+                .run(
+                    r#"SHOWN = ""
+                    local function shown()
+                        local n = 0
+                        for _, c in ipairs({WorldFrame:GetChildren()}) do
+                            if c:IsShown() then n = n + 1 end
+                        end
+                        return n
+                    end
+                    for _, c in ipairs({WorldFrame:GetChildren()}) do
+                        c:SetScript("OnHide", function()
+                            SHOWN = SHOWN .. shown()
+                            TargetUnit("party1")
+                            SEEN = UnitName("target")
+                        end)
+                    end"#,
+                )
+                .unwrap();
+        }
+        // Neither kind of plate on: the driver retires every live one.
+        world.init_resource::<crate::player::CameraControl>();
+        crate::vplates::drive_vplates_once(world);
+        let (shown, seen) = eval::<(Option<String>, Option<String>)>(&mut f, "return SHOWN, SEEN");
+        assert_eq!(shown.as_deref(), Some("10"), "each as its plate goes");
+        assert_eq!(seen.as_deref(), Some("Red Whelp"), "the new target");
+    }
+
+    /// A probe's `/script` line is `RunScript(msg)`, a verb like any other: the line's `TargetUnit`
+    /// commits through `SetSelection 0x493540` before it returns, so the line's next statement
+    /// reads the new target. The drain takes the lines in an engine turn and runs each line's Lua
+    /// between turns, with the host lent.
+    #[test]
+    fn a_probe_lines_target_call_applies_inside_it() {
+        let mut f = frame(true);
+        let world = f.app.world_mut();
+        world
+            .resource_mut::<crate::names::NameCache>()
+            .insert_player(NEW, "Red Whelp".into(), None);
+        world
+            .run_system_once(crate::ui_unit::feed_name_candidates)
+            .expect("the candidate feed runs as a one-shot system");
+        benilla_world::world_point::init_world_point_resources(world);
+        world.insert_resource(crate::ui_chat::commands::SlashCommands::build(
+            |name| (name == "SLASH_SCRIPT1").then(|| "/script".to_string()),
+            |_| None,
+        ));
+        world
+            .non_send_resource_mut::<UiScript>()
+            .push_chat_input(r#"/script TargetUnit("party1") SEEN = UnitName("target")"#.into());
+        crate::ui_chat::drain_chat_input_once(world);
+        let seen = eval::<Option<String>>(&mut f, "return SEEN");
+        assert_eq!(seen.as_deref(), Some("Red Whelp"), "the new target");
+        assert_eq!(selected(&f), Some(NEW));
     }
 
     /// `TargetByName` (`0x489d60`) commits through `SetSelection 0x493540` before it returns, so
@@ -981,12 +1857,30 @@ mod tests {
         }
     }
 
+    /// The `CMSG_LOOT_METHOD`s `chunk` sends inside its calls, run with the host lent.
+    fn loot_methods_sent(f: &mut Frame, chunk: &str) -> Vec<(u32, u64, u32)> {
+        let _ = f.rx.try_iter().count();
+        with_hosted_vm(f.app.world_mut(), |script| {
+            script.expect("a VM").run(chunk).expect("the script runs")
+        });
+        f.rx.try_iter()
+            .filter_map(|c| match c {
+                ClientCommand::LootMethod {
+                    method,
+                    master,
+                    threshold,
+                } => Some((method, master, threshold)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// `SetLootMethod`'s master name runs the resolver in mode 2 (`0x4e9418`, filter `0x493eca`):
     /// a held groupmate resolves through the candidate feed while `CanAssist` and alive, and a
     /// dead one is no candidate, so the name finds nobody and the binding sends nothing.
     #[test]
     fn set_loot_method_resolves_a_held_groupmate_only_while_alive() {
-        use benilla_ui::script::{PartyMemberInfo, PartyRequest, PartyState};
+        use benilla_ui::script::{PartyMemberInfo, PartyState};
         for (health, resolved) in [(100, true), (0, false)] {
             let mut f = frame(false);
             // OLD is a friendly player, our groupmate "Olly" in `party1`.
@@ -1027,16 +1921,12 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            script
-                .run(r#"SetLootMethod("master", "Ol")"#)
-                .expect("the script runs");
-            let sent = script.take_party_requests();
-            let expected = resolved.then_some(PartyRequest::LootMethod {
-                method: 2,
-                master: OLD,
-                threshold: 2,
-            });
-            assert_eq!(sent, expected.into_iter().collect::<Vec<_>>(), "{health}");
+            let expected = resolved.then_some((2, OLD, 2));
+            assert_eq!(
+                loot_methods_sent(&mut f, r#"SetLootMethod("master", "Ol")"#),
+                expected.into_iter().collect::<Vec<_>>(),
+                "{health}"
+            );
         }
     }
 
@@ -1045,7 +1935,7 @@ mod tests {
     /// above 0 (`0x493eca`): a ghost, at health 1, does; a corpse, at 0, does not.
     #[test]
     fn set_loot_method_resolves_our_own_name_through_the_feed() {
-        use benilla_ui::script::{PartyRequest, PartyState};
+        use benilla_ui::script::PartyState;
         for (health, resolved) in [(100, true), (1, true), (0, false)] {
             let mut f = frame(false);
             with_factions(&mut f, FRIEND, &[]);
@@ -1085,25 +1975,18 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            script
-                .run(r#"SetLootMethod("master", "kel")"#)
-                .expect("the script runs");
-            let expected = resolved.then_some(PartyRequest::LootMethod {
-                method: 2,
-                master: ME,
-                threshold: 2,
-            });
+            let expected = resolved.then_some((2, ME, 2));
             assert_eq!(
-                script.take_party_requests(),
+                loot_methods_sent(&mut f, r#"SetLootMethod("master", "kel")"#),
                 expected.into_iter().collect::<Vec<_>>(),
                 "health {health}"
             );
         }
     }
 
-    /// The candidate feed marks a `UNIT_FLAG_NOT_SELECTABLE` unit as the commit's `IsSelectable`
-    /// does (`0x4935ee`): the nearer namesake is the ranked pick and it is refused, so the chunk
-    /// keeps the old target's view and the commit keeps its selection, not the farther namesake.
+    /// The commit's `IsSelectable` (`0x4935ee`) refuses a `UNIT_FLAG_NOT_SELECTABLE` unit: the
+    /// nearer namesake is the ranked pick and it is refused, so the commit keeps its selection,
+    /// not the farther namesake, and the chunk keeps the old target's view.
     #[test]
     fn target_by_name_shows_nothing_when_the_commit_refuses_its_pick() {
         /// `UNIT_FLAG_NOT_SELECTABLE`, `UNIT_FIELD_FLAGS` bit 25.
@@ -1560,11 +2443,10 @@ mod tests {
     }
 
     /// `SetSelection` signals `PLAYER_TARGET_CHANGED` inside `ExecuteBinding` (`0x4b7b02`-
-    /// `0x4b7b11`), so an insecure addon's handler that casts passes after a TAB press. Here the
-    /// unit feed signals it a step after the call is applied, with the call's input events raised
-    /// again around it: the stock `TARGETNEARESTENEMY` binding moves the target, the addon's handler
-    /// casts at the new one. A change no call made (the server's) hears it with none up, and its
-    /// cast is refused.
+    /// `0x4b7b11`), so an insecure addon's handler that casts passes after a TAB press: the call
+    /// signals it in place, under the key's input events, as the stock `TARGETNEARESTENEMY`
+    /// binding moves the target, and the addon's handler casts at the new one. A change no call
+    /// made (the server's) hears it from the unit feed with none up, and its cast is refused.
     #[test]
     fn a_tab_targets_and_the_addons_target_handler_casts() {
         benilla_formats::wow_data_or_skip!();
@@ -1646,6 +2528,25 @@ mod tests {
             .world()
             .get_resource::<crate::spell::ScriptCastPermit>()
             .is_some());
+    }
+
+    /// A call puts back the cast permit it found as it returns, so a call nested inside another's
+    /// apply, at a signal point, leaves the outer call's answer for the rest of that apply.
+    #[test]
+    fn a_call_puts_back_the_cast_permit_it_found() {
+        let mut f = frame(true);
+        f.app
+            .world_mut()
+            .run_system_once(|mut ladder: crate::spell::CastLadder| {
+                ladder.permit(false);
+            })
+            .expect("the ladder runs as a one-shot system");
+        run(&mut f, "ClearTarget()");
+        assert!(!f
+            .app
+            .world()
+            .resource::<crate::spell::ScriptCastPermit>()
+            .allows());
     }
 
     /// The Attack slot is a cast too (`UseAction` → `TryCast`, `0x6e4c90`), behind the same first
@@ -1855,12 +2756,17 @@ mod tests {
                         item_class,
                         count: 1,
                         guid: POTION,
+                        // The record cached, as the feed pushes it.
+                        quality: Some(1),
                         ..Default::default()
                     },
                 )]),
                 ..Default::default()
             }),
         );
+        world
+            .non_send_resource_mut::<UiScript>()
+            .seat_item_records();
         let _ = f.rx.try_iter().count();
     }
 
@@ -2122,12 +3028,15 @@ mod tests {
             count: 1,
             bonding,
             equip_slots: equip,
+            // The record cached, as the feed pushes it.
+            quality: Some(1),
             ..Default::default()
         };
         let mut slots = std::collections::HashMap::new();
         slots.insert(1, slot(HELD, HELD_ENTRY, vec![], 0));
         slots.insert(2, slot(HELM, HELM_ENTRY, vec![1], bonding));
-        world.non_send_resource_mut::<UiScript>().set_container(
+        let mut script = world.non_send_resource_mut::<UiScript>();
+        script.set_container(
             0,
             Some(benilla_ui::script::ContainerState {
                 name: None,
@@ -2135,6 +3044,7 @@ mod tests {
                 slots,
             }),
         );
+        script.seat_item_records();
     }
 
     /// The bar's equip runs `0x5e1840` (`0x4e602a`): `SetCursorItem`'s inner clear drops and
@@ -2276,8 +3186,9 @@ mod tests {
         );
     }
 
-    /// `0x5e1840` refuses an item in the trade window with its line (`0x4bfd20`, `0x5e18a5`) and
-    /// ends before the set: the bar sends nothing and the held item stays.
+    /// `0x5e1840` refuses an item in the trade window with its line (`0x4bfd20`, `0x5e18a5`),
+    /// shown inside the call (`0x496720`), and ends before the set: the bar sends nothing and the
+    /// held item stays.
     #[test]
     fn a_bar_equip_of_an_item_in_the_trade_window_is_refused() {
         let mut f = frame(false);
@@ -2292,12 +3203,19 @@ mod tests {
             "PickupContainerItem(0, 2) ClickTradeButton(1) ClearCursor() PickupContainerItem(0, 1)",
         );
         let _ = f.rx.try_iter().count();
-        run(&mut f, "UseAction(1, 0)");
+        run(&mut f, r#"UseAction(1, 0) SEEN = table.concat(LINES, ",")"#);
 
         assert_eq!(f.rx.try_iter().count(), 0, "nothing is sent");
+        assert_eq!(
+            eval::<String>(&mut f, "return SEEN"),
+            "ERR_EQUIP_TRADE_ITEM"
+        );
         let mut script = f.app.world_mut().non_send_resource_mut::<UiScript>();
         assert_eq!(script.cursor_item().map(|i| i.guid), Some(HELD));
-        assert_eq!(script.take_ui_errors(), vec!["ERR_EQUIP_TRADE_ITEM"]);
+        assert!(
+            script.take_ui_errors().is_empty(),
+            "nothing waits for the feed"
+        );
     }
 
     /// The bar's item use reaches `CGItem::Use` (`0x4e607b`), whose control gate (`0x5d8eaa`) ends
@@ -2375,12 +3293,15 @@ mod tests {
     /// and the last enemy) beside `OLD` (selected) and `NEW` (party1, "Bob"), with `OLD` the last
     /// target.
     fn with_things_to_select(f: &mut Frame) {
-        spawn_mob(f, &[]);
+        // Units (`OBJECT_FIELD_TYPE` 0x9, 0x19 for the player), the typemask `0x489a40` and the
+        // assist's basis lookup take (`0x489c9b`).
+        spawn_mob(f, &[(2, 0x9)]);
         let world = f.app.world_mut();
         let new = world.resource::<GuidIndex>().0[&NEW];
         world
             .entity_mut(new)
             .insert(ObjectStore(benilla_protocol::ObjectFields::from_pairs(&[
+                (2, 0x19),
                 (22, 100),
                 (28, 100),
                 (16, MOB as u32),
@@ -2390,6 +3311,33 @@ mod tests {
         names.insert_player(NEW, "Bob".into(), None);
         world.resource_mut::<crate::target::LastEnemy>().0 = Some(MOB);
         world.resource_mut::<Selection>().last = Some(NEW);
+    }
+
+    /// Every selecting verb commits through `SetSelection 0x493540` before it returns: the TAB
+    /// cycle's pick (`0x4941e6`), and `TargetLastTarget`, `TargetLastEnemy` and `AssistUnit`
+    /// through `0x489a40` (`0x489a74`). So `UnitName("target")` on the next line of the same chunk
+    /// names the unit the call selected, from the frame's candidates.
+    #[test]
+    fn the_next_line_reads_the_target_each_selecting_verb_committed() {
+        for (lua, name) in [
+            ("TargetNearestEnemy()", "Red Affinity"),
+            ("TargetLastEnemy()", "Red Affinity"),
+            (r#"AssistUnit("party1")"#, "Red Affinity"),
+            ("TargetLastTarget()", "Bob"),
+        ] {
+            let mut f = frame(true);
+            with_things_to_select(&mut f);
+            f.app
+                .world_mut()
+                .run_system_once(crate::ui_unit::feed_name_candidates)
+                .unwrap();
+            let seen = with_hosted_vm(f.app.world_mut(), |s| {
+                s.expect("a VM")
+                    .eval::<Option<String>>(&format!(r#"{lua} return UnitName("target")"#))
+            })
+            .unwrap();
+            assert_eq!(seen.as_deref(), Some(name), "{lua}");
+        }
     }
 
     /// `SelectTarget` (`0x493540`) with the targeting cursor up binds the unit to the pending cast
@@ -2882,7 +3830,7 @@ mod tests {
                 .run_system_once(crate::spell::targeting::feed_targeting_to_vm)
                 .unwrap();
             world
-                .run_system_once(crate::ui_cast::feed_cast_reports)
+                .run_system_once(crate::ui_cast::signal_reports)
                 .unwrap();
         };
         run_hosted(
@@ -2897,6 +3845,69 @@ mod tests {
         feed(&mut f);
         assert_eq!(global(&mut f, "FIRED"), Some(5), "not again from the feed");
         assert_eq!(casts(&f), vec![(MOTW, Some(NEW))]);
+    }
+
+    /// `START_AUTOREPEAT_SPELL` fires inside the send that stores the key (`0x6e594c`,
+    /// `0x6e5952`) and `STOP_AUTOREPEAT_SPELL` inside the stop that clears it (`0x6ea16a`,
+    /// `0x6ea170`): a macro's `SpellStopCasting()` then `CastSpellByName("Shoot")` fires both, in
+    /// that order, before it returns, and the next feed fires neither again.
+    #[test]
+    fn the_auto_repeat_edges_fire_inside_the_calls_that_make_them() {
+        const SHOOT: u32 = 5019;
+        let mut f = frame(true);
+        with_book_spell(
+            &mut f,
+            SHOOT,
+            "Shoot",
+            benilla_formats::SpellDisplay {
+                targets: 0x2,
+                attributes_ex2: 0x20,
+                ..Default::default()
+            },
+        );
+        f.app
+            .world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .run(
+                r#"SEEN = {}
+                local f = CreateFrame("Frame")
+                f:RegisterEvent("START_AUTOREPEAT_SPELL")
+                f:RegisterEvent("STOP_AUTOREPEAT_SPELL")
+                f:SetScript("OnEvent", function() table.insert(SEEN, event) end)"#,
+            )
+            .unwrap();
+        let seen = |f: &mut Frame| {
+            f.app
+                .world_mut()
+                .non_send_resource_mut::<UiScript>()
+                .eval::<Vec<String>>("return SEEN")
+                .unwrap()
+        };
+        run_hosted(&mut f, r#"CastSpellByName("Shoot") N = table.getn(SEEN)"#);
+        assert_eq!(
+            global(&mut f, "N"),
+            Some(1),
+            "inside the send: {:?}",
+            seen(&mut f)
+        );
+        run_hosted(
+            &mut f,
+            r#"SpellStopCasting() CastSpellByName("Shoot") N = table.getn(SEEN)"#,
+        );
+        assert_eq!(global(&mut f, "N"), Some(3), "inside the macro");
+        assert_eq!(
+            seen(&mut f),
+            [
+                "START_AUTOREPEAT_SPELL",
+                "STOP_AUTOREPEAT_SPELL",
+                "START_AUTOREPEAT_SPELL"
+            ]
+        );
+        f.app
+            .world_mut()
+            .run_system_once(crate::ui_cast::signal_reports)
+            .unwrap();
+        assert_eq!(seen(&mut f).len(), 3, "not again from the feed");
     }
 
     /// A key's body runs inside `CBindings::ExecuteBinding` (`0x4b7990`) with its input event up
@@ -3138,6 +4149,15 @@ mod tests {
     #[test]
     fn the_chat_drains_unit_combat_names_the_target_as_it_signals() {
         let mut f = frame(true);
+        // The VM shows the selection the frame's feed would have pushed.
+        f.app
+            .world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .set_unit_guids(&benilla_ui::script::UnitGuids {
+                player: ME,
+                target: OLD,
+                ..Default::default()
+            });
         f.app
             .world_mut()
             .non_send_resource_mut::<UiScript>()

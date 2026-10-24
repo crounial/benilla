@@ -3,27 +3,35 @@
 //! setter `Z` drives (2 inferred to be the chair sit, vmangos's `UNIT_STAND_STATE_SIT_CHAIR`), and
 //! the toggle refuses on the stand state this frame committed. Both refuse silently, with no
 //! packet, so the `sit` trace tag ([`super::move_trace::posture`]) records each commit and refusal.
+//! Both act on the active player alone (`0x5ed46c`, `0x5eb4ba`), whichever body is driven: under
+//! possession `X`, the `/sit` family and `Z` read and change the character, and the possessed
+//! unit's movement stands nobody.
 
 use benilla_protocol::ObjectFields;
 use bevy::prelude::*;
 
-use super::{move_trace, state, BodyQuery, ClientCommand, NetCommands, Player, StandStateRequest};
+use super::{
+    move_trace, state, BodyQuery, ClientCommand, NetCommands, Player, SelfPosture,
+    StandStateRequest,
+};
+use crate::net::{ObjectStore, SelfPlayer};
 
-/// What the posture verbs read of the player beyond its body's components.
+/// What the posture verbs read of the player beyond its own components.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct PlayerReads {
     /// Our own control lost ([`super::OwnControlLost`]): `IsClientControlled` (`0x5fa5f0`) reads
     /// the unit's `[+0xc58] & 0x400`, which `0x5fa600` writes beside that flag for our character.
     pub(super) control_lost: bool,
-    /// The body holds a precast spell ([`crate::creature_anim::Precast`], `+0xc8c`).
-    pub(super) precast: bool,
 }
 
-/// Runs this frame's stand-state decision and sheath toggle, and returns the committed stand
-/// state: the local commit over the server's echoed byte, which the pose and sheath guard read.
+/// Runs this frame's stand-state decision and sheath toggle on the active player, and returns the
+/// driven body's stand state, which its pose reads: the active player's local commit over its
+/// echoed byte, or a possessed unit's own byte.
 pub(super) fn update(
     player: &mut Player,
+    pending: &mut super::StandPending,
     body: &BodyQuery,
+    me: &SelfPosture,
     binds: &crate::bindings::BindingsState,
     net: &NetCommands,
     commands: &mut Commands,
@@ -36,35 +44,53 @@ pub(super) fn update(
     moving: bool,
     turned: bool,
 ) -> u8 {
-    // The echo into `UNIT_FIELD_BYTES_1` drives every observer's pose; `stand_pending`, the local
+    let me = me.single();
+    let precast = me.is_some_and(|(.., precast, _)| precast);
+    // The driven body is the active player's own, which the movement stand-up needs.
+    let embodied = me.is_some_and(|(.., embodied)| embodied);
+    // The echo into `UNIT_FIELD_BYTES_1` drives every observer's pose; `pending`, the local
     // commit ([`apply_locally`]), overlays it until it lands.
-    let (stand_byte, gates) = body
-        .single()
-        .ok()
-        .and_then(|(.., store, _, _, _, _, _)| {
-            store.map(|s| (s.0.unit_stand_state(), stand_gates(&s.0, reads.precast)))
-        })
+    let (stand_byte, gates) = me
+        .and_then(|(_, _, store, ..)| store)
+        .map(|s| (s.0.unit_stand_state(), stand_gates(&s.0, precast)))
         .unwrap_or((
             0,
             state::StandGates {
-                precast: reads.precast,
+                precast,
                 ..default()
             },
         ));
-    if player.stand_pending == Some(stand_byte) {
-        player.stand_pending = None; // the echo landed
+    if pending.0 == Some(stand_byte) {
+        pending.0 = None; // the echo landed
     }
     // `SMSG_STANDSTATE_UPDATE` reaches the local apply directly, with no refusal gate and no
     // `CMSG_STANDSTATECHANGE` back, before the volunteered logic below; the last packet wins.
     if let Some(s) = server.read().last().map(|m| m.state) {
-        let stand_now = player.stand_pending.unwrap_or(stand_byte);
+        let stand_now = pending.stand_state(stand_byte);
         move_trace::posture("server", s, stand_now, player.move_flags());
-        apply_locally(player, s, stand_now, body, commands, sheath, loot_close);
+        apply_locally(pending, s, stand_now, me, commands, sheath, loot_close);
     }
-    let stand_state = player.stand_pending.unwrap_or(stand_byte);
-    // The queued asks (the `/sit` family) ran in the reference's message pass, before the X key
-    // is read; the last writer wins, and all land on the single commit below.
-    let mut request_stand = asks.read().last().map(|r| r.state);
+    // The queued asks (the idle sit, the approach's stand, the attack's stand) ran in the
+    // reference's message pass, before the X key is read, each `SetStandState` whole in its order,
+    // so an ask reads the state the one before it left (`GetStandState` `0x5ed570` answers the
+    // prediction). An ask whose packet went out where it was made, past its gate, owes the local
+    // apply alone (`0x5ed53f` → `0x6127b0`).
+    let flags = player.move_flags();
+    for ask in asks.read() {
+        let stand_now = pending.stand_state(stand_byte);
+        if !ask.sent {
+            set_stand_state(
+                ask.state, stand_now, gates, flags, me, net, pending, commands, sheath, loot_close,
+            );
+        } else if me.is_some() {
+            move_trace::posture("sent", ask.state, stand_now, flags);
+            apply_locally(
+                pending, ask.state, stand_now, me, commands, sheath, loot_close,
+            );
+        }
+    }
+    let stand_state = pending.stand_state(stand_byte);
+    let mut request_stand = None;
     if binds.fired(crate::bindings::Input::SitOrStand) {
         request_stand = Some(u8::from(stand_state == 0));
     }
@@ -74,48 +100,40 @@ pub(super) fn update(
     // though a release within 200 ms is a right-click, whose action stands you. A knockback's move
     // event stands us too (`0x60e139`: `GetStandState` `0x60be50`, then `0x60be30(0)`), read off
     // the latch [`super::wire_in::apply_server_moves`] armed this frame, as the mover runs later.
+    // The wrapper acts on the mover, and only a player (`0x60be39`) that is the active one
+    // (`0x5ed471`): a possessed unit's movement stands nobody.
     let knocked_out_of_it = player.knockback.is_some();
-    if (moving || turned || knocked_out_of_it || binds.fired(crate::bindings::Input::Jump))
+    if embodied
+        && (moving || turned || knocked_out_of_it || binds.fired(crate::bindings::Input::Jump))
         && stand_state != 0
         && request_stand.is_none()
     {
         request_stand = Some(0);
     }
-    // `SetStandState` `0x5ed430`'s gate ([`state::stand_state_refused`]), silent and before the
-    // packet: no change at all while mounted, on a taxi, dead, channelling or casting, and no
-    // sitting while translating or swimming. It covers the posture emotes too, whose `Emotes.dbc`
-    // gate has no swim bit. The flags word is the live outbound one, a frame old, the
-    // `[[this+0x118]+0x40]` the cast gates read.
-    if let Some(s) =
-        request_stand.filter(|&s| state::stand_state_refused(gates, player.move_flags(), s))
-    {
-        debug!(
-            "stand state {s} refused ({gates:?}, move flags {:#x} — the client's `0x5ed430` gate)",
-            player.move_flags()
+    if let Some(s) = request_stand {
+        set_stand_state(
+            s,
+            stand_state,
+            gates,
+            flags,
+            me,
+            net,
+            pending,
+            commands,
+            sheath,
+            loot_close,
         );
-        move_trace::posture("REFUSED", s, stand_state, player.move_flags());
-        request_stand = None;
     }
-    if let Some(s) = request_stand.filter(|&s| s != stand_state) {
-        move_trace::posture("commit", s, stand_state, player.move_flags());
-        // `0x5ed430` sends at `0x5ed501`, then calls the local apply at `0x5ed53f`.
-        let _ = net.0.send(ClientCommand::StandStateChange {
-            state: u32::from(s),
-        });
-        apply_locally(player, s, stand_state, body, commands, sheath, loot_close);
-    }
-    let stand_now = player.stand_pending.unwrap_or(stand_byte);
+    let stand_now = pending.stand_state(stand_byte);
     // The sheath toggle (Z) cycles the anim layer's committed sheath state through its one setter
     // ([`crate::creature_anim::SheathRequest`]), which sends `CMSG_SETSHEATHED`; only it plays the
     // ceremony (`bInstant = 0` in `ToggleSheath` `0x5eb480`). No body model yet drops the press.
     if binds.fired(crate::bindings::Input::ToggleSheath) {
-        if let Ok((e, _, _, _, Some((drv, committed)), store, engaged, _, _, wielded, _)) =
-            body.single()
-        {
+        if let Some((e, Some((drv, committed)), store, engaged, wielded, precast, _)) = me {
             let toggle = ToggleGates {
                 control_lost: reads.control_lost,
                 engaged,
-                precast: reads.precast,
+                precast,
                 seated: stand_now != 0,
                 mid_ceremony: drv.sheath_ceremony_active(),
             };
@@ -138,7 +156,126 @@ pub(super) fn update(
         }
     }
 
-    stand_now
+    if embodied || me.is_none() {
+        stand_now
+    } else {
+        // A possessed unit poses by its own byte; the prediction is the active player's.
+        body.single()
+            .ok()
+            .and_then(|(.., store, _, _, _, _)| store)
+            .map_or(0, |s| s.0.unit_stand_state())
+    }
+}
+
+/// The active player's posture setters run inside a script call, so their packets leave ahead of
+/// whatever the call sends next: the instant stow `SetSheatheState(0, 1, 1)` (`0x611cf0`) and
+/// `SetStandState` (`0x5ed430`): its gate ([`state::stand_state_refused`]), `CMSG_STANDSTATECHANGE`
+/// (`0x5ed501`) and the local apply (`0x5ed53f` → `0x6127b0`). The setter tests no current state:
+/// a sit while sitting sends again. A world without the player's resources reads them empty.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct StandSetter<'w, 's> {
+    net: Res<'w, NetCommands>,
+    /// The mover's flags, the `[[this+0x118]+0x40]` the gate reads.
+    player: Option<Res<'w, Player>>,
+    /// The prediction `[player+0x1d68]` the local apply writes (`0x5f07a3`).
+    pending: Option<ResMut<'w, super::StandPending>>,
+    me: Query<'w, 's, (Entity, &'static ObjectStore), With<SelfPlayer>>,
+    /// The committed sheath state the stow sets (`[+0xd40]`).
+    sheath: Query<'w, 's, &'static mut crate::creature_anim::CommittedSheath, With<SelfPlayer>>,
+    /// The precast as the queued unit edits leave it, which a link of the VM pass reads in place
+    /// of the component.
+    edits: Option<Res<'w, crate::creature_anim::UnitEdits>>,
+}
+
+impl StandSetter<'_, '_> {
+    /// `SetSheatheState(0, 1, 1)` (`0x611cf0`): stowed now, its `CMSG_SETSHEATHED` sent
+    /// (`0x611dbc`) when the state changed.
+    pub(crate) fn stow(&mut self) {
+        let fields = self.me.single().ok().map(|(_, s)| &s.0);
+        if let Ok(mut committed) = self.sheath.single_mut() {
+            if committed.set_now(0, fields, None) {
+                let _ = self.net.0.send(ClientCommand::SetSheathed { state: 0 });
+            }
+        }
+    }
+
+    /// `SetStandState(s)` up to its local apply's leave: the gate, the packet, and the prediction
+    /// written on a change (`0x5f0799`-`0x5f07a3`). `None` when the gate refuses; else whether the
+    /// change leaves, to a state but 0 (`0x5f07a9`), which owes the loot close (`0x48f200` at
+    /// `0x5f07d5`) and the attack stop (`0x5ecac0` at `0x5f07e7`) the caller runs before
+    /// [`Self::finish`]. Not built: the input resume on a stand (`0x5f07ba`).
+    pub(crate) fn set(&mut self, s: u8) -> Option<bool> {
+        let (byte, gates) = {
+            let (me, store) = self.me.single().ok()?;
+            let precast = self
+                .edits
+                .as_deref()
+                .is_some_and(|e| e.precast(me).is_some());
+            (store.0.unit_stand_state(), stand_gates(&store.0, precast))
+        };
+        let flags = self.player.as_deref().map_or(0, Player::move_flags);
+        if state::stand_state_refused(gates, flags, s) {
+            debug!("stand state {s} refused in a call ({gates:?}, the client's `0x5ed430` gate)");
+            move_trace::posture("REFUSED", s, byte, flags);
+            return None;
+        }
+        move_trace::posture("call", s, byte, flags);
+        let _ = self.net.0.send(ClientCommand::StandStateChange {
+            state: u32::from(s),
+        });
+        let now = self
+            .pending
+            .as_deref()
+            .map_or(byte, |p| p.stand_state(byte));
+        if now == s {
+            return Some(false);
+        }
+        if let Some(pending) = self.pending.as_deref_mut() {
+            pending.0 = Some(s);
+        }
+        Some(s != 0)
+    }
+
+    /// The local apply's tail (`0x6127cc`-`0x6127fb`): drawn weapons stow for a stand state but 0
+    /// or 2.
+    pub(crate) fn finish(&mut self) {
+        let byte = self.me.single().map_or(0, |(_, s)| s.0.unit_stand_state());
+        let now = self
+            .pending
+            .as_deref()
+            .map_or(byte, |p| p.stand_state(byte));
+        if now != 0 && now != 2 {
+            self.stow();
+        }
+    }
+}
+
+/// `SetStandState`'s descriptor legs (`0x5ed440`-`0x5ed4bd`): a channelling, mounted, flying or
+/// dead player changes no stand state. The precast legs (`0x5ed44b`, `0x5ed4cc`) are the
+/// caller's.
+pub(crate) fn stand_up_refused(fields: &ObjectFields) -> bool {
+    state::stand_state_refused(stand_gates(fields, false), 0, 0)
+}
+
+/// StartAttack's stand-up for a seated player (`0x5ecc90`-`0x5ecc9b`), `SetStandState(0)`: past
+/// its gate (`refused` is its descriptor and precast legs; a stand to 0 reads no movement,
+/// `0x5ed4f0`), `CMSG_STANDSTATECHANGE` goes out here (`0x5ed501`), ahead of the select and the
+/// swing, and the local apply follows in the posture pass ([`StandStateRequest::sent`]). A stand
+/// to 0 leaves nothing to close or stow.
+pub(crate) fn stand_up_for_attack(
+    refused: bool,
+    net: &NetCommands,
+    asks: &mut MessageWriter<StandStateRequest>,
+) {
+    if refused {
+        debug!("stand state 0 refused at the attack (the client's `0x5ed430` gate)");
+        return;
+    }
+    let _ = net.0.send(ClientCommand::StandStateChange { state: 0 });
+    asks.write(StandStateRequest {
+        state: 0,
+        sent: true,
+    });
 }
 
 /// [`state::StandGates`] off the body's descriptor and cast state.
@@ -212,30 +349,29 @@ fn toggle_worn(
 /// Not built: the input resume on a stand (`0x5f07ba`) and the follow-camera re-acquire each call
 /// (`0x48ec90`).
 fn apply_locally(
-    player: &mut Player,
+    pending: &mut super::StandPending,
     s: u8,
     stand_now: u8,
-    body: &BodyQuery,
+    me: Option<SelfPostureItem>,
     commands: &mut Commands,
     sheath: &mut MessageWriter<crate::creature_anim::SheathRequest>,
     loot_close: &mut crate::ui_loot::LootMoveStart,
 ) {
-    let body = body.single().ok();
-    let drawn = body
-        .and_then(|(_, _, _, _, drv, ..)| drv)
+    let drawn = me
+        .and_then(|(_, drv, ..)| drv)
         .and_then(|(_, committed)| committed.state())
         .unwrap_or(0)
         != 0;
     let apply = local_apply(s, stand_now, drawn);
     if apply.predict {
-        player.stand_pending = Some(s);
+        pending.0 = Some(s);
     }
     if apply.leave {
         // The same close as the movement start's (`0x60e9dd`), under the same `0x6126b0`.
         loot_close.0 = true;
         commands.run_system_cached(stop_attack_for_stand_state);
     }
-    if let (true, Some((e, ..))) = (apply.stow, body) {
+    if let (true, Some((e, ..))) = (apply.stow, me) {
         sheath.write(crate::creature_anim::SheathRequest {
             entity: e,
             state: 0,
@@ -243,6 +379,58 @@ fn apply_locally(
         });
     }
 }
+
+/// `SetStandState(s)` (`0x5ed430`) on the active player over the committed `stand_now`. Its gate
+/// ([`state::stand_state_refused`]), silent and before the packet: no change at all while
+/// mounted, on a taxi, dead, channelling or casting, and no sitting while translating or
+/// swimming. It covers the posture emotes too, whose `Emotes.dbc` gate has no swim bit. The flags
+/// word is the live outbound one, a frame old, the `[[this+0x118]+0x40]` the cast gates read. Then
+/// `CMSG_STANDSTATECHANGE` (`0x5ed501`) and the local apply (`0x5ed53f`). A state equal to the
+/// committed one is dropped, each caller here having asked off its own read of the state.
+#[allow(clippy::too_many_arguments)] // the setter's whole input, as `update` holds it
+fn set_stand_state(
+    s: u8,
+    stand_now: u8,
+    gates: state::StandGates,
+    flags: u32,
+    me: Option<SelfPostureItem>,
+    net: &NetCommands,
+    pending: &mut super::StandPending,
+    commands: &mut Commands,
+    sheath: &mut MessageWriter<crate::creature_anim::SheathRequest>,
+    loot_close: &mut crate::ui_loot::LootMoveStart,
+) {
+    if state::stand_state_refused(gates, flags, s) {
+        debug!(
+            "stand state {s} refused ({gates:?}, move flags {flags:#x} — the client's `0x5ed430` gate)"
+        );
+        move_trace::posture("REFUSED", s, stand_now, flags);
+        return;
+    }
+    // Nothing to sit before our own object streams in: the setter runs on the active player.
+    if s == stand_now || me.is_none() {
+        return;
+    }
+    move_trace::posture("commit", s, stand_now, flags);
+    let _ = net.0.send(ClientCommand::StandStateChange {
+        state: u32::from(s),
+    });
+    apply_locally(pending, s, stand_now, me, commands, sheath, loot_close);
+}
+
+/// One row of [`SelfPosture`], the active player as the posture verbs read it.
+pub(super) type SelfPostureItem<'a> = (
+    Entity,
+    Option<(
+        &'a crate::creature_anim::AnimDriver,
+        &'a crate::creature_anim::CommittedSheath,
+    )>,
+    Option<&'a crate::net::ObjectStore>,
+    bool,
+    Option<&'a crate::creature_anim::Wielded>,
+    bool,
+    bool,
+);
 
 /// What the local apply (`0x6127b0`) does for state `s` over the committed `stand_now`, with the
 /// body's weapons `drawn` or not.
@@ -271,10 +459,12 @@ fn local_apply(s: u8, stand_now: u8, drawn: bool) -> LocalApply {
 fn stop_attack_for_stand_state(
     mut slots: crate::spell::CastSlots,
     net: Res<NetCommands>,
-    me: Query<Has<crate::creature_anim::Engaged>, With<crate::net::SelfPlayer>>,
+    me: Query<Entity, With<crate::net::SelfPlayer>>,
+    edits: Res<crate::creature_anim::UnitEdits>,
+    mut word: ResMut<crate::creature_anim::AttackStopInFlight>,
 ) {
-    let engaged = me.iter().next().unwrap_or(false);
-    crate::creature_anim::stop_attack_local(engaged, &mut slots.core(&net));
+    let me = me.iter().next();
+    crate::creature_anim::stop_attack_local(me, &edits, &mut word, &mut slots.core(&net));
 }
 
 #[cfg(test)]

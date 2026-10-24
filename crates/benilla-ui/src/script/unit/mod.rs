@@ -177,8 +177,9 @@ pub struct UnitState {
     /// disconnected, which greys a stock mana bar (`UnitFrame.lua:214`), so a hand-built live
     /// unit must set it; the app's `snapshot` does for every held one.
     pub is_connected: bool,
-    /// `UnitIsPVPFreeForAll`: `PLAYER_FLAGS` bit `0x80`, or the roster status byte's `0x10`;
-    /// independent of [`Self::pvp`].
+    /// `UnitIsPVPFreeForAll` (`0x516540`): a held unit's `UNIT_FIELD_FLAGS` 0x8 and its
+    /// controlling player's `PLAYER_FLAGS` 0x80, or for one with no object the roster status
+    /// byte's `0x10`; independent of [`Self::pvp`].
     pub is_pvp_ffa: bool,
     /// `UnitPVPRank`: the current rank on the internal `0..=18` scale (0 none), from the public
     /// `PLAYER_BYTES_3` byte 3. The private lifetime highest rides
@@ -220,6 +221,13 @@ pub struct UnitState {
     pub drunk: u8,
     /// What the unit tooltip builder `0x529fe0` alone reads of the unit.
     pub tooltip: super::tooltip_unit::UnitTooltipFacts,
+    /// The unit's own stat, resistance, damage, speed and attack-power fields, which the stat
+    /// getters read for any unit but the active player (`ui/unitstats`); zeros where the server
+    /// sends the field to the owner alone.
+    pub combat: super::char_stats::UnitCombatStats,
+    /// `UNIT_FIELD_SUMMONEDBY` (fields 12-13), 0 for none: `UnitDefense` and `UnitAttackBothHands`
+    /// answer a unit the active player summoned (`0x519272`, `0x518881`).
+    pub summoned_by: u64,
 }
 
 /// The name of a unit whose name is not yet known, as the reference's `UnitName` (`0x517220`) and
@@ -389,6 +397,21 @@ impl super::UiScript {
                 model.units_by_guid.remove(&guid);
             }
         }
+    }
+
+    /// The snapshot pushed under `token` itself, as [`Self::set_unit`] left it.
+    pub fn unit_view(&self, token: &str) -> Option<UnitState> {
+        self.model_ref().pushed_unit(token).cloned()
+    }
+
+    /// The snapshot pushed for `guid`, as [`Self::set_unit_by_guid`] left it.
+    pub fn unit_view_by_guid(&self, guid: u64) -> Option<UnitState> {
+        self.model_ref().units_by_guid.get(&guid).cloned()
+    }
+
+    /// The unit-token resolver's inputs as last pushed ([`Self::set_unit_guids`]).
+    pub fn unit_guids_view(&self) -> UnitGuids {
+        self.model_ref().unit_guids.clone()
     }
 
     /// The guids the chains a script can spell end on ([`UnitGuids::chain_ends`]), each once: the
@@ -578,6 +601,8 @@ pub mod by_name;
 mod chain_tests;
 mod relations;
 mod resolve;
+#[cfg(test)]
+mod selection_tests;
 #[cfg(test)]
 mod tests;
 

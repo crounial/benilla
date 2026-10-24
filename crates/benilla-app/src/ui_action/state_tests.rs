@@ -1,6 +1,8 @@
 //! [`super::feed_action_state`] through a real Lua VM, and its helpers.
 
 use super::*;
+use crate::creature_anim::Engaged;
+use crate::spell::AutoRepeatActive;
 use crate::target::Selection;
 use benilla_formats::SpellDisplay;
 use benilla_ui::script::UiScript;
@@ -19,9 +21,8 @@ const ME: u64 = 0x10;
 /// guid and the self-cast flag the cast targeting reads.
 fn feed_inputs(app: &mut App) {
     app.add_message::<crate::net::FieldChanged>()
-        .add_message::<crate::item_watch::ItemNotice>()
         .add_message::<crate::net::WorldEnterCascadeMessage>()
-        .init_resource::<crate::ui_items::feed::BagUpdates>()
+        .init_resource::<crate::item_lane::ItemLane>()
         .insert_resource(crate::net::SelfGuid(Some(ME)))
         .init_resource::<crate::spell::AutoSelfCast>()
         .init_resource::<Selection>()
@@ -31,16 +32,18 @@ fn feed_inputs(app: &mut App) {
 
 /// The feed's two halves, around the unit snapshots as the plugin orders them.
 fn add_action_feed(app: &mut App) {
-    app.init_resource::<ActionEvents>().add_systems(
-        Update,
-        (
-            feed_action_state.before(crate::ui_unit::UnitSnapshots),
-            fire_action_events
-                .in_set(crate::ui_action::CooldownEvents)
-                .after(crate::ui_unit::UnitSnapshots),
-        )
-            .chain(),
-    );
+    app.init_resource::<ActionEvents>()
+        .init_resource::<super::ActionStateMemory>()
+        .add_systems(
+            Update,
+            (
+                feed_action_state.before(crate::ui_unit::UnitSnapshots),
+                fire_action_events
+                    .in_set(crate::ui_action::CooldownEvents)
+                    .after(crate::ui_unit::UnitSnapshots),
+            )
+                .chain(),
+        );
 }
 
 /// A profession opener (`Effect[0]` 47) names the window `IsCurrentAction` checks it against
@@ -59,16 +62,20 @@ fn a_profession_opener_names_its_window() {
         ..Default::default()
     };
     assert_eq!(
-        profession(7411, &opener(3), Some(&lines)),
+        profession(7411, &opener(3), Some(&lines), (1, 1)),
         Some(Profession::Craft(3))
     );
     assert_eq!(
-        profession(3908, &opener(0), Some(&lines)),
+        profession(3908, &opener(0), Some(&lines), (1, 1)),
         Some(Profession::TradeSkill(197))
     );
-    assert_eq!(profession(3908, &opener(0), None), None, "no rows loaded");
     assert_eq!(
-        profession(133, &SpellDisplay::default(), Some(&lines)),
+        profession(3908, &opener(0), None, (1, 1)),
+        None,
+        "no rows loaded"
+    );
+    assert_eq!(
+        profession(133, &SpellDisplay::default(), Some(&lines), (1, 1)),
         None
     );
 }
@@ -320,6 +327,7 @@ fn a_ranged_button_pads_its_range_by_the_selected_target_alone() {
             target: Some(selected),
             guid: Some(SELECTED),
             last: None,
+            lit: None,
         });
         app.insert_non_send_resource(UiScript::new().unwrap());
         add_action_feed(&mut app);
@@ -457,6 +465,7 @@ fn a_melee_button_reaches_the_moving_bonus_while_both_units_run() {
             target: Some(mob),
             guid: Some(SELECTED),
             last: None,
+            lit: None,
         });
         app.insert_non_send_resource(UiScript::new().unwrap());
         add_action_feed(&mut app);
@@ -712,7 +721,6 @@ fn a_broken_worn_weapon_draws_no_equipped_border() {
         app.insert_resource(actions)
             .insert_resource(crate::ui_macro::MacroBoundSpells::default())
             .insert_resource(Spells::empty_for_tests())
-            .add_message::<crate::item_watch::ItemNotice>()
             .add_message::<crate::net::WorldEnterCascadeMessage>()
             .init_resource::<Cooldowns>()
             .init_resource::<crate::spell::SpellModifiers>()
@@ -1159,6 +1167,7 @@ fn select(app: &mut App, guid: Option<u64>) {
         target,
         guid,
         last: None,
+        lit: None,
     });
 }
 
@@ -1197,6 +1206,7 @@ fn edge(
 ) {
     let entity = app.world().resource::<crate::net::GuidIndex>().0[&guid];
     app.world_mut().write_message(crate::net::FieldChanged {
+        at: crate::lanes::stamp(),
         entity,
         guid,
         kind,
@@ -1596,6 +1606,39 @@ fn a_usable_handler_reads_this_frames_target_and_health() {
     );
 }
 
+/// A selection call's usable refresh (`0x4b31c0` at `0x493892`) that runs ahead of the feed's
+/// first pass on a new VM leaves that pass the new VM's: the cooldown list's refresh and flush
+/// counts an earlier VM ran up (`0x6e2e85`, `0x6e3076`) reach it as the state it meets, and it
+/// signals neither `SPELL_UPDATE_USABLE` nor `BAG_UPDATE_COOLDOWN`.
+#[test]
+fn a_calls_refresh_ahead_of_the_feed_leaves_the_new_vm_its_first_pass() {
+    use bevy::ecs::system::RunSystemOnce;
+    let mut app = feed_app(&[], Spells::empty_for_tests(), 5.0);
+    {
+        let mut cds = app.world_mut().resource_mut::<Cooldowns>();
+        cds.usable_refreshes = 3;
+        cds.bag_flushes = 2;
+    }
+    record(&mut app, &["SPELL_UPDATE_USABLE", "BAG_UPDATE_COOLDOWN"]);
+    select(&mut app, Some(OTHER));
+    app.world_mut()
+        .run_system_once(
+            |mut states: super::ActionStates, mut script: NonSendMut<UiScript>| {
+                states.usable_refresh(&mut script).fire(&mut script);
+            },
+        )
+        .expect("the call's refresh runs as a one-shot system");
+    let script = app.world().non_send_resource::<UiScript>();
+    let heard = script.eval::<Vec<String>>("return HEARD").unwrap();
+    assert_eq!(heard, ["SPELL_UPDATE_USABLE"], "the call's own refresh");
+    script.run("HEARD = {}").unwrap();
+
+    assert!(
+        frame(&mut app).is_empty(),
+        "the new VM's first pass hears none"
+    );
+}
+
 /// `BAG_UPDATE_COOLDOWN` (`0x4f93d0`) comes from the item legs alone: `SMSG_ITEM_COOLDOWN`
 /// (`0x6e965b`), the player's start or removal of a spell's records (`0x6e3089`) and its list clear
 /// (`0x6e9721`), and the spell charges watcher (`0x5d9587`). The global cooldown's start
@@ -1636,7 +1679,12 @@ fn bag_update_cooldown_fires_from_the_item_legs_alone() {
 
     cds(&mut app).start_gcd(133, &fireball, now, &mods);
     assert_eq!(frame(&mut app), PAIR, "a cast's global cooldown");
-    cds(&mut app).apply_wire_cooldown(133, 8000, Some(&fireball), now);
+    cds(&mut app).apply_spell_cooldowns(
+        [(133, 8000, Some(&fireball))],
+        &mods,
+        crate::spell::CategoryPad::NoPlayer,
+        now,
+    );
     assert_eq!(frame(&mut app), PAIR, "SMSG_SPELL_COOLDOWN");
     cds(&mut app).apply_wire_item_cooldown(6948, 8690, now);
     assert_eq!(
@@ -1672,16 +1720,6 @@ fn bag_update_cooldown_fires_from_the_item_legs_alone() {
         frame(&mut app),
         [PAIR[0], PAIR[1], "SPELL_UPDATE_USABLE"],
         "a held global cooldown"
-    );
-    app.world_mut()
-        .write_message(crate::item_watch::ItemNotice::SpellCharges {
-            guid: 0x4000_0000_0000_0042,
-            entry: 5512,
-        });
-    assert_eq!(
-        frame(&mut app),
-        ["BAG_UPDATE_COOLDOWN"],
-        "the spell charges watcher"
     );
     assert!(frame(&mut app).is_empty(), "and a quiet frame after");
 }
@@ -1747,6 +1785,97 @@ fn an_item_slots_record_landing_flushes_its_running_cooldown() {
     );
 }
 
+/// The three events a record callback `0x6e2f70` fires (`0x6e2f89`, `0x6e2f8e`).
+const RECORD_FLUSH: [&str; 3] = [
+    "ACTIONBAR_UPDATE_COOLDOWN",
+    "SPELL_UPDATE_COOLDOWN",
+    "BAG_UPDATE_COOLDOWN",
+];
+
+/// Hearthstone's record, its on-use spell 8690.
+fn hearthstone_record() -> benilla_protocol::messages::ItemInfo {
+    benilla_protocol::messages::ItemInfo {
+        use_spell: Some(benilla_protocol::messages::ItemUseSpell {
+            spell_id: 8690,
+            cooldown_ms: -1,
+            category: 0,
+            category_cooldown_ms: -1,
+        }),
+        ..crate::items::test_template("Hearthstone")
+    }
+}
+
+/// The callback `0x6e2f70` is the item cache's, not the asking slot's: a record that lands after
+/// the slot was cleared still flushes its running cooldown (`0x6e2f80`-`0x6e2f8e`).
+#[test]
+fn a_record_landing_after_its_slot_was_cleared_still_flushes() {
+    const HEARTHSTONE: u32 = 6948;
+    let mut app = feed_app(
+        &[(0, HEARTHSTONE, ACTION_KIND_ITEM)],
+        Spells::empty_for_tests(),
+        5.0,
+    );
+    record(&mut app, &RECORD_FLUSH);
+    app.world_mut()
+        .resource_mut::<Cooldowns>()
+        .apply_wire_item_cooldown(HEARTHSTONE, 8690, Instant::now());
+    frame(&mut app);
+    app.world_mut()
+        .resource_mut::<PlayerActions>()
+        .buttons
+        .clear();
+    assert!(
+        frame(&mut app).is_empty(),
+        "the slot is gone, its ask is not"
+    );
+    app.world_mut()
+        .resource_mut::<Items>()
+        .insert_template(HEARTHSTONE, Some(hearthstone_record()));
+    assert_eq!(frame(&mut app), RECORD_FLUSH);
+}
+
+/// `GetContainerItemCooldown` on a bag slot whose record is missing asks it with the callback
+/// `0x6e2f70` (`0x4f9a7f` → `0x6e2efb`), whose landing on a running cooldown fires the pair and
+/// `BAG_UPDATE_COOLDOWN` (`0x6e2f89`, `0x6e2f8e`).
+#[test]
+fn a_bag_query_on_a_missing_record_flushes_when_the_record_lands() {
+    use benilla_ui::script::{ContainerSlot, ContainerState};
+    const HEARTHSTONE: u32 = 6948;
+    let mut app = feed_app(&[], Spells::empty_for_tests(), 5.0);
+    record(&mut app, &RECORD_FLUSH);
+    app.world_mut()
+        .non_send_resource_mut::<UiScript>()
+        .set_container(
+            0,
+            Some(ContainerState {
+                name: None,
+                num_slots: 16,
+                slots: std::collections::HashMap::from([(
+                    1,
+                    ContainerSlot {
+                        item_id: HEARTHSTONE,
+                        count: 1,
+                        ..Default::default()
+                    },
+                )]),
+            }),
+        );
+    app.world_mut()
+        .resource_mut::<Cooldowns>()
+        .apply_wire_item_cooldown(HEARTHSTONE, 8690, Instant::now());
+    frame(&mut app);
+    app.world()
+        .non_send_resource::<UiScript>()
+        .run("GetContainerItemCooldown(0, 1)")
+        .unwrap();
+    assert!(frame(&mut app).is_empty(), "asked, and waiting");
+    app.world_mut()
+        .resource_mut::<Items>()
+        .insert_template(HEARTHSTONE, Some(hearthstone_record()));
+    assert_eq!(frame(&mut app), RECORD_FLUSH);
+    assert!(frame(&mut app).is_empty(), "once");
+}
+
 /// The feed's two halves sit around the unit snapshots, and its signals come ahead of the events
 /// its producers precede. The push half seats the action states before the snapshots, which
 /// `PLAYER_ENTERING_WORLD`'s handlers read. The fire half runs after the snapshots and the
@@ -1755,9 +1884,8 @@ fn an_item_slots_record_landing_flushes_its_running_cooldown() {
 /// It signals before `PLAYER_TARGET_CHANGED` (`0x493892` ahead of `0x49389c`), `UNIT_HEALTH` and
 /// `UNIT_MANA` (the type watchers ahead of the object's bridge at one field, `0x46544a`),
 /// `PLAYER_REGEN_DISABLED` (`0x5ff51b` ahead of `0x5ff533`), `PLAYER_COMBO_POINTS` (`0x5ddff0`)
-/// and the form's cast change (`0x5de011` ahead of `0x5de016`). The bag feed runs ahead of the
-/// push half, whose usable cache each `BAG_UPDATE` refreshes (`0x4f9374`), so the refresh lands in
-/// the update's own frame. Read off the declared graph; skips where bevy carries no system names.
+/// and the form's cast change (`0x5de011` ahead of `0x5de016`). Read off the declared graph; skips
+/// where bevy carries no system names.
 #[test]
 fn the_feed_runs_around_the_snapshots_and_before_the_events_its_producers_precede() {
     use crate::game_plugins::schedule_tests::{census, headless_client, SyncPoints};
@@ -1799,10 +1927,6 @@ fn the_feed_runs_around_the_snapshots_and_before_the_events_its_producers_preced
     let key = |name: &str| named(name).unwrap_or_else(|| panic!("{name} is scheduled"));
     let fire = key("::fire_action_events");
     assert!(
-        later_than(key("::ui_items::feed::feed_containers")).contains(&push),
-        "the bag feed runs before the push half"
-    );
-    assert!(
         later_than(push).contains(&key("::ui_unit::feed_units")),
         "the push half runs before the unit snapshots"
     );
@@ -1815,7 +1939,7 @@ fn the_feed_runs_around_the_snapshots_and_before_the_events_its_producers_preced
     let seen = later_than(fire);
     for later in [
         "::ui_unit::fire_unit_events",
-        "::field_events::fire_field_notices",
+        "::lanes::fire_in_order",
         "::ui_cast::feed_cast_reports",
     ] {
         assert!(
@@ -1937,9 +2061,16 @@ fn the_cache_refreshes_alone_at_a_reload_a_bag_update_and_a_macro_edit() {
     set_mana_quietly(&mut app, 500);
     assert!(frame(&mut app).is_empty());
     app.world_mut()
-        .resource_mut::<crate::ui_items::feed::BagUpdates>()
-        .0 += 1;
-    assert_eq!(frame(&mut app), ["ACTIONBAR_UPDATE_USABLE"], "a BAG_UPDATE");
+        .resource_mut::<crate::item_lane::ItemLane>()
+        .push(crate::item_watch::Run {
+            bags: vec![crate::item_watch::BagEvent::Raise(None)],
+            ..Default::default()
+        });
+    assert_eq!(
+        frame(&mut app),
+        ["ACTIONBAR_UPDATE_USABLE"],
+        "a RaiseBagUpdate, even one that signals nothing (`0x4f9374`)"
+    );
 
     set_mana_quietly(&mut app, 100);
     assert!(frame(&mut app).is_empty());
@@ -2124,4 +2255,51 @@ fn a_macro_bound_to_a_pet_spell_reads_the_pets_gate_power_and_history() {
     // Stunned (0x40000): the gate fails before the cost is read, so nothing is out of power.
     let (usable, oom, ..) = at_a_refresh(500, 0x4_0000);
     assert_eq!((usable, oom), (None, None));
+}
+
+/// `START_AUTOREPEAT_SPELL` and `STOP_AUTOREPEAT_SPELL` fire where the key changes, inside the send
+/// and the stop that change it (`0x6e5952`, `0x6ea170`), never off the frame's feed: a key the
+/// world entry zeroes (`0x6e730b`, which signals nothing) and a VM that arrives with one running
+/// see neither.
+#[test]
+fn the_feed_signals_no_auto_repeat_edge_of_its_own() {
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut app = App::new();
+    app.insert_resource(PlayerActions::default())
+        .insert_resource(crate::ui_macro::MacroBoundSpells::default())
+        .init_resource::<Cooldowns>()
+        .init_resource::<crate::spell::SpellModifiers>()
+        .init_resource::<crate::ui_script::UiClock>()
+        .insert_resource(AutoRepeatActive(Some(75)))
+        .init_resource::<crate::creature_anim::UnitEdits>()
+        .add_message::<crate::player::StandStateRequest>()
+        .init_resource::<crate::spell::PendingCast>()
+        .init_resource::<crate::spell::QueuedMeleeSpell>()
+        .init_resource::<crate::spell::ActiveChannel>()
+        .init_resource::<crate::spell::SpellTargeting>()
+        .init_resource::<crate::spell::HeldForPick>()
+        .init_resource::<Items>()
+        .insert_resource(NetCommands(tx));
+    feed_inputs(&mut app);
+    let script = UiScript::new().unwrap();
+    script
+        .run(
+            r#"SEEN = {}
+            local f = CreateFrame("Frame")
+            f:RegisterEvent("START_AUTOREPEAT_SPELL")
+            f:RegisterEvent("STOP_AUTOREPEAT_SPELL")
+            f:SetScript("OnEvent", function() table.insert(SEEN, event) end)"#,
+        )
+        .unwrap();
+    app.insert_non_send_resource(script);
+    add_action_feed(&mut app);
+    app.update();
+    app.world_mut().resource_mut::<AutoRepeatActive>().0 = None;
+    app.update();
+    let seen = app
+        .world()
+        .non_send_resource::<UiScript>()
+        .eval::<Vec<String>>("return SEEN")
+        .unwrap();
+    assert!(seen.is_empty(), "{seen:?}");
 }

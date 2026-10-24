@@ -31,21 +31,24 @@ mod frames;
 /// The idle handler: the 5-minute auto-sit and auto-AFK, and the 30-minute camp.
 pub(crate) mod idle;
 mod input;
-/// The `SendChatMessage` drain, for the tests that feed it a real group.
-#[cfg(test)]
-pub(crate) use input::drain_addon_chat_sends;
 /// The language gate: the exemptions and fluency lookup behind the chat garble.
 mod language;
 /// `LoggingChat`/`LoggingCombat`: the two log files `/chatlog` and `/combatlog` toggle.
 pub(crate) mod logging;
+#[cfg(test)]
+mod monster_tests;
 mod net;
 #[cfg(test)]
 mod notice_tests;
 /// The `AUTO_JOIN_GUILD_CHANNEL` cascade, the one place the client joins or leaves
 /// `GuildRecruitment - City` on its own.
 mod recruitment;
+/// `/chatlist`'s member list, held on its channel's slot until every name is known.
+mod roster;
 /// The chat windows' saved look: tab tint, alpha and font size, read at login, saved at logout.
 pub(crate) mod settings;
+#[cfg(test)]
+mod slot_tests;
 #[cfg(test)]
 mod tests;
 
@@ -60,7 +63,12 @@ pub(crate) use edit::ChannelState;
 #[cfg(test)]
 pub(crate) use event::event_name;
 pub(crate) use event::{default_color, ChatEvent, ChatEventKind};
-pub(crate) use feed::ChatLog;
+pub(crate) use feed::{Answer, ChatLog};
+/// The chat applier off a bare world, for the tests that send through it.
+#[cfg(test)]
+pub(crate) use input::{chat_world, run_chat};
+/// The host's chat appliers ([`crate::script_calls::ScriptCallHost`]).
+pub(crate) use input::{ChatSender, EmoteDoer};
 
 /// The chat feed once, for a test over the whole client: the `CHAT_MSG_*` fan-out of what the
 /// log holds, with the call host the world lends.
@@ -70,6 +78,35 @@ pub(crate) fn feed_chat_once(world: &mut World) {
     world
         .run_system_once(feed::feed_chat)
         .expect("the chat feeds");
+}
+/// Every resource the chat drain reads, fresh, for a test world that holds the VM and the
+/// net commands itself.
+#[cfg(test)]
+pub(crate) fn insert_drain_reads(world: &mut World) {
+    world.init_resource::<ChatLog>();
+    world.insert_resource(frames::ChatWindows::default());
+    world.insert_resource(edit::ChannelState::default());
+    world.init_resource::<crate::names::NameCache>();
+    world.insert_resource(crate::chat_bubble::BubbleQueue::default());
+    world.insert_resource(crate::chat_bubble::BubbleConfig::default());
+    world.insert_resource(crate::creature_anim::GestureQueue::default());
+    world.init_resource::<crate::net::SelfGuid>();
+    world.init_resource::<crate::net::GuidIndex>();
+    world.insert_resource(crate::world_state::WorldStates::default());
+    world.insert_resource(language::ChatLanguages::default());
+    world.insert_resource(crate::items::Items::default());
+    world.insert_resource(crate::go_templates::GameObjectTemplates::default());
+    world.insert_resource(crate::text_filter::TextFilter::default());
+    world.insert_resource(crate::text_filter::TextFilterSwitches::default());
+}
+/// The submitted-line drain once, for a test over the whole client: the dev and probe lines the
+/// VM holds, with the call host the world lends.
+#[cfg(test)]
+pub(crate) fn drain_chat_input_once(world: &mut World) {
+    use bevy::ecs::system::RunSystemOnce;
+    world
+        .run_system_once(input::drain_chat_input)
+        .expect("the chat input drains");
 }
 /// Test-only: the quest log's rig tees the lines its timers show.
 #[cfg(test)]
@@ -88,6 +125,7 @@ pub(crate) struct ChatDrain;
 impl Plugin for UiChatPlugin {
     fn build(&self, app: &mut App) {
         net::register(app);
+        add_chat_lane(app);
         app.add_observer(combat::on_cvar);
         app.init_resource::<ChatLog>()
             .init_resource::<away::AfkMirror>()
@@ -115,7 +153,7 @@ impl Plugin for UiChatPlugin {
             )
             // The slash-command table needs the VM's globals and the emote catalog, both `Startup`.
             .add_systems(PostStartup, commands::build_slash_commands)
-            // The language gate's feeds, ahead of the chat drain that reads them.
+            // The language gate's feeds, ahead of the chat lane that reads them.
             .add_systems(
                 Update,
                 (
@@ -123,7 +161,7 @@ impl Plugin for UiChatPlugin {
                     language::feed_language_skills,
                     language::feed_default_language,
                 )
-                    .before(feed::feed_chat),
+                    .before(crate::lanes::UiLanes),
             )
             // Descriptor-diff combat-log lines, ahead of the drain so none lands a frame late.
             .add_systems(
@@ -133,47 +171,29 @@ impl Plugin for UiChatPlugin {
                     combat::watch::aura_lines,
                     combat::watch::pet_loyalty_lines,
                 )
-                    .before(feed::feed_chat),
+                    .before(crate::lanes::UiLanes),
             )
             // After the drain, so the log files take the frame's lines in one order.
             .add_systems(
                 Update,
                 frames::tee_shown_lines
-                    .in_set(UiFeed)
-                    .after(feed::feed_chat),
+                    .in_set(crate::lanes::UiLanes)
+                    .after(crate::lanes::fire_in_order),
             )
             // Before the drain, so a broadcast lands on the frame it decodes.
             .add_systems(
                 Update,
-                broadcast::feed_broadcasts
-                    .in_set(crate::ui_script::UiFeed)
-                    .before(feed::feed_chat),
-            )
-            // Only against the in-game VM: the drain takes the whole queue and fires every line,
-            // so a VM with no ChatFrame destroys them. After the unit and guild feeds, as in the
-            // reference: login-burst chat is queued (`0x49cae0`) behind the `[0x8435fc]` latch and
-            // drains at `0x490974`, after `PLAYER_LOGIN` (`0x490959`) and `PLAYER_ENTERING_WORLD`
-            // (`0x49096a`), while `GUILD_MOTD` fires on arrival (`0x5e7288`), so the guild line
-            // precedes the welcome.
-            .add_systems(
-                Update,
-                feed::feed_chat
-                    .in_set(UiFeed)
-                    .after(crate::ui_unit::UnitFeed)
-                    .after(crate::ui_guild::GuildFeed)
-                    .run_if(crate::ui_script::ingame_ui_up),
+                broadcast::feed_broadcasts.in_set(crate::ui_script::UiFeed),
             )
             // The last-input stamp `[0xcf0bc8]`, ungated and ahead of the UI pass: the reference
             // stamps raw input before dispatch, so a key the chat box swallows still counts.
             .add_systems(Update, idle::stamp_input.before(UiInput))
-            // A fresh VM's joined-channel mirror, before the feed so its first line is numbered.
+            // A fresh VM's joined-channel mirror, before the drain so its first line is numbered.
             .add_systems(
                 Update,
-                channels::seed_channels
-                    .in_set(crate::ui_script::UiFeed)
-                    .before(feed::feed_chat),
+                channels::seed_channels.in_set(crate::ui_script::UiFeed),
             )
-            // `RequestTimePlayed()` -> `CMSG_PLAYED_TIME`; `SMSG_PLAYED_TIME` -> `TIME_PLAYED_MSG`.
+            // `SMSG_PLAYED_TIME` -> `TIME_PLAYED_MSG`.
             .add_systems(Update, feed::played_time_bridge.in_set(UiFeed))
             .add_systems(
                 Update,
@@ -185,10 +205,6 @@ impl Plugin for UiChatPlugin {
                     // settled before the idle timer reads it.
                     idle::idle_handler,
                     input::drain_chat_input.in_set(ChatDrain),
-                    // After the box's drain, so a `SendChatMessage` or `SendAddonMessage` from a
-                    // slash handler it just ran goes out this frame.
-                    input::drain_addon_chat_sends,
-                    input::drain_addon_message_sends,
                 )
                     .chain()
                     .in_set(crate::ui_script::UiDrain)
@@ -214,13 +230,37 @@ impl Plugin for UiChatPlugin {
                     .after(benilla_world::terrain_stream::AreaAuthoritySet)
                     .after(crate::player::WorldFocusSet),
             )
+            // After the shutdown's `PLAYER_LOGOUT`, whose handlers read the windows and the
+            // channels as they stood, and before the glue VM goes in.
             .add_systems(
                 OnExit(crate::client_state::ClientState::InWorld),
-                (channels::end_session_channels, end_session_chat),
+                (channels::end_session_channels, end_session_chat)
+                    .in_set(crate::ui_script::SessionEnd::Clears),
             );
         settings::plugin(app);
         logging::plugin(app);
     }
+}
+
+/// The chat lane ([`crate::lanes`]): the lines and the combat edges the packets queue, fired
+/// against the in-game VM only, since a VM with no ChatFrame would destroy them, and after every
+/// feed, as in the reference: login-burst chat is queued (`0x49cae0`) behind the `[0x8435fc]`
+/// latch and drains at `0x490974`, after `PLAYER_LOGIN` (`0x490959`) and `PLAYER_ENTERING_WORLD`
+/// (`0x49096a`), while `GUILD_MOTD` fires on arrival (`0x5e7288`), so the guild line precedes the
+/// welcome. Ahead of each drain the held lines' age pass is queued ([`ChatLog::begin_frame`]).
+pub(crate) fn add_chat_lane(app: &mut App) {
+    use crate::lanes::LaneApp;
+    app.init_resource::<combat::watch::DeathLineAt>();
+    app.init_resource::<ChatLog>().add_lane(
+        "chat",
+        |world| world.get_resource::<ChatLog>()?.peek(),
+        feed::fire_chat,
+        Some(|world| {
+            if let Some(log) = world.get_resource::<ChatLog>() {
+                log.begin_frame();
+            }
+        }),
+    );
 }
 
 /// The chat session end: the undrained feed, which outlives the Lua state, and both windows'

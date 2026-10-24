@@ -247,12 +247,13 @@ fn the_open_menu_takes_the_screen_and_refuses_every_other_panel() {
         "Interface\\FrameXML\\LootFrame.xml",
         "ScrollTemplates.xml",
     ]);
+    s.keep_calls();
     s.set_money(0);
     s.set_container(0, Some(backpack()));
     s.run("MainMenuBarBackpackButton:Click()").unwrap();
     s.set_loot(Some(LootState {
         source_unit: false,
-        fishing: false,
+        has_money: false,
         master_candidates: Vec::new(),
         rows: vec![Some(LootRow {
             item_id: 0,
@@ -708,9 +709,11 @@ fn backpack() -> ContainerState {
     slots.insert(
         1,
         ContainerSlot {
+            uncached_link: None,
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
+            field_duration: 0,
             petition: None,
             already_bound: false,
             occupied_seats: None,
