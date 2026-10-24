@@ -117,7 +117,7 @@ pub(crate) fn auto_clear_line(
 }
 
 /// Fill the first `%s` of a GlobalString, which the reference `snprintf`s; `%%` is a percent.
-fn fill_one(template: &str, arg: &str) -> String {
+pub(super) fn fill_one(template: &str, arg: &str) -> String {
     let mut out = String::with_capacity(template.len() + arg.len());
     let mut chars = template.chars().peekable();
     let mut used = false;
@@ -145,6 +145,12 @@ fn fill_one(template: &str, arg: &str) -> String {
 /// Push one of the four lines into the chat log as `CHAT_MSG_SYSTEM`.
 pub(crate) fn push_system(chat: &ChatLog, line: String) {
     chat.push_event(ChatEvent::text_only(ChatEventKind::System, line));
+}
+
+/// Show one of the four lines inside the verb that prints it, as `0x49a870` does with type 0xa:
+/// its `CHAT_MSG_SYSTEM` fires before the call returns.
+pub(crate) fn show_system(chat: &ChatLog, script: &mut benilla_ui::script::UiScript, line: String) {
+    chat.show_now(script, &ChatEvent::text_only(ChatEventKind::System, line));
 }
 
 /// The last `PLAYER_FLAGS` the reconcile saw; `None` with no local player in the world.
@@ -182,43 +188,41 @@ pub(crate) fn reconcile_afk_mirror(
 pub(crate) fn movement_clears_afk(
     binds: Res<crate::bindings::BindingsState>,
     cvars: Res<crate::cvars::Cvars>,
-    mut hosted_vm: crate::script_calls::HostedVm,
+    // The mirror shares the host's param set, whose chat sends write it too.
+    mut vm: crate::script_calls::VmWith<ResMut<'static, AfkMirror>>,
     commands: Res<crate::net::NetCommands>,
     chat: Res<ChatLog>,
-    mut mirror: ResMut<AfkMirror>,
 ) {
-    hosted_vm.run(|script| {
-        use crate::bindings::Input;
-        if !mirror.is_afk() || cvars.flag("autoClearAFK") == Some(false) {
-            return;
-        }
-        let moved = [
-            Input::Jump,
-            Input::MoveForward,
-            Input::MoveBackward,
-            Input::StrafeLeft,
-            Input::StrafeRight,
-            Input::TurnLeft,
-            Input::TurnRight,
-        ]
-        .iter()
-        .any(|&c| binds.just_pressed(c));
-        if !moved {
-            return;
-        }
-        let line = script
-            .and_then(|s| super::combat::global_string(s, "CLEARED_AFK"))
-            .unwrap_or_default();
-        push_system(&chat, line);
-        mirror.0 = 0;
-        // `ClearAFK`'s own packet: the empty `0x14` the command path sends.
-        let _ = commands.0.send(crate::net::ClientCommand::Chat {
-            kind: crate::net::ChatKind::Afk,
-            target: None,
-            text: String::new(),
-            language: None,
-        });
-    })
+    use crate::bindings::Input;
+    if !vm.own().is_afk() || cvars.flag("autoClearAFK") == Some(false) {
+        return;
+    }
+    let moved = [
+        Input::Jump,
+        Input::MoveForward,
+        Input::MoveBackward,
+        Input::StrafeLeft,
+        Input::StrafeRight,
+        Input::TurnLeft,
+        Input::TurnRight,
+    ]
+    .iter()
+    .any(|&c| binds.just_pressed(c));
+    if !moved {
+        return;
+    }
+    let line = vm
+        .run(|script| script.and_then(|s| super::combat::global_string(s, "CLEARED_AFK")))
+        .unwrap_or_default();
+    push_system(&chat, line);
+    vm.own().0 = 0;
+    // `ClearAFK`'s own packet: the empty `0x14` the command path sends.
+    let _ = commands.0.send(crate::net::ClientCommand::Chat {
+        kind: crate::net::ChatKind::Afk,
+        target: None,
+        text: String::new(),
+        language: None,
+    });
 }
 
 #[cfg(test)]

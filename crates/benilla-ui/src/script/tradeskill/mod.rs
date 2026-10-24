@@ -2,19 +2,52 @@
 //! ([`UiScript::set_trade_skill`]) with recipes resolved from `Spell.dbc`, `SkillLineAbility.dbc`
 //! and bag counts, and drains the intents `DoTradeSkill` and `CloseTradeSkill` queue. The engine
 //! owns the grouped, filtered list (`0x4fca20`); every Lua index, `SetTradeSkillItem`'s included,
-//! is 1-based into its visible rows ([`recipe_at`]). The filter, fold, repeat and close verbs fire
-//! their events inside the call, as the reference's do.
+//! is 1-based into its whole sorted array, the displayed rows first ([`recipe_at`]). The filter,
+//! fold, repeat and close verbs fire their events inside the call, as the reference's do.
 
 use std::collections::HashSet;
 
 mod api;
 mod itemstats;
-mod view;
+pub(crate) mod view;
+
+/// A build's lookups (`0x4fcd4d`): the pending count started again (`0x4fc8cb`) and taken up by
+/// each product whose record is in flight (`0x4fcd58`), each waited on with the callback
+/// `0x4fc8e0`, which no cancel removes (`0x4fc890`).
+fn note_build(model: &mut super::Model) {
+    let misses: Vec<u32> = model
+        .trade_skill
+        .as_ref()
+        .map(|t| t.recipes.iter().filter_map(|r| r.icon_pending).collect())
+        .unwrap_or_default();
+    model.trade_skill_pending = misses.len() as u32;
+    model.trade_skill_build_waits.extend(misses);
+}
+
+impl TradeSkillState {
+    /// Each reagent's carried count from `count` (`0x622130`) and each recipe's makeable count
+    /// from them (`0x4fcce0`-`0x4fcf19`).
+    pub fn recount(&mut self, count: &dyn Fn(u32) -> u32) {
+        for r in &mut self.recipes {
+            for re in &mut r.reagents {
+                re.have = count(re.item);
+            }
+            r.num_available = makeable(r.reagents.iter().map(|re| (re.have, re.need)));
+        }
+    }
+}
+
+/// The build's makeable count (`0x4fcce0`-`0x4fcf19`): the least of each reagent's carried count
+/// over its need, 0 for a recipe with no reagent.
+pub(crate) fn makeable(reagents: impl Iterator<Item = (u32, u32)>) -> u32 {
+    reagents
+        .map(|(have, need)| have / need.max(1))
+        .min()
+        .unwrap_or(0)
+}
 
 #[cfg(test)]
 mod tests;
-
-use view::build_groups;
 
 pub(super) use api::install;
 pub(crate) use view::recipe_at;
@@ -85,8 +118,11 @@ pub struct TradeSkillRecipe {
     pub difficulty: TradeSkillDifficulty,
     /// The least `have / need` over the reagents, reported as `numAvailable`.
     pub num_available: u32,
-    /// The product's icon, else the spell's; `None` while neither has arrived.
+    /// The icon of `EffectItemType[0]`'s item (`0x4fdae0`), `None` on any miss.
     pub icon: Option<String>,
+    /// That item, while its template is in flight: `GetTradeSkillIcon` waits on it with the
+    /// callback `0x4fdc30` (`0x4fdb90`).
+    pub icon_pending: Option<u32>,
     pub min_made: u32,
     pub max_made: u32,
     /// The recipe spell's cooldown as `(start_ms on the GetTime clock, duration_ms, enabled)`,
@@ -105,6 +141,9 @@ pub struct TradeSkillRecipe {
     pub reagents: Vec<TradeSkillReagent>,
     /// The Requirements line's `(tool name, have)` pairs.
     pub tools: Vec<(String, bool)>,
+    /// The totems whose templates are in flight: `GetTradeSkillTools` waits on each with the
+    /// callback `0x4fdc30` (`0x4ffac6`).
+    pub tools_pending: Vec<u32>,
 }
 
 /// One open tradeskill window, pushed whole by the app.
@@ -113,9 +152,12 @@ pub struct TradeSkillState {
     /// The `SkillLine.dbc` id, the persistence key (`0xbde064`).
     pub line: u32,
     pub line_name: String,
+    /// `GetTradeSkillLine`'s rank and maximum: the slot's halves with the permanent bonus
+    /// (`0x4fdd40`); the recipes are banded on the raw value.
     pub rank: u32,
     pub max_rank: u32,
-    /// Unordered: the engine sorts them (`0x4fca20`), and Lua indexes the visible rows, not this.
+    /// In the line's learn order (`0x5e9d72`), which the build refills its array in before it
+    /// sorts (`0x4fca20`); Lua indexes the sorted array, not this.
     pub recipes: Vec<TradeSkillRecipe>,
 }
 
@@ -127,7 +169,7 @@ impl super::UiScript {
     /// selection rides its spell id (`0xbde044`); fold and subclass keys are pruned to live groups,
     /// while the inv-slot mask (`0x84dd64`) is never pruned.
     /// `None` marks the window closed and keeps the list and selection, as the close does
-    /// (`0x4fc870`).
+    /// (`0x4fc870`). After the world-enter init no push builds rows until a rebuild does.
     pub fn set_trade_skill(&mut self, state: Option<TradeSkillState>) {
         let mut model = self.model_mut();
         model.trade_skill_open = state.is_some();
@@ -141,25 +183,112 @@ impl super::UiScript {
                     model.trade_skill_selected_spell = 0;
                     model.trade_skill_last_line = s.line;
                 }
-                model.trade_skill_selection = (model.trade_skill_selected_spell != 0)
-                    .then(|| {
-                        s.recipes
-                            .iter()
-                            .position(|r| r.spell_id == model.trade_skill_selected_spell)
+                let live: HashSet<(u32, u32)> = s
+                    .recipes
+                    .iter()
+                    .map(|r| {
+                        r.group
+                            .as_ref()
+                            .map_or((u32::MAX, u32::MAX), |(c, sc, _)| (*c, *sc))
                     })
-                    .flatten()
-                    .map_or(0, |i| (i + 1) as u32);
-                let live: HashSet<(u32, u32)> = build_groups(&s.recipes)
-                    .into_iter()
-                    .map(|g| g.key)
                     .collect();
                 model.trade_skill_collapsed.retain(|k| live.contains(k));
                 model
                     .trade_skill_subclass_hidden
                     .retain(|k| live.contains(k));
+                // A changed recipe set remakes the headers, as a learn's or the open's build does
+                // (flag 1, `0x5e9d79`, `0x4fc985`).
+                let spells = |recipes: &[TradeSkillRecipe]| {
+                    recipes.iter().map(|r| r.spell_id).collect::<Vec<_>>()
+                };
+                let remake = model
+                    .trade_skill
+                    .as_ref()
+                    .is_none_or(|t| spells(&t.recipes) != spells(&s.recipes));
                 model.trade_skill = Some(s);
+                if !model.trade_skill_unbuilt {
+                    view::build(&mut model, remake);
+                }
             }
         }
+    }
+
+    /// A rebuild with flag 0 (`0x4fca20(0)`), as the bag, item and skill watchers run one on each
+    /// of their runs (`0x4f8e65`, `0x4f8f6d`, `0x4f917c`, `0x5d85be`, `0x5d8788`, `0x5d94d1`,
+    /// `0x5dee70`, `0x5de434`, `0x5de457`), then `TRADE_SKILL_UPDATE` (`0x4fd164`) when it
+    /// signals one ([`Self::rebuild_trade_skill_with`]).
+    pub fn rebuild_trade_skill(&mut self, refresh: &mut dyn FnMut(&mut TradeSkillState)) {
+        if self.rebuild_trade_skill_with(false, refresh) {
+            self.fire_event("TRADE_SKILL_UPDATE", Vec::new());
+        }
+    }
+
+    /// A rebuild with `remake` as its flag (`0x4fca20`): while the window is open, the state read
+    /// again where `refresh` brings the caller's change in, the array refilled in add order and
+    /// sorted, its products' records in flight counted pending (`0xbde048`) and waited on with
+    /// the callback `0x4fc8e0` (`0x4fcd32`). Whether its `TRADE_SKILL_UPDATE` follows: an open
+    /// window with nothing pending, whether or not anything changed (`0x4fcf34`, `0x4fd164`). A
+    /// closed window builds nothing (`0x4fcaee`).
+    pub fn rebuild_trade_skill_with(
+        &mut self,
+        remake: bool,
+        refresh: &mut dyn FnMut(&mut TradeSkillState),
+    ) -> bool {
+        let mut model = self.model_mut();
+        if !model.trade_skill_open {
+            return false;
+        }
+        if let Some(t) = model.trade_skill.as_mut() {
+            refresh(t);
+        }
+        model.trade_skill_unbuilt = false;
+        let complete = view::build(&mut model, remake);
+        note_build(&mut model);
+        complete
+    }
+
+    /// The open's build (`0x4fc985` → `0x4fca20(1)`) over the list the push made: its products'
+    /// records in flight counted and waited on as any build's. Whether its update follows.
+    pub fn trade_skill_open_build(&mut self) -> bool {
+        let mut model = self.model_mut();
+        if std::mem::take(&mut model.trade_skill_unbuilt) {
+            view::build(&mut model, true);
+        }
+        note_build(&mut model);
+        model.trade_skill_pending == 0
+    }
+
+    /// The callback `0x4fc8e0` on a record a build waited on, answered: the pending count down by
+    /// one when above 0 (`0x4fc8f3`), and whether a rebuild with flag 1 follows, at 0 (`0x4fc8f9`,
+    /// `0x4fc900`).
+    pub fn trade_skill_record_landed(&mut self) -> bool {
+        let mut model = self.model_mut();
+        if model.trade_skill_pending > 0 {
+            model.trade_skill_pending -= 1;
+        }
+        model.trade_skill_pending == 0
+    }
+
+    /// The cancel `0x4fc890` on leaving the world (`0x490ae9` → `0x4fc780`): the pending count
+    /// zeroed (`0x4fc8cb`); the callbacks stay, as the cancel's keys miss them.
+    pub fn trade_skill_cancel_waits(&mut self) {
+        self.model_mut().trade_skill_pending = 0;
+    }
+
+    /// The records the builds waited on since the last take, one per miss.
+    pub fn take_trade_skill_build_waits(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.model_mut().trade_skill_build_waits)
+    }
+
+    /// The item records the getters' calls missed since the last take, one per call.
+    pub fn take_trade_skill_item_waits(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.model_mut().trade_skill_item_waits)
+    }
+
+    /// The rows the list holds, headers included: the full count (`0xbde04c`) that
+    /// `TRADE_SKILL_SHOW` waits on at the open (`0x4fc98a`).
+    pub fn trade_skill_full_count(&self) -> usize {
+        self.model_ref().trade_skill_rows.len()
     }
 
     /// Drains the `(spell id, count)` crafts `DoTradeSkill` queued; the app's repeat loop
@@ -222,21 +351,25 @@ impl super::UiScript {
 
     /// The world-enter inits (`0x4908c0` at `0x4909bf` and `0x4909c4`), which a login, a
     /// cross-map worldport and a `/reload` all run, with no event: the tradeskill init `0x4fc750`
-    /// zeroes the selection (`[0xbde044]`), the visible and held counts (`[0xbde04c]`,
-    /// `[0xbde054]`), the line key (`[0xbde064]`), so the next push resets the filters, and the
-    /// armed spell (`[0xbde05c]`, `0x4fc76b`), keeping the count (`[0xbde060]`) and the open marker
-    /// (`[0xbde040]`); the craft init `0x4f5ee0` zeroes the craft open marker (`[0xbdcfb8]`), its
-    /// selection and its count (`[0xbdcfc8]`).
+    /// zeroes the selection (`[0xbde044]`), the row, displayed and header counts (`[0xbde04c]`,
+    /// `[0xbde054]`, `[0xbde050]`), the line key (`[0xbde064]`), so the next push resets the
+    /// filters, and the armed spell (`[0xbde05c]`, `0x4fc76b`), keeping the count (`[0xbde060]`)
+    /// and the open line (`[0xbde040]`), whose list waits for the next rebuild; the craft init
+    /// `0x4f5ee0` zeroes the craft type (`[0xbdcfb8]`), which closes its window, its selection and
+    /// its counts (`[0xbdcfbc]`-`[0xbdcfc8]`).
     pub fn reset_crafts_on_world_enter(&mut self) {
         let mut model = self.model_mut();
-        model.trade_skill = None;
-        model.trade_skill_selection = 0;
+        model.trade_skill_rows.clear();
+        model.trade_skill_headers.clear();
+        model.trade_skill_visible = 0;
+        model.trade_skill_unbuilt = true;
         model.trade_skill_selected_spell = 0;
         model.trade_skill_last_line = 0;
         model.trade_skill_repeat_spell = 0;
         model.craft = None;
         model.craft_open = false;
         model.craft_selection = 0;
+        super::craft::build(&mut model);
     }
 
     /// Seat the repeat count a previous VM left (`[0xbde060]`), which the world-enter init keeps

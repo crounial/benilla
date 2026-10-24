@@ -1394,6 +1394,11 @@ pub(super) fn writer_loop(
                         packed,
                         target_guid,
                     } => w.pet_action(pet_guid, packed, target_guid),
+                    ClientCommand::PetCastSpell {
+                        caster_guid,
+                        spell_id,
+                        target,
+                    } => w.pet_cast_spell(caster_guid, spell_id, target),
                     ClientCommand::PetSetAction { pet_guid, entries } => {
                         w.pet_set_action(pet_guid, &entries)
                     }
@@ -1407,18 +1412,21 @@ pub(super) fn writer_loop(
                         enabled,
                     } => w.pet_spell_autocast(pet_guid, spell_id, enabled),
                     ClientCommand::PetAbandon { pet_guid } => w.pet_abandon(pet_guid),
+                    ClientCommand::RequestPetInfo => w.request_pet_info(),
                     ClientCommand::PetRename { pet_guid, name } => w.pet_rename(pet_guid, &name),
                     ClientCommand::AttackSwing { guid } => w.attack_swing(guid),
                     ClientCommand::AttackStop => w.attack_stop(),
                     ClientCommand::SetSheathed { state } => w.set_sheathed(state),
                     ClientCommand::StandStateChange { state } => w.stand_state_change(state),
                     ClientCommand::MountSpecial => w.mount_special(),
+                    ClientCommand::Emote { emote } => w.emote(emote),
                     ClientCommand::TextEmote { text_id, target } => w.text_emote(text_id, target),
                     ClientCommand::GossipHello { guid } => w.gossip_hello(guid),
-                    ClientCommand::GossipSelectOption { guid, option } => {
-                        // No code is sent: coded options are greyed, never selected.
-                        w.gossip_select_option(guid, option, None)
-                    }
+                    ClientCommand::GossipSelectOption {
+                        guid,
+                        option,
+                        code,
+                    } => w.gossip_select_option(guid, option, code.as_deref()),
                     ClientCommand::NpcTextQuery { text_id, guid } => w.npc_text_query(text_id, guid),
                     ClientCommand::ListInventory { guid } => w.list_inventory(guid),
                     ClientCommand::BuyItem {
@@ -1566,6 +1574,9 @@ pub(super) fn writer_loop(
                         spell_id,
                         item_guid,
                     } => w.cast_spell_item(spell_id, item_guid),
+                    ClientCommand::CastSpellTradeItem { spell_id, slot } => {
+                        w.cast_spell_trade_item(spell_id, slot)
+                    }
                     ClientCommand::LootMasterGive { guid, slot, target } => {
                         w.loot_master_give(guid, slot, target)
                     }
@@ -1634,9 +1645,11 @@ pub(super) fn writer_loop(
                     ClientCommand::MailDelete { mailbox, mail_id } => {
                         w.mail_delete(mailbox, mail_id)
                     }
-                    ClientCommand::MailCreateTextItem { mailbox, mail_id } => {
-                        w.mail_create_text_item(mailbox, mail_id)
-                    }
+                    ClientCommand::MailCreateTextItem {
+                        mailbox,
+                        mail_id,
+                        template_id,
+                    } => w.mail_create_text_item(mailbox, mail_id, template_id),
                     ClientCommand::ItemTextQuery { text_id, mail_id } => {
                         w.item_text_query(text_id, mail_id)
                     }
@@ -1700,7 +1713,7 @@ pub(super) fn writer_loop(
                     ClientCommand::BeginTrade => w.begin_trade(),
                     ClientCommand::BusyTrade => w.busy_trade(),
                     ClientCommand::IgnoreTrade => w.ignore_trade(),
-                    ClientCommand::AcceptTrade => w.accept_trade(),
+                    ClientCommand::AcceptTrade { flag } => w.accept_trade(flag),
                     ClientCommand::UnacceptTrade => w.unaccept_trade(),
                     ClientCommand::CancelTrade => w.cancel_trade(),
                     ClientCommand::SetTradeGold { copper } => w.set_trade_gold(copper),
@@ -1760,6 +1773,7 @@ pub(super) fn writer_loop(
                         threshold,
                     } => w.loot_method(method, master, threshold),
                     ClientCommand::SetRaidTarget { icon, guid } => w.raid_target_set(icon, guid),
+                    ClientCommand::RequestRaidTargets => w.raid_target_request(),
                     ClientCommand::MinimapPing { x, y } => w.minimap_ping(x, y),
                     ClientCommand::GroupChangeSubGroup { name, group } => {
                         w.group_change_sub_group(&name, group)
@@ -1771,7 +1785,7 @@ pub(super) fn writer_loop(
                         w.group_assistant_leader(guid, grant)
                     }
                     ClientCommand::ReadyCheckStart => w.ready_check_start(),
-                    ClientCommand::ReadyCheckAnswer { ready } => w.ready_check_answer(ready),
+                    ClientCommand::ReadyCheckAnswer { status } => w.ready_check_answer(status),
                     ClientCommand::RequestRaidInfo => w.request_raid_info(),
                     ClientCommand::ResetInstances => w.reset_instances(),
                     ClientCommand::DuelAccepted { arbiter } => w.duel_accepted(arbiter),

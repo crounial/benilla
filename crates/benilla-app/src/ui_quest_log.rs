@@ -7,8 +7,9 @@
 //! reads two message queues and the engine's ask lists.
 //!
 //! The quest-update packets' toasts are shown from here: `SMSG_QUESTUPDATE_ADD_ITEM`,
-//! `_ADD_KILL` and `_COMPLETE`, each with its `QUEST_WATCH_UPDATE`. Abandons, shares and the
-//! slot watcher's accept line drain from here too.
+//! `_ADD_KILL` and `_COMPLETE`, each with its `QUEST_WATCH_UPDATE`, and the slot watcher's accept
+//! line drains from here too; abandons and shares send in their calls
+//! ([`crate::ui_quest::QuestVerbs`]).
 
 use std::collections::{HashMap, HashSet};
 
@@ -25,13 +26,14 @@ use benilla_ui::script::{
 };
 
 use crate::field_watch::FieldNotice;
-use crate::item_watch::ItemNotice;
 use crate::names::NameCache;
 use crate::net::{ClientCommand, Guid, NetCommands, ObjectStore, SelfPlayer};
 use crate::query_cache::{Ask, QueryCache};
 use crate::ui_action::Spells;
 use crate::ui_script::UiFeed;
 use crate::ui_unit::UnitFeed;
+
+pub(crate) use net::{on_item_bought, ItemBook};
 
 /// Marks a GameObject objective's entry on the wire (vmangos `Quest.cpp:512-516`).
 const GO_OBJECTIVE_BIT: u32 = 0x8000_0000;
@@ -45,7 +47,7 @@ pub(crate) struct QuestLog {
     refused: Vec<u32>,
     /// The fold mask and the selected quest a dying VM left ([`fold_dying_vm_quest_folds`]),
     /// seated in the next.
-    folds: (HashSet<String>, Option<u32>),
+    folds: benilla_ui::script::QuestLogCarry,
     /// The quest-update toasts the handlers resolved, shown by the next feed.
     toasts: Vec<Toast>,
     /// `(quest id, item id, count)` pairs of an added item whose quest record was not cached, held
@@ -274,7 +276,7 @@ mod net {
 
     /// What an added item's toast reads off the player: the bags and the item cache.
     #[derive(SystemParam)]
-    struct ItemBook<'w, 's> {
+    pub(crate) struct ItemBook<'w, 's> {
         self_q: Query<'w, 's, &'static ObjectStore, With<SelfPlayer>>,
         objects: Objects<'w, 's>,
         items: Res<'w, Items>,
@@ -351,6 +353,21 @@ mod net {
                     return;
                 }
             }
+        }
+    }
+
+    /// `SMSG_BUY_ITEM`'s quest progress (`0x5dced0`): the merchant handler's bought row, its item
+    /// (`[+4]`) and the bought count, through the same walk over the 20 log slots
+    /// (`0x5dcf70`-`0x5dd02e`), which `0x5dd060` ends on the first quest needing the item.
+    pub(crate) fn on_item_bought(
+        In(bought): In<Option<(u32, u32)>>,
+        book: ItemBook,
+        quest_log: ResMut<QuestLog>,
+        script: Option<NonSend<UiScript>>,
+    ) {
+        if let Some((item_id, count)) = bought {
+            let ev = SessionEvent::QuestObjectiveItem { item_id, count };
+            on_item_added(In(ev), book, quest_log, script);
         }
     }
 
@@ -494,8 +511,8 @@ impl Plugin for UiQuestLogPlugin {
         net::register(app);
         crate::query_cache::register::<QuestLog>(app);
         app.init_resource::<QuestLog>()
-            .add_message::<ItemNotice>()
-            .add_message::<FieldNotice>()
+            .init_resource::<crate::item_lane::ItemLane>()
+            .init_resource::<crate::field_watch::NoticeLane>()
             .add_systems(
                 Startup,
                 (load_quest_header_names, load_quest_tag_names)
@@ -510,8 +527,6 @@ impl Plugin for UiQuestLogPlugin {
                         .in_set(crate::ui_unit::WorldEnterSeats),
                     // Before the script tick, so `QuestTimerFrame` reads this frame's clock.
                     feed_server_clock.in_set(UiFeed),
-                    drain_quest_log_abandons.in_set(crate::ui_script::UiDrain),
-                    drain_quest_log_pushes.in_set(crate::ui_script::UiDrain),
                 ),
             );
     }
@@ -625,6 +640,7 @@ fn record_view(t: &QuestTemplate, tables: &RecordTables) -> QuestRecordView {
         end_text: t.end_text.clone(),
         required_money,
         reward_money,
+        reward_money_max_level: t.money_max_level as i32,
         rewards: set(&t.rewards),
         choices: set(&t.choices),
         // Quest text arrives with its `$N`, `$B`, `$G` and `$<n>w` macros unexpanded.
@@ -716,50 +732,45 @@ pub(crate) struct QuestLogReads<'w, 's> {
 
 /// The quest log's feed. A new VM or player is seated with every cached record and the slots;
 /// otherwise the frame lands the templates the packets brought, answers the engine's asks, keeps
-/// the held counts current when the bags or the slots moved, runs the item-change trigger
-/// (`0x4df7b0`) for each item notice that carries it, fires the callbacks whose records landed,
-/// and shows the quest-update toasts. An idle frame does none of it.
+/// the held counts current when the bags or the slots moved, fires the callbacks whose records
+/// landed, and shows the quest-update toasts. The item-change trigger (`0x4df7b0`) runs in its
+/// item watcher's run on the item lane ([`crate::item_lane`]), after this. An idle frame does
+/// none of it.
+#[allow(clippy::type_complexity)] // the VM beside the window its latch refreshes
 pub(crate) fn feed_quest_log(
-    mut hosted_vm: crate::script_calls::HostedVm,
+    // The questgiver window is the host's too: the latch's refresh is bumped after the VM's run.
+    mut vm: ParamSet<(
+        crate::script_calls::HostedVm,
+        ResMut<crate::ui_quest::QuestGiver>,
+    )>,
     reads: QuestLogReads,
     mut quest_log: ResMut<QuestLog>,
     // The toasts are message-catalog rows, whose surface and sound the sink reads.
     mut sink: crate::ui_action::MessageSink,
     // The accept line's queue.
     mut quest_lines: ResMut<crate::ui_quest::QuestLines>,
-    // The latch's quest-giver refresh.
-    mut quest_giver: ResMut<crate::ui_quest::QuestGiver>,
-    mut item_notices: MessageReader<ItemNotice>,
-    mut field_notices: MessageReader<FieldNotice>,
+    // The item watchers' runs and the notices still to fire this frame: the lanes' drain follows
+    // every feed.
+    item_runs: Res<crate::item_lane::ItemLane>,
+    field_notices: Res<crate::field_watch::NoticeLane>,
     mut memo: Local<crate::ui_script::VmMemo<FeedMemo>>,
 ) {
-    hosted_vm.run(|script| {
+    let refreshes = vm.p0().run(|script| {
         let Some(script) = script else {
-            return;
+            return 0;
         };
         let memo = memo.get(script);
         let Some((store, guid)) = reads.self_q.iter().next() else {
             if memo.player.take().is_some() {
                 script.set_quest_log_player(false);
             }
-            return;
+            return 0;
         };
         let store = &store.0;
         let slots_moved = field_notices
-            .read()
+            .iter()
             .any(|n| matches!(n, FieldNotice::QuestLog));
-        let mut item_changes: Vec<u32> = Vec::new();
-        let mut bags_moved = !reads.changed_items.is_empty();
-        for notice in item_notices.read() {
-            bags_moved = true;
-            // `0x4df7b0`'s three callers: the record set up, the stack count, the deactivation.
-            if let ItemNotice::Record { entry, .. }
-            | ItemNotice::StackCount { entry, .. }
-            | ItemNotice::Destroyed { entry, .. } = *notice
-            {
-                item_changes.push(entry);
-            }
-        }
+        let bags_moved = !reads.changed_items.is_empty() || item_runs.notices().next().is_some();
 
         let seat = memo.player != Some(guid.0);
         // The rebuild's misses, each looked up with a callback (`0x4de65f`) below.
@@ -924,20 +935,19 @@ pub(crate) fn feed_quest_log(
         for _ in 0..std::mem::take(&mut quest_log.faction_rank_moves) {
             script.quest_log_faction_rank_changed();
         }
-        // What the expiry latch owes the givers (`0x4df531`).
-        if script.take_quest_giver_refreshes() > 0 {
-            quest_giver.bump_reask();
-        }
+        // What the expiry latch owes the givers (`0x4df531`), bumped once the VM is free.
+        let refreshes = script.take_quest_giver_refreshes();
         // The update packets lead the object updates they report (vmangos `Player.cpp:10249`, and
         // the kill's counter `:14570` before `:14575`), so the toasts go first.
         if !quest_log.toasts.is_empty() {
             show_toasts(&mut quest_log, script, &mut sink);
         }
-        for entry in item_changes {
-            script.quest_item_changed(entry);
-        }
         script.flush_quest_log_refires();
-    })
+        refreshes
+    });
+    if refreshes > 0 {
+        vm.p1().bump_reask();
+    }
 }
 
 /// The quest-update toasts the handlers resolved, each its catalog row, then `QUEST_WATCH_UPDATE`
@@ -1026,39 +1036,6 @@ fn load_quest_tag_names(mut commands: Commands, assets: Option<Res<benilla_asset
     }
 }
 
-/// `QuestLogPushQuest()`: the quest id taken at the click goes out; the server finds the party.
-fn drain_quest_log_pushes(
-    mut hosted_vm: crate::script_calls::HostedVm,
-    commands: Res<NetCommands>,
-) {
-    hosted_vm.run(|script| {
-        let Some(script) = script else {
-            return;
-        };
-        for quest in script.take_quest_log_pushes() {
-            debug!("ui_quest_log: sharing quest {quest} with the party");
-            let _ = commands.0.send(ClientCommand::PushQuestToParty { quest });
-        }
-    })
-}
-
-/// `AbandonQuest()`'s sends: the slot of the row the engine found for the marked quest
-/// (`0x4df070`).
-fn drain_quest_log_abandons(
-    mut hosted_vm: crate::script_calls::HostedVm,
-    commands: Res<NetCommands>,
-) {
-    hosted_vm.run(|script| {
-        let Some(script) = script else {
-            return;
-        };
-        for slot in script.take_quest_log_abandons() {
-            debug!("ui_quest_log: abandon slot {slot}");
-            let _ = commands.0.send(ClientCommand::QuestlogRemove { slot });
-        }
-    })
-}
-
 /// Quest-log fixtures for a bare VM: records and slots seated as the feed seats them.
 #[cfg(test)]
 mod tests {
@@ -1092,10 +1069,13 @@ mod tests {
         std::array::from_fn(|_| obj(0, 0, 0, 0, ""))
     }
 
-    /// Quest `quest_id` in group 0, the reference's missing header, so it is row 2.
+    /// Quest `quest_id` in group 0, the reference's missing header, so it is row 2. Its level is
+    /// its id, so the rows sort in id order (`0x4decd9`), where one level and title would leave
+    /// them in `qsort`'s.
     fn quest_template(quest_id: u32, objectives: [QuestObjective; 4]) -> QuestTemplate {
         let mut t = crate::ui_quest::test_template(quest_id, "A Threat Within", 0);
         t.zone_or_sort = 0;
+        t.level = quest_id;
         t.objectives = objectives;
         t
     }
@@ -1234,7 +1214,7 @@ mod tests {
 
     // ── The feed over one player ────────────────────────────────────────────────────────────────
 
-    /// The feed, the quest log's field watcher and the abandon drain over one player, the script
+    /// The feed and the quest log's field watcher over one player, the script
     /// logging the quest events as `name:arg1`.
     struct Rig {
         app: App,
@@ -1257,10 +1237,9 @@ mod tests {
                 .init_resource::<crate::sound::MessageSounds>()
                 .init_resource::<crate::ui_quest::QuestLines>()
                 .init_resource::<crate::ui_quest::QuestGiver>()
-                .init_resource::<crate::ui_unit::field_events::FieldNoticeCursor>()
                 .init_resource::<QuestLog>()
-                .add_message::<ItemNotice>()
-                .add_message::<FieldNotice>();
+                .init_resource::<crate::item_lane::ItemLane>()
+                .init_resource::<crate::field_watch::NoticeLane>();
             net::register(&mut app);
             for t in templates {
                 app.world_mut()
@@ -1277,7 +1256,7 @@ mod tests {
                 (
                     feed_quest_log,
                     crate::ui_unit::field_events::fire_field_notices,
-                    drain_quest_log_abandons,
+                    crate::item_lane::fire_item_lane,
                 )
                     .chain(),
             );
@@ -1347,18 +1326,41 @@ mod tests {
         /// A values block that moved the log: the slots and the watcher's notice.
         fn set_log(&mut self, log: &[u32]) {
             self.write_log(log);
-            self.app.world_mut().write_message(FieldNotice::QuestLog);
+            self.app
+                .world_mut()
+                .resource_mut::<crate::field_watch::NoticeLane>()
+                .write(FieldNotice::QuestLog);
         }
 
         /// A values block that moved slot 0's timer word alone.
         fn touch_log(&mut self, timer: u32) {
             self.fields.insert(FIELD_PLAYER_QUEST_LOG_1_1 + 2, timer);
             self.write_store();
-            self.app.world_mut().write_message(FieldNotice::QuestLog);
+            self.app
+                .world_mut()
+                .resource_mut::<crate::field_watch::NoticeLane>()
+                .write(FieldNotice::QuestLog);
         }
 
-        fn notify(&mut self, notice: ItemNotice) {
-            self.app.world_mut().write_message(notice);
+        /// The run of `notice`'s watcher, with no signals, on the item lane.
+        fn notify(&mut self, notice: crate::item_watch::ItemNotice) {
+            self.notify_with(notice, Vec::new());
+        }
+
+        /// The run of `notice`'s watcher, ending in `signals`, on the item lane.
+        fn notify_with(
+            &mut self,
+            notice: crate::item_watch::ItemNotice,
+            signals: Vec<FieldNotice>,
+        ) {
+            self.app
+                .world_mut()
+                .resource_mut::<crate::item_lane::ItemLane>()
+                .push(crate::item_watch::Run {
+                    notice: Some(notice),
+                    signals,
+                    ..Default::default()
+                });
         }
 
         /// A backpack stack as the wire leaves it: the item's own descriptor, and the player's slot
@@ -1763,7 +1765,7 @@ mod tests {
         assert_eq!(rig.eval(board), "Wolf Pelt: 4/5");
 
         rig.set_stack(0, 0x100, 3);
-        rig.notify(ItemNotice::StackCount {
+        rig.notify(crate::item_watch::ItemNotice::StackCount {
             guid: 0x100,
             entry: WOLF_PELT,
         });
@@ -1771,16 +1773,55 @@ mod tests {
         assert_eq!(rig.eval(board), "Wolf Pelt: 3/5", "the dip the split makes");
 
         rig.set_stack(1, 0x101, 1);
-        rig.notify(ItemNotice::Record {
+        rig.notify(crate::item_watch::ItemNotice::Record {
             guid: 0x101,
             entry: WOLF_PELT,
         });
-        rig.notify(ItemNotice::Seat {
+        rig.notify(crate::item_watch::ItemNotice::Seat {
             old: None,
             new: Some(WOLF_PELT),
         });
         assert_eq!(rig.frame(), [QLU], "the seat itself runs no trigger");
         assert_eq!(rig.eval(board), "Wolf Pelt: 4/5");
+    }
+
+    /// The quest log's ask for an item runs inside its watcher's run, at the handler's place: the
+    /// stack count's after the slot's signal (`0x5d950e` before `0x5d9519`), the record set-up's
+    /// ahead of the owner's (`0x5d85d9` before `0x5d8606`).
+    #[test]
+    fn the_logs_item_ask_runs_at_its_place_in_the_watchers_run() {
+        let mut rig = Rig::new(vec![pelt_quest()], &[7]);
+        rig.cache_pelt();
+        rig.set_stack(0, 0x100, 4);
+        rig.frame();
+        rig.enter_world();
+        rig.script()
+            .run(
+                "local g = CreateFrame('Frame') g:RegisterEvent('UNIT_INVENTORY_CHANGED') \
+                 g:SetScript('OnEvent', function() table.insert(SEEN, event .. ':' .. arg1) end)",
+            )
+            .unwrap();
+        let slot = FieldNotice::Player {
+            id: crate::field_watch::id::UNIT_INVENTORY_CHANGED,
+        };
+        rig.set_stack(0, 0x100, 3);
+        rig.notify_with(
+            crate::item_watch::ItemNotice::StackCount {
+                guid: 0x100,
+                entry: WOLF_PELT,
+            },
+            vec![slot],
+        );
+        assert_eq!(rig.frame(), ["UNIT_INVENTORY_CHANGED:player", QLU]);
+        rig.set_stack(1, 0x101, 1);
+        rig.notify_with(
+            crate::item_watch::ItemNotice::Record {
+                guid: 0x101,
+                entry: WOLF_PELT,
+            },
+            vec![slot],
+        );
+        assert_eq!(rig.frame(), [QLU, "UNIT_INVENTORY_CHANGED:player"]);
     }
 
     /// A pickup is `SMSG_QUESTUPDATE_ADD_ITEM` ahead of the item's update (`Player.cpp:10249`):
@@ -1797,7 +1838,7 @@ mod tests {
             count: 1,
         });
         rig.set_stack(0, 0x100, 5);
-        rig.notify(ItemNotice::StackCount {
+        rig.notify(crate::item_watch::ItemNotice::StackCount {
             guid: 0x100,
             entry: WOLF_PELT,
         });
@@ -1872,16 +1913,13 @@ mod tests {
         // With the popup up, fold Z1: B moves to row 3 and C takes row 4.
         rig.script().run("CollapseQuestHeader(1)").unwrap();
         rig.frame();
+        // The call is kept for the test: the host sends its slot ([`crate::ui_quest::QuestVerbs`]).
+        rig.script().keep_calls();
         rig.script().run("AbandonQuest()").unwrap();
-        rig.frame();
-        let sent: Vec<_> = rig
-            .sent()
-            .into_iter()
-            .filter(|c| matches!(c, ClientCommand::QuestlogRemove { .. }))
-            .collect();
-        assert!(
-            matches!(sent.as_slice(), [ClientCommand::QuestlogRemove { slot: 1 }]),
-            "the abandon removes B's slot (1), never C's (2): {sent:?}"
+        assert_eq!(
+            rig.script().take_quest_log_abandons(),
+            [1],
+            "the abandon removes B's slot (1), never C's (2)"
         );
     }
 

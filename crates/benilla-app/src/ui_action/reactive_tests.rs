@@ -84,11 +84,11 @@ fn app() -> App {
         .insert_resource(NetCommands(tx))
         // The usable refresh's callers and the cast targeting the walk reads.
         .add_message::<crate::net::FieldChanged>()
-        .add_message::<crate::item_watch::ItemNotice>()
         .add_message::<crate::net::WorldEnterCascadeMessage>()
         .insert_resource(crate::net::SelfGuid(Some(ME)))
         .init_resource::<crate::spell::AutoSelfCast>()
-        .init_resource::<super::state::ActionEvents>();
+        .init_resource::<super::state::ActionEvents>()
+        .init_resource::<super::state::ActionStateMemory>();
     seat(&mut app);
     app.insert_non_send_resource(listener());
     app.add_systems(
@@ -150,6 +150,7 @@ fn step(app: &mut App, aura_state: u32) -> Vec<String> {
     store.0 = ObjectFields::from_pairs(&[(22, 100), (23, 500), (AURA_STATE, aura_state)]);
     if old != aura_state {
         app.world_mut().write_message(crate::net::FieldChanged {
+            at: crate::lanes::stamp(),
             entity,
             guid: ME,
             kind: benilla_protocol::messages::ObjectType::Player,
@@ -287,6 +288,7 @@ fn select(app: &mut App, guid: u64) {
         target: None,
         guid: Some(guid),
         last: None,
+        lit: None,
     });
 }
 

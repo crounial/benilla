@@ -282,11 +282,13 @@ fn open_window(
 }
 
 fn service_probe(
-    mut vm: crate::script_calls::VmWith<ResMut<'static, MerchantOpen>>,
+    mut vm: crate::script_calls::VmWith<(
+        ResMut<'static, MerchantOpen>,
+        ResMut<'static, GossipState>,
+        ResMut<'static, QuestGiver>,
+    )>,
     time: ProbeClock,
     mut probe: ResMut<ServiceProbe>,
-    mut gossip: ResMut<GossipState>,
-    mut giver: ResMut<QuestGiver>,
     mut trainer: ResMut<TrainerOpen>,
     // `[0xb4e2d0]`'s mirror, what the re-click gate reads: armed by a window and only by one.
     interact: Res<InteractNpc>,
@@ -298,7 +300,17 @@ fn service_probe(
     net: Res<NetCommands>,
     mut exit: MessageWriter<AppExit>,
 ) {
-    vm.turn(|script, mut merchant| {
+    // The cursor legs pick up through the binding and read the bags through Lua, with the host
+    // lent so a call that Lua makes applies inside its verb; the rest is an engine turn over the
+    // merchant, gossip and questgiver windows.
+    let lent = matches!(
+        probe.phase,
+        Phase::VendorArm { .. } | Phase::VendorSell { .. }
+    );
+    let mut step = |script: Option<&mut UiScript>,
+                    mut merchant: Option<&mut MerchantOpen>,
+                    mut gossip: Option<&mut GossipState>,
+                    mut giver: Option<&mut QuestGiver>| {
         if self_player.is_empty() {
             return; // not in-world yet
         }
@@ -309,6 +321,10 @@ fn service_probe(
                 hop(&mut probe, &net, 0, 0, now);
             }
             Phase::Hop { i, hop: h, sent_at } => {
+                let (Some(gossip), Some(giver)) = (gossip.as_deref_mut(), giver.as_deref_mut())
+                else {
+                    return;
+                };
                 if now - sent_at < SETTLE_SECS {
                     return;
                 }
@@ -483,8 +499,12 @@ fn service_probe(
                 };
             }
             Phase::Await { i, since, guid } => {
+                let (Some(gossip), Some(giver)) = (gossip.as_deref_mut(), giver.as_deref_mut())
+                else {
+                    return;
+                };
                 let leg = &LEGS[i];
-                match open_window(guid, &gossip, &giver, &trainer) {
+                match open_window(guid, gossip, giver, &trainer) {
                     Some(open) if open == leg.want_window => {
                         info!(
                             "PROBE_SERVICE: PASS ({}) — {:?} window open on {guid:#x}{}",
@@ -569,6 +589,10 @@ fn service_probe(
             }
             // ── The vendor fork ──────────────────────────────────────────────────
             Phase::VendorHop { sent_at } => {
+                let (Some(gossip), Some(giver)) = (gossip.as_deref_mut(), giver.as_deref_mut())
+                else {
+                    return;
+                };
                 if now - sent_at < SETTLE_SECS {
                     return;
                 }
@@ -594,7 +618,9 @@ fn service_probe(
                 gossip.clear();
                 giver.clear();
                 trainer.clear();
-                merchant.clear();
+                if let Some(merchant) = merchant.as_deref_mut() {
+                    merchant.clear();
+                }
 
                 // The empty-cursor leg. The arm is asserted: a vendor with a GOSSIP bit takes the
                 // gossip arm.
@@ -630,7 +656,7 @@ fn service_probe(
                 }
             }
             Phase::VendorOpen { since, guid } => {
-                if merchant.vendor == Some(guid) {
+                if let Some(merchant) = merchant.as_deref_mut().filter(|m| m.vendor == Some(guid)) {
                     info!(
                         "PROBE_SERVICE: PASS (vendor fork, empty cursor) — merchant window open on \
                          {guid:#x}: the zero leg is still the plain list open"
@@ -796,7 +822,19 @@ fn service_probe(
                 });
             }
         }
-    })
+    };
+    if lent {
+        vm.run(|script| step(script, None, None, None));
+    } else {
+        vm.turn(|script, (mut merchant, mut gossip, mut giver)| {
+            step(
+                script,
+                Some(&mut *merchant),
+                Some(&mut *gossip),
+                Some(&mut *giver),
+            )
+        });
+    }
 }
 
 /// The open quest panel's shape, for the PASS line.

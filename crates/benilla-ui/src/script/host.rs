@@ -4,6 +4,14 @@
 //! reaches `ArmCastTargets 0x6e5250` through direct calls, so `SpellIsTargeting()` (`0x6e6cd0`) on
 //! the script's next line reads the armed word. The reference has no queue between a verb and its
 //! effect, so a call made with no host lent is refused with a Lua error.
+//!
+//! Two engine steps hold the host's state while they run, so neither can lend it: an engine turn
+//! ([`UiScript::host_out`]) and a call's apply ([`CallHost::apply`]). The handlers either fires
+//! (an event's listeners, a widget's script) are held ([`holding`]) and run as soon as the host
+//! is back, in the order fired, so a call a handler makes applies in place, inside its verb, as
+//! the reference's does: they read the state the step left, not the state at the signal. An apply
+//! that goes on after a signal, as the reference's verb does, lends the host back there
+//! ([`UiScript::signal_point`]), so what it held runs before its next step.
 
 use std::cell::Cell;
 use std::ptr::NonNull;
@@ -16,8 +24,9 @@ use super::{ScriptCall, UiScript};
 pub trait CallHost {
     /// Apply `call`, with the input events it was made under raised. The host is out of the VM
     /// while this runs, so a call a handler makes meanwhile waits, and applies next, ahead of any
-    /// made after this one. Whatever must run Lua with the host back in place (an event this call
-    /// signals, a macro's lines) is returned as the tail.
+    /// made after this one, or at a signal point the apply reaches ([`UiScript::signal_point`]).
+    /// Whatever must run Lua with the host back in place (an event this call signals, a macro's
+    /// lines) is returned as the tail.
     fn apply(&mut self, script: &mut UiScript, call: ScriptCall) -> Option<CallTail>;
 }
 
@@ -38,10 +47,18 @@ struct HostSlot {
     /// The lends and the engine turns ([`UiScript::host_out`]) running now. While any is, a call
     /// is the host's: it applies at once with the host in the slot, else as soon as it is back.
     open: Cell<u32>,
+    /// An engine step that cannot lend the host is running (an engine turn, or a call's apply) and
+    /// no Lua it ran since: a handler fired now is held for the host ([`holding`]).
+    hold: Cell<bool>,
+    /// The deferred stretches running now ([`UiScript::defer`]): while any is, every handler fired
+    /// is held and nothing that waits runs, a lend's included.
+    defer: Cell<u32>,
 }
 
-/// Install the empty slot at the VM's birth: app data is never inserted while any is borrowed
-/// (`handler_prof::install`), and a lend may come while a verb holds the model.
+/// Install the empty slot at the VM's birth, a fork's included: every verb asks it
+/// (`calls::submit`) and a lend holds its cell across Lua, so it is installed once and
+/// never replaced. A later `set_app_data` would collide with no borrow (benilla-mlua keeps each
+/// entry in a cell of its own) but would hand later lookups a second slot beside the lent one.
 pub(super) fn install(lua: &Lua) {
     lua.set_app_data(HostSlot::default());
 }
@@ -70,6 +87,53 @@ impl Drop for Open<'_> {
     }
 }
 
+/// Set the slot's [`HostSlot::hold`] while it lives, and put back what it was.
+struct Hold<'a> {
+    slot: mlua::AppDataRef<'a, HostSlot>,
+    before: bool,
+}
+
+impl<'a> Hold<'a> {
+    fn new(slot: mlua::AppDataRef<'a, HostSlot>, hold: bool) -> Self {
+        let before = slot.hold.replace(hold);
+        Hold { slot, before }
+    }
+}
+
+impl Drop for Hold<'_> {
+    fn drop(&mut self) {
+        self.slot.hold.set(self.before);
+    }
+}
+
+/// Run `f`, Lua the host runs in place (a chunk, a binding's body, a slash command's handler),
+/// with no handler held meanwhile: the handlers it fires run inside it, as its own lines read
+/// what they did. Only an engine step's own signals are held.
+pub(crate) fn unheld<R>(lua: &Lua, f: impl FnOnce() -> R) -> R {
+    // Lua run in place ahead of a held handler would run before it, out of the order made: such
+    // Lua runs between turns, or in a turn before it signals ([`UiScript::host_out`]).
+    debug_assert!(
+        !super::calls::signal_waiting(lua),
+        "Lua runs in place only with no held signal waiting"
+    );
+    in_place(lua, f)
+}
+
+/// [`unheld`] without its check, for the settle that runs what waits ([`UiScript::signal_point`]).
+fn in_place<R>(lua: &Lua, f: impl FnOnce() -> R) -> R {
+    let _hold = Hold::new(slot(lua), false);
+    f()
+}
+
+/// Run `f` with the slot open and nothing held, with no host to lend: the drop of what an engine
+/// turn left ([`super::calls::refuse_waiting`]), whose handlers still run, their calls waiting to
+/// be dropped with the rest.
+pub(crate) fn open_unheld<R>(lua: &Lua, f: impl FnOnce() -> R) -> R {
+    let _open = Open::new(slot(lua));
+    let _hold = Hold::new(slot(lua), false);
+    f()
+}
+
 /// Lend `host` to the VM of `lua` while `f` runs, then take it back, `f` unwinding included. A
 /// host lent already is put back after.
 pub(crate) fn lend<R>(lua: &Lua, host: &mut dyn CallHost, f: impl FnOnce() -> R) -> R {
@@ -94,7 +158,8 @@ pub(crate) fn lend<R>(lua: &Lua, host: &mut dyn CallHost, f: impl FnOnce() -> R)
 }
 
 /// Run `f` on the lent host, out of the slot meanwhile; `None` with no host lent, or with the one
-/// lent out applying a call.
+/// lent out applying a call. The handlers `f` fires are held ([`holding`]) for the caller to run
+/// once the host is back ([`super::calls::drain`]).
 pub(crate) fn with_host<R>(lua: &Lua, f: impl FnOnce(&mut dyn CallHost) -> R) -> Option<R> {
     struct PutBack<'a> {
         slot: mlua::AppDataRef<'a, HostSlot>,
@@ -108,6 +173,7 @@ pub(crate) fn with_host<R>(lua: &Lua, f: impl FnOnce(&mut dyn CallHost) -> R) ->
     let slot = slot(lua);
     let host = slot.host.take()?;
     let _back = PutBack { slot, host };
+    let _hold = Hold::new(self::slot(lua), true);
     // SAFETY: the pointer came out of the slot, so by its invariant it is valid, and this is the
     // only `&mut` made from it until it goes back.
     Some(f(unsafe { &mut *host.as_ptr() }))
@@ -115,7 +181,8 @@ pub(crate) fn with_host<R>(lua: &Lua, f: impl FnOnce(&mut dyn CallHost) -> R) ->
 
 /// Whether a host is lent and in the slot, so a call submitted now applies at once.
 pub(crate) fn free(lua: &Lua) -> bool {
-    slot(lua).host.get().is_some()
+    let slot = slot(lua);
+    slot.host.get().is_some() && slot.defer.get() == 0
 }
 
 /// Whether a call made now is the host's: a lend or an engine turn is running.
@@ -123,7 +190,40 @@ pub(crate) fn open(lua: &Lua) -> bool {
     slot(lua).open.get() > 0
 }
 
+/// Whether a handler fired now is held for the host rather than run: an engine step that cannot
+/// lend it is running, and no Lua it ran in place since ([`unheld`]). A handler run then would
+/// make its calls wait past the verb that made them, where the reference applies them inside it.
+pub(crate) fn holding(lua: &Lua) -> bool {
+    let slot = slot(lua);
+    (slot.hold.get() && slot.host.get().is_none()) || slot.defer.get() > 0
+}
+
+/// A deferred stretch, while it lives ([`UiScript::defer`]).
+pub struct Deferring(Lua);
+
+impl Drop for Deferring {
+    fn drop(&mut self) {
+        let slot = slot(&self.0);
+        slot.defer.set(slot.defer.get() - 1);
+        slot.open.set(slot.open.get() - 1);
+    }
+}
+
 impl UiScript {
+    /// Defer what fires while the guard lives: an engine step that does its work in place but
+    /// whose signals the app runs later, in their packet's place among the other packets' events
+    /// ([`Self::park_since`]). Every handler fired meanwhile is held, a lend runs nothing that
+    /// waits, and the host counts as open, so a call made meanwhile waits too.
+    pub fn defer(&self) -> Deferring {
+        let lua = self.lua().clone();
+        {
+            let slot = slot(&lua);
+            slot.defer.set(slot.defer.get() + 1);
+            slot.open.set(slot.open.get() + 1);
+        }
+        Deferring(lua)
+    }
+
     /// Run `f` with `host` lent to the VM: each script call a verb makes meanwhile applies before
     /// the verb returns, in call order, through [`CallHost::apply`], as the reference's verbs do.
     /// What an engine turn of this entry left ([`Self::host_out`]) applies first, each call under
@@ -141,20 +241,56 @@ impl UiScript {
     }
 
     /// Run `f` as an engine turn: the app's half of a verb or an engine step that holds the host's
-    /// own state alongside the VM, so it cannot lend the host meanwhile. A call the Lua `f` runs
-    /// makes waits, as one made while the host applies a call does; the entry lends the host when
-    /// the turn ends ([`Self::hosted`]), which applies it, or drops it with
-    /// [`Self::refuse_waiting`] when it has none to lend.
+    /// own state alongside the VM, so it cannot lend the host meanwhile. The handlers its pushes
+    /// and signals fire are held, and a call Lua `f` runs in place makes (a chunk) waits; the
+    /// entry lends the host when the turn ends ([`Self::hosted`]), which runs and applies them in
+    /// the order made, or runs the handlers and drops the calls with [`Self::refuse_waiting`] when
+    /// it has none to lend. A test build counts what it sends while a handler waits under its
+    /// caller ([`super::census`]).
+    #[track_caller]
     pub fn host_out<R>(&mut self, f: impl FnOnce(&mut UiScript) -> R) -> R {
         let lua = self.lua().clone();
         let _open = Open::new(slot(&lua));
+        let _hold = Hold::new(slot(&lua), true);
+        #[cfg(any(test, feature = "test-support"))]
+        let _census = super::census::Applying::turn(std::panic::Location::caller());
         f(self)
     }
 
-    /// Drop the calls an engine turn left with no host to apply them, a harness without the
-    /// engine's half; the count dropped.
+    /// Run `f` with no host to lend, for an entry of a harness without the engine's half that runs
+    /// Lua (a load in a bare world): the handlers run in place, and a call its Lua makes waits and
+    /// is dropped as `f` returns, as with [`Self::refuse_waiting`].
+    pub fn refusing<R>(&mut self, f: impl FnOnce(&mut UiScript) -> R) -> R {
+        let lua = self.lua().clone();
+        let r = open_unheld(&lua, || f(self));
+        self.refuse_waiting();
+        r
+    }
+
+    /// Run the handlers an engine turn left with no host to lend them, and drop its calls and
+    /// theirs, for a harness without the engine's half; the count of calls dropped.
     pub fn refuse_waiting(&mut self) -> usize {
         super::calls::refuse_waiting(self.lua())
+    }
+
+    /// A signal point inside a call's apply, where the reference goes on after a signal:
+    /// `SignalEvent` (`0x703e50`) walks every listener before it returns. `host`, the host out
+    /// applying the call, is lent back and nothing is held while what the apply held so far runs,
+    /// in the order made, so the calls its handlers make apply here, nested, before the apply's
+    /// next step. Then the host is out and holding again, unwinding included. The caller carries
+    /// nothing borrowed from the host across the point.
+    pub fn signal_point(&mut self, host: &mut dyn CallHost) {
+        let lua = self.lua().clone();
+        // Inside an apply the host is out of the slot and handlers are held ([`with_host`]).
+        debug_assert!(
+            !free(&lua) && slot(&lua).hold.get(),
+            "a signal point is only inside a call's apply"
+        );
+        #[cfg(any(test, feature = "test-support"))]
+        super::census::point();
+        lend(&lua, host, || {
+            in_place(&lua, || super::calls::settle(&lua, self));
+        });
     }
 
     /// Whether a host is lent and free to apply a call now.
@@ -222,6 +358,19 @@ mod tests {
         assert!(s.lua().app_data_ref::<HostSlot>().is_some());
     }
 
+    /// A fork is a VM of its own with its own slot: a host lent to it applies the fork's verbs,
+    /// and the original's slot stays empty.
+    #[test]
+    fn a_fork_takes_a_lent_host_and_applies_its_verbs() {
+        let original = UiScript::new().unwrap();
+        let mut fork = original.fork();
+        let mut host = Count(0);
+        fork.hosted(&mut host, |s| s.run("ClearTarget() ClearTarget()"))
+            .unwrap();
+        assert_eq!(host.0, 2);
+        assert!(!original.host_free());
+    }
+
     #[test]
     fn a_host_is_out_of_the_slot_while_it_applies() {
         let mut s = UiScript::new().unwrap();
@@ -260,6 +409,16 @@ mod tests {
             assert!(free(&lua));
         });
         assert!(!s.host_free());
+    }
+
+    /// A signal point is a step of a call's apply; reached outside one, it is refused.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "only inside a call's apply")]
+    fn a_signal_point_outside_an_apply_is_refused() {
+        let mut s = UiScript::new().unwrap();
+        let mut host = Count(0);
+        s.signal_point(&mut host);
     }
 
     #[test]

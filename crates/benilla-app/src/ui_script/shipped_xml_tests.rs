@@ -618,6 +618,8 @@ fn every_texture_frame_outranks_its_status_bars() {
     use benilla_ui::order::unpack;
 
     let mut s = benilla_ui::script::UiScript::new().unwrap();
+    // No engine behind it: `RaidFrame`'s `RequestRaidInfo()` at world entry is kept.
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     // The in-game UI loads on world entry, so a player always exists by then.
     s.set_unit(
@@ -1859,6 +1861,8 @@ fn the_video_windows_ten_composed_names_stay_nil() {
 fn the_stock_options_windows_load_and_save_are_reachable_for_addons() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = benilla_ui::script::UiScript::new().unwrap();
+    // No host: the Okay's `ClearTutorials()` (`UIOptionsFrame.lua:325`) is kept, not applied.
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     s.set_unit(
         "player",

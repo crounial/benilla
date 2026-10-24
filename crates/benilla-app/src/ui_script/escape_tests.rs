@@ -12,9 +12,11 @@ fn one_item_backpack() -> ContainerState {
     slots.insert(
         1,
         ContainerSlot {
+            uncached_link: None,
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
+            field_duration: 0,
             petition: None,
             already_bound: false,
             occupied_seats: None,
@@ -56,6 +58,7 @@ fn one_item_backpack() -> ContainerState {
 fn escape_closes_bag_and_panel_releases_loot_and_keeps_the_held_item() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     // `LOOT_UI` whole: a missing `ItemButtonTemplate` is only a load warning, so it fails silently.
     for file in super::test_ui::production_order(&[
@@ -78,7 +81,7 @@ fn escape_closes_bag_and_panel_releases_loot_and_keeps_the_held_item() {
     s.run("MainMenuBarBackpackButton:Click()").unwrap();
     s.set_loot(Some(LootState {
         source_unit: false,
-        fishing: false,
+        has_money: false,
         master_candidates: Vec::new(),
         rows: vec![Some(LootRow {
             item_id: 0,
@@ -122,8 +125,8 @@ fn escape_closes_bag_and_panel_releases_loot_and_keeps_the_held_item() {
         "ESC hid the loot window"
     );
     assert_eq!(
-        s.take_loot_close(),
-        Some(false),
+        s.take_loot_calls(),
+        vec![benilla_ui::script::LootCall::Close { failed: false }],
         "closing the loot fired the release (OnHide → CloseLoot)"
     );
     // Stock `ToggleGameMenu` has no `ClearCursor` arm, so the held item survives ESC.
@@ -266,9 +269,11 @@ fn escape_closes_an_open_stack_split_frame() {
     slots.insert(
         1,
         ContainerSlot {
+            uncached_link: None,
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
+            field_duration: 0,
             petition: None,
             already_bound: false,
             occupied_seats: None,

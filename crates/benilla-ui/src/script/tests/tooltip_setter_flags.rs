@@ -300,7 +300,7 @@ fn the_mail_and_auction_item_setters_answer_one_value() {
         name: Some("Linen Cloth".into()),
         ..Default::default()
     });
-    s.set_auction(Some(auction));
+    s.set_auction(auction);
     {
         let mut model = s.model_mut();
         let item = CursorItem {
@@ -337,6 +337,7 @@ fn the_mail_and_auction_item_setters_answer_one_value() {
 #[test]
 fn live_objects_and_blocks_reach_the_flag() {
     let mut s = fixture();
+    s.keep_calls();
     s.run(r#"ITEM_DURATION_HOURS = "[DURATION %d h]" LOCKED = "[LOCKED]""#)
         .unwrap();
     s.set_lock_rows(std::collections::HashMap::from([

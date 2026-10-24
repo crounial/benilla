@@ -326,6 +326,12 @@ pub enum ServerPacket {
     SetFactionVisible {
         list_id: u32,
     },
+    /// `SMSG_SET_FACTION_ATWAR`: one slot and a flag byte, whose bit `0x02` alone is the slot's
+    /// new at-war bit (`0x4d56d9`).
+    SetFactionAtWar {
+        list_id: u32,
+        flags: u8,
+    },
     /// `SMSG_NAME_QUERY_RESPONSE`: guid, name, realm (empty on one realm), race/gender/class as
     /// `u32`s (`NameQueryResponse::AppendBodyTo`); an unknown guid gets an empty name.
     NameQueryResponse {
@@ -1172,7 +1178,8 @@ pub enum ServerPacket {
         allow_move: bool,
     },
     /// `SMSG_SHOWTAXINODES` (`TaxiHandler.cpp:82-96`): the taxi map; vmangos always writes
-    /// `window` 1, and `nearest_node` is the flight master's own node.
+    /// `window` 1, and `nearest_node` is the flight master's own node. A `window` of 0 carries
+    /// the mask alone, with no flight master or node (`0x5ece97`).
     ShowTaxiNodes {
         window: u32,
         flightmaster: u64,
@@ -1367,6 +1374,7 @@ impl ServerPacket {
             ServerPacket::SetFactionStanding { .. } => "SMSG_SET_FACTION_STANDING".into(),
             ServerPacket::SetForcedReactions { .. } => "SMSG_SET_FORCED_REACTIONS".into(),
             ServerPacket::SetFactionVisible { .. } => "SMSG_SET_FACTION_VISIBLE".into(),
+            ServerPacket::SetFactionAtWar { .. } => "SMSG_SET_FACTION_ATWAR".into(),
             ServerPacket::NameQueryResponse { .. } => "SMSG_NAME_QUERY_RESPONSE".into(),
             ServerPacket::CreatureQueryResponse { .. } => "SMSG_CREATURE_QUERY_RESPONSE".into(),
             ServerPacket::PetNameQueryResponse { .. } => "SMSG_PET_NAME_QUERY_RESPONSE".into(),

@@ -120,6 +120,8 @@ mod stable_slot_prices;
 pub use stable_slot_prices::{load_stable_slot_prices, StableSlotPrices};
 mod page_text_material;
 pub use page_text_material::{load_page_text_material_catalog, PageTextMaterialCatalog};
+mod mail_template;
+pub use mail_template::load_mail_templates;
 mod packages;
 pub use packages::{load_packages, PackageRow};
 mod stationery;
@@ -223,11 +225,11 @@ mod spells;
 pub use spells::{
     cc_exemption, grants_immunity, load_shapeshift_forms, load_spell_cast_times,
     load_spell_catalog, load_spell_dispel_types, load_spell_durations, load_spell_radii,
-    load_spell_ranges, min_max_range, min_max_range_reads_units, resolve_parts, soft_modify,
-    substitute, substitute_parts, CcExemption, ExpandAt, FormRefusal, LearnAnnouncement,
-    LearnEffect, OpenLock, RangeTargets, RangeUnit, ShapeshiftForm, SpellCastTime,
-    SpellCastTimeCatalog, SpellCatalog, SpellDispelTypes, SpellDisplay, SpellDuration,
-    SpellDurationCatalog, SpellMods, SpellRadius, SpellRadiusCatalog, SpellRange,
+    load_spell_ranges, min_max_range, min_max_range_reads_ranged_slot, min_max_range_reads_units,
+    resolve_parts, soft_modify, substitute, substitute_parts, CcExemption, ExpandAt, FormRefusal,
+    LearnAnnouncement, LearnEffect, OpenLock, RangeTargets, RangeUnit, ShapeshiftForm,
+    SpellCastTime, SpellCastTimeCatalog, SpellCatalog, SpellDispelTypes, SpellDisplay,
+    SpellDuration, SpellDurationCatalog, SpellMods, SpellRadius, SpellRadiusCatalog, SpellRange,
     SpellRangeCatalog, TokenContext, TokenNumber, TokenPart, UnitMotion, ATTR_CASTABLE_WHILE_DEAD,
     ATTR_NOT_IN_COMBAT, ATTR_ONLY_STEALTHED, COMBAT_REACH_ADD, MELEE_RANGE_FLOOR,
     MOVING_BONUS_FLAGS, MOVING_RANGE_BONUS, ON_NEXT_SWING_RANGE, SPELL_ATTR_IS_TRADESKILL,
@@ -237,7 +239,7 @@ pub use spells::{
 };
 mod skill_lines;
 pub use skill_lines::{
-    load_skill_line_catalog, SkillLineCatalog, SkillLineInfo, SkillRaceClass, SlaInfo,
+    load_skill_line_catalog, LineAbility, SkillLineCatalog, SkillLineInfo, SkillRaceClass, SlaInfo,
 };
 mod spell_focus;
 mod spell_mechanic;

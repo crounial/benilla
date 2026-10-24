@@ -247,6 +247,8 @@ fn a_bag_items_price_scales_by_its_charges_and_loses_its_repair_cost() {
 #[test]
 fn the_merchant_prices_an_object_held_past_the_worn_slots() {
     let mut s = script();
+    // The bank bands read through `GetItemInSlot`, open only at a banker.
+    s.set_bank(Some(crate::script::BankState::default()));
     s.set_screen_size(800.0, 600.0);
     for (id, name, sell_price) in [(4380, "Ring", 50), (4381, "Gem", 7), (4382, "Shard", 9)] {
         s.set_item_template(
@@ -869,6 +871,7 @@ fn a_looted_roll_shows_its_lines_and_never_the_placeholder() {
     s.set_loot(Some(LootState {
         source_unit: false,
         master_candidates: Vec::new(),
+        has_money: false,
         rows: vec![Some(LootRow {
             name: Some("Bloodrazor of the Monkey".into()),
             texture: None,
@@ -880,7 +883,6 @@ fn a_looted_roll_shows_its_lines_and_never_the_placeholder() {
             // The row carries the roll id; the engine resolves it, as the reference reads `+0x424`.
             random_property_id: 584,
         })],
-        fishing: false,
     }));
     s.set_random_properties(
         [(
@@ -951,6 +953,7 @@ fn a_looted_item_with_no_roll_shows_neither_line_nor_placeholder() {
     s.set_loot(Some(LootState {
         source_unit: false,
         master_candidates: Vec::new(),
+        has_money: false,
         rows: vec![Some(LootRow {
             name: Some("Bloodrazor".into()),
             quantity: 1,
@@ -958,7 +961,6 @@ fn a_looted_item_with_no_roll_shows_neither_line_nor_placeholder() {
             item_id: 8888,
             ..Default::default()
         })],
-        fishing: false,
     }));
     s.run(
         r#"

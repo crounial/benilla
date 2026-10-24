@@ -229,6 +229,8 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
                 misses: s.misses,
                 target: s.targets.unit_target,
                 go_target: s.targets.go_target,
+                target_mask: s.targets.mask,
+                source: s.targets.source.map(|d| [d.x, d.y, d.z]),
                 dest: s.targets.dest.map(|d| [d.x, d.y, d.z]),
                 ammo_display_id: s.ammo_display_id,
                 // Against the resolved caster: a GameObject's own guid in slot 1 is not an item.
@@ -829,6 +831,9 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::SetFactionVisible { list_id } => {
             vec![SessionEvent::ReputationVisible { list_id }]
         }
+        ServerPacket::SetFactionAtWar { list_id, flags } => {
+            vec![SessionEvent::ReputationAtWar { list_id, flags }]
+        }
         ServerPacket::NameQueryResponse {
             guid,
             name,
@@ -984,9 +989,10 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             nearest_node,
             known,
         } => {
-            // The reference parser gates on this word: zero carries no menu; vmangos sends 1.
+            // The mode word: zero prints the known nodes and opens no map (`0x5ecf37`); vmangos
+            // sends 1.
             if window == 0 {
-                vec![]
+                vec![SessionEvent::TaxiNodesListed { known_mask: known }]
             } else {
                 vec![SessionEvent::TaxiNodesShown {
                     flightmaster,

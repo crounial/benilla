@@ -2,7 +2,9 @@
 //! streamed unit. The environmental-damage log also feeds [`crate::combat_log`], whose handler is
 //! registered first and so runs first. The swing's handler registers ahead of the combat log's
 //! (`net_handler_ahead`): `0x62578d` flushes and dispatches the victim's feedback before it
-//! writes the packet's line, last (`0x625a2c`, `0x625a78`).
+//! writes the packet's line, last (`0x625a2c`, `0x625a78`). The attack start and stop signal the
+//! active player's combat events in their packet, queued among the lines and feedback around
+//! them ([`crate::ui_chat::ChatLog::push_combat_edge`]).
 
 use benilla_protocol::messages::{AttackSwingError, AttackerState, EnvironmentalDamageLog};
 use benilla_protocol::{SessionEvent, SessionEventKind};
@@ -34,9 +36,15 @@ pub(crate) fn register(app: &mut App) {
         .net_handler(K::EnvironmentalDamageLog, on_environmental_damage_log);
 }
 
-fn on_attack_start(In(ev): In<SessionEvent>, mut commands: Commands, index: Res<GuidIndex>) {
+fn on_attack_start(
+    In(ev): In<SessionEvent>,
+    mut commands: Commands,
+    index: Res<GuidIndex>,
+    self_guid: Res<SelfGuid>,
+    log: Res<crate::ui_chat::ChatLog>,
+) {
     if let SessionEvent::AttackStart { attacker, victim } = ev {
-        attack_start(attacker, victim, &mut commands, &index);
+        attack_start(attacker, victim, &mut commands, &index, &self_guid, &log);
     }
 }
 
@@ -44,8 +52,11 @@ fn on_attack_stop(
     In(ev): In<SessionEvent>,
     mut commands: Commands,
     index: Res<GuidIndex>,
+    self_guid: Res<SelfGuid>,
+    log: Res<crate::ui_chat::ChatLog>,
     mut pending: ResMut<PendingImpacts>,
     mut sinks: ImpactSinks,
+    mut stop_word: ResMut<super::AttackStopInFlight>,
 ) {
     if let SessionEvent::AttackStop { attacker, victim } = ev {
         attack_stop(
@@ -53,8 +64,10 @@ fn on_attack_stop(
             victim,
             &mut commands,
             &index,
+            (&self_guid, &log),
             &mut pending,
             &mut sinks,
+            &mut stop_word,
         );
     }
 }
@@ -99,6 +112,7 @@ fn on_text_emote(
     index: Res<GuidIndex>,
     mut out: MessageWriter<EmoteMessage>,
     chat_log: Res<crate::ui_chat::ChatLog>,
+    social: Res<crate::ui_social::SocialState>,
 ) {
     if let SessionEvent::TextEmote {
         guid,
@@ -106,7 +120,16 @@ fn on_text_emote(
         target_name,
     } = ev
     {
-        self::text_emote(guid, text_emote, target_name, &index, &mut out, &chat_log);
+        let ignored = social.is_ignored(guid);
+        self::text_emote(
+            guid,
+            text_emote,
+            target_name,
+            ignored,
+            &index,
+            &mut out,
+            &chat_log,
+        );
     }
 }
 
@@ -166,12 +189,24 @@ fn on_play_spell_visual(
 }
 
 /// A unit began melee auto-attack (`SMSG_ATTACKSTART`, including our own echo).
-fn attack_start(attacker: u64, victim: u64, commands: &mut Commands, index: &GuidIndex) {
+fn attack_start(
+    attacker: u64,
+    victim: u64,
+    commands: &mut Commands,
+    index: &GuidIndex,
+    self_guid: &SelfGuid,
+    log: &crate::ui_chat::ChatLog,
+) {
     // The Ready idle rides this window: the client's gate is the auto-attack target being set.
     debug!("net: attack start {attacker:#x} → {victim:#x}");
     if let Some(&e) = index.0.get(&attacker) {
         // The precast is not touched: only the local StartAttack clears its bit (`0x5ecd87`).
         commands.entity(e).insert(Engaged(victim));
+        // A held attacker that is the active player (`0x6256f1` → `0x5fa6d0`) signals
+        // `PLAYER_ENTER_COMBAT` inside the packet (`0x6256ff`).
+        if self_guid.0 == Some(attacker) {
+            log.push_combat_edge(true);
+        }
     }
 }
 
@@ -181,13 +216,23 @@ fn attack_stop(
     victim: u64,
     commands: &mut Commands,
     index: &GuidIndex,
+    (self_guid, log): (&SelfGuid, &crate::ui_chat::ChatLog),
     pending: &mut PendingImpacts,
     sinks: &mut ImpactSinks,
+    stop_word: &mut super::AttackStopInFlight,
 ) {
     debug!("net: attack stop {attacker:#x} → {victim:#x}");
     if let Some(&e) = index.0.get(&attacker) {
+        // `StopAttack 0x624e40` (`0x625763`) zeroes the attacker's target and its stop in flight
+        // (`0x624e6b`).
         commands.entity(e).remove::<Engaged>();
+        stop_word.clear(e);
         stop_swing(e, pending, sinks);
+        // After `StopAttack`'s swing flush (`0x625763` → `0x624e40`), the active player's
+        // `PLAYER_LEAVE_COMBAT` (`0x62576a` → `0x5fa6d0`, `0x625778`).
+        if self_guid.0 == Some(attacker) {
+            log.push_combat_edge(false);
+        }
     }
 }
 
@@ -265,6 +310,7 @@ fn attacker_state(
         hit_info: s.hit_info,
         victim_state: s.victim_state,
         damage: s.damage,
+        school: s.school,
         displayed: s.displayed(),
         seq,
     };
@@ -301,11 +347,14 @@ fn attacker_state(
 }
 
 /// `SMSG_TEXT_EMOTE`: the animation needs the performer streamed, the chat line only needs their
-/// name, so an off-screen emote still prints (reference: `0x49dbe0`).
+/// name, so an off-screen emote still prints (reference: `0x49dbe0`). An `ignored` performer's
+/// line is dropped at receipt, before anything is composed (`0x49dc36` → `0x49dc3d`); its voice
+/// has a gate of its own (`sound::emote`).
 fn text_emote(
     guid: u64,
     text_emote: u32,
     target_name: String,
+    ignored: bool,
     index: &GuidIndex,
     out: &mut MessageWriter<EmoteMessage>,
     chat_log: &crate::ui_chat::ChatLog,
@@ -315,7 +364,9 @@ fn text_emote(
         source: index.0.get(&guid).copied(),
         kind: EmoteKind::Text(text_emote),
     });
-    chat_log.push_text_emote(guid, text_emote, target_name);
+    if !ignored {
+        chat_log.push_text_emote(guid, text_emote, target_name);
+    }
 }
 
 /// `SMSG_EMOTE`: an `Emotes.dbc` id to play on a unit (NPC scripts, a `/`-emote's animation).
@@ -407,7 +458,15 @@ mod tests {
         world.insert_resource(index);
         world
             .run_system_once(|mut commands: Commands, index: Res<GuidIndex>| {
-                attack_start(SHOOTER, 30, &mut commands, &index);
+                let log = crate::ui_chat::ChatLog::default();
+                attack_start(
+                    SHOOTER,
+                    30,
+                    &mut commands,
+                    &index,
+                    &SelfGuid::default(),
+                    &log,
+                );
             })
             .unwrap();
         assert!(world.get::<Engaged>(e).is_some());

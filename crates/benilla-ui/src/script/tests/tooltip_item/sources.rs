@@ -24,6 +24,8 @@ fn texts_after(s: &mut UiScript, call: &str) -> Vec<String> {
 /// Opens a trade showing `state` and offers each `(bag slot, trade slot)` of the backpack by a
 /// click, which records the item's guid in our slot (`0x4bfa70`, the table at `0xb716d0`).
 fn offer(s: &mut UiScript, state: TradeState, slots: &[(u32, u32)]) {
+    // No host: the placements' calls are kept, and the VM writes our slots as a sent one would.
+    s.keep_calls();
     s.open_trade_window();
     s.set_trade(Some(state));
     for (bag_slot, trade_slot) in slots {
@@ -117,6 +119,8 @@ fn only_a_source_with_an_item_object_reads() {
 #[test]
 fn a_bank_vault_item_keeps_its_text_and_its_open_hint() {
     let mut s = script();
+    // The bank bands read through `GetItemInSlot`, open only at a banker.
+    s.set_bank(Some(crate::script::BankState::default()));
     s.set_screen_size(800.0, 600.0);
     s.set_item_template(
         9201,

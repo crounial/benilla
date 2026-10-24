@@ -23,6 +23,29 @@ use crate::query_cache::Ask;
 use crate::target::{Candidacy, NameSearch, RelUnit, Relations};
 use crate::ui_script::{gate, VmMemo};
 
+/// A held unit's entry in the reach map: its squared distance from the player at `me_at`, and
+/// whether it passes `0x4944a0`'s other legs, the one `CanInspect` answers by (`0x48a2a1`): a
+/// player unit (`0x4944d8`) that is the active player (`0x4944dd`) or one it can cooperate with
+/// (`0x4944e4`). Cooperation is the faction group, not attackability: an unflagged enemy-faction
+/// player is not inspectable, a same-faction duel opponent is.
+pub(crate) fn unit_reach(
+    world: &crate::target::RelationWorld,
+    guid: u64,
+    store: Option<&ObjectStore>,
+    at: Vec3,
+    me_at: Vec3,
+) -> benilla_ui::script::UnitReach {
+    let (rel, me) = (world.get(), world.me());
+    let unit = store.map(|s| world.unit_of(guid, s));
+    let inspectable = unit.zip(me.as_ref()).is_some_and(|(unit, me)| {
+        unit.is_player && (unit.guid == me.guid || rel.can_cooperate(me, &unit))
+    });
+    benilla_ui::script::UnitReach {
+        dist_sq: super::dist_sq(at, me_at),
+        inspectable,
+    }
+}
+
 /// What a held unit's snapshot reads beside its descriptor.
 pub(super) struct HeldUnits<'a> {
     pub(super) names: &'a NameCache,
@@ -37,12 +60,14 @@ pub(super) struct HeldUnits<'a> {
     pub(super) me: Option<RelUnit>,
     /// What the unit tooltip's own lines read.
     pub(super) tooltip: super::tooltip_facts::TooltipSources<'a>,
+    /// The guild cache, which the guild leg reads without asking.
+    pub(super) guild: &'a crate::ui_guild::GuildState,
 }
 
 impl HeldUnits<'_> {
     /// The snapshot of the held unit `guid`, whose descriptor is `store`, as a token naming a unit
-    /// other than the player carries it. It has no guild leg, so `GetGuildInfo` on a chain answers
-    /// nothing, where the reference resolves the token and reads the object's guild (`0x4c9330`).
+    /// other than the player carries it, however the token spells it: `GetGuildInfo` resolves the
+    /// token and reads that object's guild (`0x4c9330`), so the guild leg is every held unit's.
     pub(super) fn state(&self, store: &ObjectStore, guid: u64) -> UnitState {
         // The unit's create looked its name up with a callback (`0x5dec12`); a frame asks only
         // a name the cache holds nothing for, as one invalidated since, and a refused one waits
@@ -54,18 +79,31 @@ impl HeldUnits<'_> {
         self.state_named(store, guid, name)
     }
 
+    /// The snapshot of the unit a `target` chain ends on, by guid, whose descriptor is `store`:
+    /// a held unit's, a no-object entry for a guid the object manager does not hold, nothing for
+    /// one held as anything but a unit.
+    pub(super) fn chain_end(&self, guid: u64, store: Option<&ObjectStore>) -> Option<UnitState> {
+        match store {
+            Some(store) => store.is_unit().then(|| self.state(store, guid)),
+            None => Some(unheld_state(self.names, self.group, guid, self.unit_names)),
+        }
+    }
+
     /// [`Self::state`] under a name the caller looked up, which sends no name query.
     fn state_named(&self, store: &ObjectStore, guid: u64, name: Option<String>) -> UnitState {
         let unit = RelUnit::of(guid, store).with_record(store, self.names);
         let factions = self.rel.factions;
         let reaction = unit_reaction(&self.rel, &unit, self.me.as_ref());
         let mut s = snapshot(store, guid, name, reaction, self.unit_names, self.types);
+        s.is_pvp_ffa = super::pvp_free_for_all(&self.rel, &unit);
         s.player_reaction = player_reaction(&self.rel, &unit, self.me.as_ref());
         s.raid_target = self.group.raid_target_index(guid);
         s.faction_group = faction_group(store, factions);
         s.faction_group_localized = faction_group_localized(store, factions);
         enrich_unit(&mut s, guid, self.names, store, factions, self.self_store);
         s.tooltip = super::tooltip_facts::tooltip_facts(store, s.creature_type, &self.tooltip);
+        // `[[unit+0xe68]+0xc]` (`0x4c93a3`) against the cache; a miss is `GetGuildInfo`'s to ask.
+        s.guild = crate::ui_guild::cached_unit_guild(&store.0, self.guild);
         s
     }
 }
@@ -74,6 +112,7 @@ impl HeldUnits<'_> {
 #[derive(Default)]
 pub(super) struct ChainMemo {
     names_generation: gate::Watch,
+    guild_generation: gate::Watch,
     /// The guids the last build covered, sorted.
     ends: Vec<u64>,
     /// What each was last pushed as.
@@ -93,7 +132,7 @@ pub(super) struct ChainMemo {
 /// held as anything but a unit gets no snapshot. A token without a hop reads its own push, not
 /// these.
 pub(super) fn feed_chain_units(
-    mut hosted_vm: crate::script_calls::HostedVm,
+    mut vm: crate::script_calls::VmWith<crate::target::RelationWorld<'static, 'static>>,
     tables: super::SnapshotTables,
     // The object manager's lookup (`0x468460`) on its own, not through [`super::UnitTokens`],
     // whose pet-bar read would order this feed against the pet feed it does not depend on.
@@ -101,14 +140,14 @@ pub(super) fn feed_chain_units(
     stores: Query<&ObjectStore>,
     names: Res<NameCache>,
     commands: Res<NetCommands>,
-    world: crate::target::RelationWorld,
     group: Res<crate::ui_party::GroupState>,
+    guild: Res<crate::ui_guild::GuildState>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
     changed: Query<(), (Changed<ObjectStore>, Without<crate::items::ItemObject>)>,
     mut removed: RemovedComponents<Guid>,
     mut memo: Local<VmMemo<ChainMemo>>,
 ) {
-    hosted_vm.run(|script| {
+    vm.turn(|script, world| {
         let Some(script) = script else {
             return;
         };
@@ -124,6 +163,7 @@ pub(super) fn feed_chain_units(
         // guids themselves, which move with the selection, the hover, the group and every held
         // unit's target.
         let names_moved = memo.names_generation.moved(names.generation());
+        let guild_moved = memo.guild_generation.moved(guild.identity_generation());
         let ends_moved = memo.ends != ends;
         let stores_changed = !changed.is_empty();
         let stores_removed = !removed.is_empty();
@@ -133,6 +173,7 @@ pub(super) fn feed_chain_units(
         let gate = gate::Gate::new(
             vm_reset
                 || names_moved
+                || guild_moved
                 || ends_moved
                 || stores_changed
                 || stores_removed
@@ -162,15 +203,16 @@ pub(super) fn feed_chain_units(
                 object: &object,
                 study: tables.study(),
             },
+            guild: &guild,
         };
         let built: HashMap<u64, UnitState> = ends
             .iter()
             .filter_map(|&guid| {
-                let Some(&entity) = index.as_ref().and_then(|i| i.0.get(&guid)) else {
-                    return Some((guid, unheld_state(&names, &group, guid)));
+                let store = match index.as_ref().and_then(|i| i.0.get(&guid)) {
+                    Some(&entity) => Some(stores.get(entity).ok()?),
+                    None => None,
                 };
-                let store = stores.get(entity).ok().filter(|s| s.is_unit())?;
-                Some((guid, held.state(store, guid)))
+                Some((guid, held.chain_end(guid, store)?))
             })
             .collect();
 
@@ -200,13 +242,43 @@ pub(super) fn feed_chain_units(
 /// nothing else. Off the roster it does not exist (`0x491900`); on it, the VM reads the row's push.
 /// The name is read without asking: the lookup asks when `UnitName` reads it, and the VM hands
 /// the miss back ([`UiScript::take_unit_name_asks`]).
-fn unheld_state(names: &NameCache, group: &crate::ui_party::GroupState, guid: u64) -> UnitState {
-    UnitState {
+pub(crate) fn unheld_state(
+    names: &NameCache,
+    group: &crate::ui_party::GroupState,
+    guid: u64,
+    tables: super::UnitNames<'_>,
+) -> UnitState {
+    let mut s = UnitState {
         guid,
         name: names.resolve_player(guid, Ask::Read).map(str::to_string),
         raid_target: group.raid_target_index(guid),
         ..Default::default()
-    }
+    };
+    traits_from_name_cache(&mut s, names, guid, tables);
+    s
+}
+
+/// What `UnitRace`, `UnitClass` and `UnitSex` read of a unit with no object: the name cache record
+/// of its guid, looked up with no callback, so nothing is asked (`0x5182bc`): the race at `+0x138`
+/// (`0x5182d9`), the class at `+0x140` (`0x518429`) and the sex at `+0x13c` (`0x517f80`) through
+/// `{2, 3, 1, 6}` (`0x808be4`). A miss leaves them unset: `nil, nil`, and `UnitSex` 2 (`0x517f95`).
+pub(crate) fn traits_from_name_cache(
+    s: &mut UnitState,
+    names: &NameCache,
+    guid: u64,
+    tables: super::UnitNames<'_>,
+) {
+    let Some((race, class, gender)) = names.player_traits(guid) else {
+        return;
+    };
+    let race = tables.race(race);
+    let class = tables.class(class);
+    s.race = race.map(|(n, _)| n.to_string());
+    s.race_file = race.map(|(_, f)| f.to_string());
+    s.class = class.map(|(n, _)| n.to_string());
+    s.class_file = class.map(|(_, f)| f.to_string());
+    // The table has no bound; past its four entries there is nothing to read, so it stays unset.
+    s.sex = [2, 3, 1, 6].get(usize::from(gender)).copied().unwrap_or(0);
 }
 
 /// [`feed_name_candidates`]' per-VM memory.
@@ -216,22 +288,25 @@ pub(crate) struct CandidateMemo {
     /// entry's creature record had answered. A creature's name is its record, but a pet's name
     /// and its record (the creature type the snapshot reads) come back apart.
     pushed: HashMap<u64, (String, bool)>,
+    /// The guild cache's generation the snapshots read, every one's guild leg.
+    guild_generation: gate::Watch,
     /// This frame's candidates, kept between frames so the walk allocates nothing.
     seen: HashSet<u64>,
 }
 
-/// Push every unit `TargetByName` can pick, by guid, so the binding resolves its name against
-/// them and shows the pick as `"target"` to the rest of its chunk, as `0x489d60` commits before it
-/// returns: the by-name scan's candidates (typemask 8, a cached name, no query sent) with their
-/// distance each frame, and each one's snapshot when it is new, its descriptor, name or creature
-/// record moved, or an input every snapshot reads did; another name's answer rebuilds nothing.
-/// The snapshot has no guild leg, as a chain end's; it is a view for the rest of a chunk, which
-/// [`super::feed_units`] replaces with the committed selection's next frame.
+/// Push every unit `TargetByName` can pick, by guid: the VM's by-name walks rank them, and a
+/// selection a script call commits is seated as `"target"` from them for the rest of its chunk
+/// (`UiScript::seat_selection`), as `SetSelection 0x493540` commits before each selecting verb
+/// returns. They are the by-name scan's candidates (typemask 8, a cached name, no query sent)
+/// with their distance each frame, and each one's snapshot when it is new, its descriptor, name or
+/// creature record moved, or an input every snapshot reads did; another name's answer rebuilds
+/// nothing. It is a view for the rest of a chunk, which [`super::feed_units`] replaces with the
+/// committed selection's next frame.
 /// A move of our own descriptor does not rebuild the rest, so a reaction can lag our own faction
 /// change until the unit's next update. Without an active player object nothing is a candidate,
 /// as the reference resolves nothing then (`0x493ae0`).
 pub(crate) fn feed_name_candidates(
-    mut hosted_vm: crate::script_calls::HostedVm,
+    mut vm: crate::script_calls::VmWith<crate::target::RelationWorld<'static, 'static>>,
     tables: super::SnapshotTables,
     // [`GlobalTransform`], as [`crate::target::PlayerLookup`] reads it: `Transform` would put
     // this feed in an undeclared order against every system that moves a unit.
@@ -239,18 +314,19 @@ pub(crate) fn feed_name_candidates(
     self_q: Query<(&Guid, &GlobalTransform, Option<&ObjectStore>), With<SelfPlayer>>,
     names: Res<NameCache>,
     commands: Res<NetCommands>,
-    world: crate::target::RelationWorld,
     group: Res<crate::ui_party::GroupState>,
+    guild: Res<crate::ui_guild::GuildState>,
     // The object manager's lookup, which the tooltip's owner line names an owner through.
     index: Option<Res<crate::net::GuidIndex>>,
     mut memo: Local<VmMemo<CandidateMemo>>,
 ) {
-    hosted_vm.run(|script| {
+    vm.turn(|script, world| {
         let Some(script) = script else {
             return;
         };
         let (memo, vm_reset) = memo.get_reset(script);
-        let rebuild = vm_reset || group.is_changed() || world.inputs_changed();
+        let guild_moved = memo.guild_generation.moved(guild.identity_generation());
+        let rebuild = vm_reset || group.is_changed() || world.inputs_changed() || guild_moved;
         let me = self_q.single().ok();
         let object = |guid: u64| {
             let entity = *index.as_ref()?.0.get(&guid)?;
@@ -271,10 +347,10 @@ pub(crate) fn feed_name_candidates(
                 object: &object,
                 study: tables.study(),
             },
+            guild: &guild,
         };
         memo.seen.clear();
         let origin = me.map(|(_, tf, _)| tf.translation());
-        let self_guid = me.map(|(g, _, _)| g.0);
         for (guid, tf, store) in origin.iter().flat_map(|_| &units) {
             let guid = guid.0;
             let Candidacy::Named(name) = NameSearch::AnyUnit.candidacy(&names, guid) else {
@@ -324,7 +400,6 @@ pub(crate) fn feed_name_candidates(
                     name: name.to_string(),
                     dist2,
                     state,
-                    selectable: crate::target::is_selectable(store.as_deref(), self_guid),
                     assistable_alive: crate::target::assistable_alive(
                         &held.rel,
                         held.me.as_ref(),
@@ -441,6 +516,7 @@ mod tests {
             .init_resource::<Reputations>()
             .init_resource::<NameCache>()
             .init_resource::<GroupState>()
+            .init_resource::<crate::ui_guild::GuildState>()
             .insert_resource(NetCommands(tx))
             .add_plugins(crate::ui_aura::UiAuraPlugin)
             .add_systems(Update, feed_chain_units.after(crate::ui_aura::AuraEvents));
@@ -475,7 +551,13 @@ mod tests {
                 );
             }
         }
-        let me = spawn(&mut app, ME, player(MOB, 900));
+        let mut mine = player(MOB, 900);
+        // `UNIT_FIELD_SUMMON`, the pet `"pet"` names (`0x515a6e`).
+        mine.0.merge(ObjectFields::from_pairs(&[
+            (8, MY_PET as u32),
+            (9, (MY_PET >> 32) as u32),
+        ]));
+        let me = spawn(&mut app, ME, mine);
         app.world_mut().entity_mut(me).insert(SelfPlayer);
         spawn(&mut app, A, player(BOSS, 800));
         spawn(&mut app, B, player(ADD, 700));
@@ -500,9 +582,7 @@ mod tests {
             guid: Some(MOB),
             ..Default::default()
         });
-        let mut bar = crate::ui_pet::PetBar::default();
-        bar.spells.pet_guid = MY_PET;
-        app.insert_resource(bar);
+        app.init_resource::<crate::ui_pet::PetBar>();
         app
     }
 
@@ -584,9 +664,10 @@ mod tests {
             );
         }
         // The plain tokens read their own push and nothing else: this world pushes none, so
-        // `raid1` answers nil though a chain ends on it, and a token pushed by name wins.
+        // `raid1` answers nil though a chain ends on it, and a token pushed by name wins. `target`
+        // alone reads its guid as a chain does, for a selection with no object has no push.
         assert_eq!(name(&app, "raid1"), None);
-        assert_eq!(name(&app, "target"), None);
+        assert_eq!(name(&app, "target").as_deref(), Some("Mob"));
         app.world_mut()
             .non_send_resource_mut::<UiScript>()
             .set_unit(
@@ -598,6 +679,51 @@ mod tests {
                 }),
             );
         assert_eq!(name(&app, "target").as_deref(), Some("Pushed"));
+    }
+
+    /// `UnitIsPVPFreeForAll` (`0x516540`) on a held unit: `UNIT_FIELD_FLAGS` 0x8
+    /// (`0x5165ad`-`0x5165bf`), then the player controlling it (`0x606170` at `0x5165c3`, its
+    /// charmer, else its creator, else itself, when that is a player) and that player's
+    /// `PLAYER_FLAGS` 0x80 (`0x5165cc`-`0x5165d5`). A creature charmed by a free-for-all player
+    /// answers 1 with no player flags of its own; a player without bit 0x8 answers nil though
+    /// flagged; a creature that answers to nobody is no player and answers nil.
+    #[test]
+    fn unit_is_pvp_free_for_all_reads_the_controlling_players_flag() {
+        const FLAGS: u16 = benilla_protocol::field::FIELD_UNIT_FLAGS;
+        const CHARMEDBY: u16 = 10;
+        const PLAYER_FLAGS: u16 = 190;
+        let mut app = app();
+        let set = |app: &mut App, guid: u64, pairs: &[(u16, u32)]| {
+            let e = app.world().resource::<GuidIndex>().0[&guid];
+            let mut store = app.world_mut().get_mut::<ObjectStore>(e).unwrap();
+            store.0.merge(ObjectFields::from_pairs(pairs));
+        };
+        // `MOB` (`playertarget`) is charmed by `A` (`targettarget`), free-for-all; `BOSS`
+        // (`party1target`) is player-controlled with no owner.
+        set(&mut app, A, &[(FLAGS, 0x8), (PLAYER_FLAGS, 0x80)]);
+        set(
+            &mut app,
+            MOB,
+            &[
+                (FLAGS, 0x8),
+                (CHARMEDBY, A as u32),
+                (CHARMEDBY + 1, (A >> 32) as u32),
+            ],
+        );
+        set(&mut app, BOSS, &[(FLAGS, 0x8), (PLAYER_FLAGS, 0x80)]);
+        app.update();
+        let ffa =
+            |app: &App, token: &str| holds(app, &format!("UnitIsPVPFreeForAll({token:?}) == 1"));
+        assert!(ffa(&app, "targettarget"), "a flagged player");
+        assert!(ffa(&app, "playertarget"), "a creature its charmer flags");
+        assert!(!ffa(&app, "party1target"), "a creature, its own controller");
+        set(&mut app, A, &[(FLAGS, 0)]);
+        app.update();
+        assert!(!ffa(&app, "targettarget"), "a player without bit 0x8");
+        assert!(
+            ffa(&app, "playertarget"),
+            "the charmer's own bit 0x8 is not asked"
+        );
     }
 
     /// A chain ending on a guid nobody holds answers what the client knows of it, each getter
@@ -616,9 +742,11 @@ mod tests {
         let mut app = app();
         let (tx, rx) = crossbeam_channel::unbounded();
         app.insert_resource(NetCommands(tx));
-        app.init_resource::<crate::ui_chat::ChatLog>();
+        app.init_resource::<crate::ui_chat::ChatLog>()
+            .init_resource::<crate::sound::MessageSounds>();
         benilla_world::world_point::init_world_point_resources(app.world_mut());
-        app.add_systems(Update, crate::ui_party::feed_party);
+        app.init_resource::<crate::ui_party::PartyLane>()
+            .add_systems(Update, crate::ui_party::feed_party);
         {
             let mut script = app.world_mut().non_send_resource_mut::<UiScript>();
             script.run(r#"UNKNOWNOBJECT = "Unknown""#).unwrap();
@@ -628,11 +756,15 @@ mod tests {
                 ..Default::default()
             });
         }
+        // A Troll (8) Hunter (3), female (1), as the name query answered.
         app.world_mut().resource_mut::<NameCache>().insert_player(
             STRANGER,
             "Wanderer".into(),
-            None,
+            Some((8, 3, 1)),
         );
+        let tables = crate::ui_unit::TestNames::english();
+        app.insert_resource(crate::chr_classes::ChrRaceTable(tables.races))
+            .insert_resource(crate::chr_classes::ChrClassTable(tables.classes));
         let asked = |rx: &crossbeam_channel::Receiver<crate::net::ClientCommand>| -> Vec<u64> {
             rx.try_iter()
                 .filter_map(|c| match c {
@@ -687,11 +819,26 @@ mod tests {
             "a pending name is asked once"
         );
 
-        // A player out of view: the cached name, and still no unit.
+        // A player out of view: the cached name, race, class and sex (`0x5182d9`, `0x518429`,
+        // `0x517f80`), and still no unit.
         retarget_boss(&mut app, STRANGER);
         assert_eq!(name(&app, chain).as_deref(), Some("Wanderer"));
         assert_eq!(asked(&rx), Vec::<u64>::new(), "a cached name is not asked");
         nil(&app, &["UnitExists", "UnitIsPlayer", "UnitPVPName"]);
+        let pair = |getter: &str| -> (Option<String>, Option<String>) {
+            script(&app)
+                .eval(&format!("return {getter}({chain:?})"))
+                .unwrap()
+        };
+        assert_eq!(
+            pair("UnitRace"),
+            (Some("Troll".into()), Some("Troll".into()))
+        );
+        assert_eq!(
+            pair("UnitClass"),
+            (Some("Hunter".into()), Some("HUNTER".into()))
+        );
+        assert_eq!(number(&app, "UnitSex", chain), 3);
 
         // A party member out of view: what `party4` reads, off the record.
         let mut entries: Vec<GroupMemberEntry> =
@@ -870,6 +1017,42 @@ mod tests {
             &app,
             r#"UnitCanAssist("player", "raid2target") == nil"#
         ));
+    }
+
+    /// `GetGuildInfo` (`0x4c9330`) resolves any token (`0x515940`) and reads that object's guild,
+    /// `[[unit+0xe68]+0xc]` (`0x4c93a3`), from the cache (`0x4c93d2`), so a held player a chain
+    /// ends on answers its guild as a base token does; a record that lands later answers on the
+    /// next frame. `targettarget` here is a chain: no feed in this world pushes it by name.
+    #[test]
+    fn get_guild_info_answers_for_the_player_a_chain_ends_on() {
+        /// `PLAYER_GUILDID` and `PLAYER_GUILDRANK`.
+        const GUILD_ID: u16 = 191;
+        const GUILD_RANK: u16 = 192;
+        let mut app = app();
+        let a = app.world().resource::<GuidIndex>().0[&A];
+        app.world_mut()
+            .get_mut::<ObjectStore>(a)
+            .unwrap()
+            .0
+            .merge(ObjectFields::from_pairs(&[(GUILD_ID, 7), (GUILD_RANK, 2)]));
+        app.update();
+        let info = |app: &App, token: &str| -> (Option<String>, i64) {
+            script(app)
+                .eval::<(Option<String>, Option<String>, i64)>(&format!(
+                    "return GetGuildInfo({token:?})"
+                ))
+                .map(|(name, _, rank)| (name, rank))
+                .unwrap()
+        };
+        assert_eq!(info(&app, "targettarget"), (None, 0), "not cached yet");
+        app.world_mut()
+            .resource_mut::<crate::ui_guild::GuildState>()
+            .land_for_test(7, "Probe Guild");
+        app.update();
+        for token in ["targettarget", "playertargettarget"] {
+            let want = (Some("Probe Guild".to_string()), 2);
+            assert_eq!(info(&app, token), want, "GetGuildInfo({token})");
+        }
     }
 
     /// The chain feed reads the resolver inputs the aura feed pushes in the same frame, so the

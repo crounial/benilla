@@ -78,6 +78,10 @@ pub const SMSG_SET_FACTION_STANDING: u16 = 0x0124;
 /// (`ReputationMgr::SendForceReactions`): a `u32` count, then `(faction id, reaction rank)` pairs
 /// of two `u32`s.
 pub const SMSG_SET_FORCED_REACTIONS: u16 = 0x02A5;
+/// A slot's at-war bit from the server: a `u32` slot and a `u8` whose bit `0x02` is the new bit
+/// (`0x4d56b0`). vmangos sends it when a creature of an unwarred faction enters combat with the
+/// player, and clears it as the player leaves combat (`Player::SendFactionAtWar`).
+pub const SMSG_SET_FACTION_ATWAR: u16 = 0x0313; // 787
 /// Set a faction's at-war flag from the reputation pane; none of the pane's three verbs is acked.
 pub const CMSG_SET_FACTION_ATWAR: u16 = 0x0125; // 293
 pub const CMSG_SET_FACTION_INACTIVE: u16 = 0x0317; // 791
@@ -110,6 +114,8 @@ pub const SMSG_PLAY_OBJECT_SOUND: u16 = 0x0278;
 pub const SMSG_PLAY_SOUND: u16 = 0x02D2;
 /// The zone's weather, pushed by the server.
 pub const SMSG_WEATHER: u16 = 0x02F4;
+/// One `u32` emote, the placed bid's wave (`0x4cc5dd`).
+pub const CMSG_EMOTE: u16 = 0x0102;
 pub const SMSG_EMOTE: u16 = 0x0103;
 pub const CMSG_TEXT_EMOTE: u16 = 0x0104;
 pub const SMSG_TEXT_EMOTE: u16 = 0x0105;
@@ -312,6 +318,9 @@ pub const CMSG_PET_NAME_QUERY: u16 = 0x0052; // 82
 
 /// A pet bar press: the slot's packed word and a target guid, dispatched on its type byte.
 pub const CMSG_PET_ACTION: u16 = 0x0175; // 373
+/// A cast whose caster is the pet or a possessed unit (`SendCast`, `0x6e5816`): the caster's guid,
+/// the spell and the targets block.
+pub const CMSG_PET_CAST_SPELL: u16 = 0x01F0; // 496
 /// A pet bar drag: one or two `(position, packed)` pairs, told apart by body size alone.
 pub const CMSG_PET_SET_ACTION: u16 = 0x0174; // 372
 /// Set a pet spell's autocast bit to a given value (the right-click).
@@ -327,6 +336,9 @@ pub const CMSG_PET_ABANDON: u16 = 0x0176; // 374
 /// Rename the pet (`PetRename`, `0x4be4e0`). One-shot: the server clears `UNIT_FLAG_PET_RENAME`
 /// on success (`PetHandler.cpp:302-345`); a refusal is [`SMSG_PET_NAME_INVALID`].
 pub const CMSG_PET_RENAME: u16 = 0x0177; // 375
+/// Ask the server to resend our pet's or charm's bar, empty body (`0x4bc738`); answered by
+/// `SMSG_PET_SPELLS` (`MiscHandler.cpp:1168`).
+pub const CMSG_REQUEST_PET_INFO: u16 = 0x0279; // 633
 
 /// The ask-once GameObject template lookup, shaped like `CMSG_CREATURE_QUERY`.
 pub const CMSG_GAMEOBJECT_QUERY: u16 = 0x005E; // 94

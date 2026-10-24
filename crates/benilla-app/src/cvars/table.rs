@@ -471,6 +471,9 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // `0x50c000` → `0x50b330` refuses values outside [0.1, 360] rather than clamping.
     same("cameraYawMoveSpeed", "180.0").checked(benilla_ui::script::check_camera_rate),
     same("cameraPitchMoveSpeed", "90.0").checked(benilla_ui::script::check_camera_rate),
+    // The distance axis's yards a second (`0x50b7f3`, read at `0x5113d9`): the wheel's glide and
+    // `MoveViewIn`/`Out`. Its validator `0x50c040` refuses a value out of range.
+    same("cameraDistanceMoveSpeed", "8.33").checked(benilla_ui::script::check_camera_decay),
     // MOUSE_SENSITIVITY (`UIOptionsFrame.lua:87`): FrameXML's spelling of the binary's `mouseSpeed`
     // (`0x402c7b`); lookups are case-insensitive (`CVar::Lookup 0x63de30`), here as there. The
     // reference's default is `SPI_GETMOUSESPEED × 0.1`, "1.0" on stock Windows, and its record
@@ -497,6 +500,9 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // validator `0x50c000` refuses outside [0.1, 360] and the follow reader (`0x512d75`) uses the
     // stored value as is; 90 to 270 is only the stock slider's range.
     same("cameraYawSmoothSpeed", "180.0").checked(benilla_ui::script::check_camera_rate),
+    // `cameraCustomViewSmoothing` (`0x50bad0`, read at `0x50fc33`): with it set, a customised view
+    // still takes the auto-return.
+    same("cameraCustomViewSmoothing", "0"),
     // `UIOptionsFrame.lua:353` names `cameraPitchSmoothSpeed`, registered "45.0" (`0x50b90b`) with
     // the same validator, and `SetCVar` raises on a name no CVar has (`0x488c53`). `FollowRig` has
     // one rate, so nothing reads it.
@@ -579,6 +585,11 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // (`GetScriptMemory 0x46da10`, `SetScriptMemory 0x46da50`) and watched each frame in the
     // world (`0x495599`), [`crate::ui_memory`].
     same("scriptMemory", "49152"),
+    // `widescreen` (`0x63a74f`: name `0x837050`, "1", flags 0, record `[0xc4ec08]`): off, the
+    // resolution list is the four fixed sizes (`0x48bcac`, [`crate::video`]) and the glue's and
+    // the interface's aspect is 4/3 (`0x46ab40`, `0x4901e0`; `crate::ui_script::glue`,
+    // [`crate::portrait::GxAspect`]).
+    same("widescreen", "1"),
     // `gxApi` (`0x63a833`: name `0x842a64`, default `0x864f7c` "direct3d", flags 3, callback
     // `0x63b030`, record `[0xc4ea94]`): the reference builds D3D9 unless it reads "OpenGl"
     // (`0x63a3c4`, `0x842a5c`). Here it reports the wgpu backend (`wgpu::Backend::to_str`), pushed
@@ -602,14 +613,17 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // and macOS offer no mode-set and X11's leaves the desktop changed after a crash
     // ([`crate::video`]).
     same_by_locale("gxWindow", "0", &[(ZH_CN, "1")]).latched(),
-    // `gxResolution`, a string row parsed by `video::on_cvar`. Here it is only the windowed size:
-    // fullscreen is the monitor's own and no mode list is offered.
+    // `gxResolution` (`0x63a7c1`, "640x480", flags 3, callback `0x63aa00`), a string row parsed by
+    // `video::on_cvar` into the windowed size. In fullscreen it answers the borderless window's
+    // device pixels, the size the screen runs at, over that windowed size, which is what it saves
+    // (`video::show_screen_size`).
     deviates(
         "gxResolution",
         "1600x900",
         "640x480",
-        "narrowed to the WINDOWED size only — fullscreen is the monitor's own and we expose \
-         no mode list, and 640x480 is not a window anyone would ship a client at",
+        "the saved value is the WINDOWED size, as fullscreen is the borderless window over the \
+         monitor, whose size the row answers while it holds; and 640x480 is not a window anyone \
+         would ship a client at",
     )
     .latched(),
     // benilla's own: a body pane's doll renders at half the frame rate while the pane is open; the
@@ -723,16 +737,17 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // ── The stock Video Options window's other boxes (`OptionsFrame.lua:5-22`) ───────────────────
     //
     // `ffx` (`0x6ccfe3`: name `0x86f2ac`, record `[0xce8a04]`), `ffxGlow` (`0x6cc17d`, name
-    // `0x86f200`) and `ffxDeath` (`0x6cc6d1`, name `0x86f238`): each "1", flags 1, with the echo stub
-    // `0x6cde30` as callback, and each record's integer read every frame. The FFX begin/end pair
+    // `0x86f200`) and `ffxDeath` (`0x6cc6d1`, name `0x86f238`): each "1", flags 1, with the echo
+    // callback `0x6cde30` ([`benilla_ui::script::check_ffx_echo`]), and each record's integer read
+    // every frame. The FFX begin/end pair
     // (`0x6cd890`/`0x6cda70`) runs the active pass only while `ffx` (`0x6cd8a6`), `pixelShaders`
     // (`0x6cd8b6`) and that pass's own enable hold: `CFFXGlow` (`0x6cc5a0`) reads `ffxGlow` at
     // `0x6cc5a8`, `CFFXDeath` (`0x6cded0`) reads `ffxDeath` at `0x6cdf10`. The stock Okay writes
     // `ffx` as Enable All Shaders (`OptionsFrame.lua:202-204`). The knob is
     // [`benilla_world::ffx_glow::FfxSwitches`].
-    same("ffx", "1"),
-    same("ffxGlow", "1"),
-    same("ffxDeath", "1"),
+    same("ffx", "1").checked(benilla_ui::script::check_ffx_echo),
+    same("ffxGlow", "1").checked(benilla_ui::script::check_ffx_echo),
+    same("ffxDeath", "1").checked(benilla_ui::script::check_ffx_echo),
     // `pixelShaders` (`0x688712`: name `0x869560`, "0", flags 1, callback `0x688f40`, record
     // `[0xc7f360]`) and `specular` (`0x6886a0`: name `0x8695d8`, "0", flags 1, callback `0x688e20`,
     // record `[0xc7f2cc]`), Enable All Shaders and Terrain Highlights. Both callbacks act only on a
