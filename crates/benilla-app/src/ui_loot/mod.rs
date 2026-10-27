@@ -43,10 +43,6 @@ const BIND_CONFIRM_MIN_QUALITY: u32 = 2;
 /// The coin row's quality, 0, so its text is grey: `0x4c23a0`'s coin guard returns 0 at
 /// `0x4c23de`, and `LootFrame_Update` has no coin case (`LootFrame.lua:81-85`).
 const COIN_QUALITY: u32 = 0;
-/// 1.12's `GOLD`, `SILVER` and `COPPER` (`GlobalStrings.lua:2025`, `:3465`, `:865`).
-const GOLD_WORD: &str = "Gold";
-const SILVER_WORD: &str = "Silver";
-const COPPER_WORD: &str = "Copper";
 /// Frames a push waits for its item template before it is dropped, about 2 s at 60 fps.
 const RECEIVE_MAX_TRIES: u16 = 120;
 /// The slots `OnItemPush` treats as the keyring (`0x491bc3`/`0x491bc8`, 0x51..=0x70): the
@@ -175,14 +171,12 @@ impl Window {
         }
         let mut slots: Vec<Option<u64>> = vec![None; MASTER_LOOT_CANDIDATE_SLOTS];
         for &guid in &self.master_candidates {
-            // A guid missing from the roster is ours: `SMSG_GROUP_LIST` lists only the others,
-            // and `Group::MasterLoot` includes us.
-            let flags = group
-                .members
-                .iter()
-                .find(|m| m.guid == guid)
-                .map_or(group.own_flags, |m| m.flags);
-            let base = usize::from(flags & GROUP_MEMBER_SUBGROUP) * MEMBERS_PER_RAID_GROUP;
+            // The stored row's subgroup (`[row+8]`, `0x61c606`); a guid on no row below the count,
+            // ours included, is placed nowhere (`0x61c5f9`).
+            let Some(row) = group.raid.iter().find(|r| r.guid == guid) else {
+                continue;
+            };
+            let base = usize::from(row.subgroup & GROUP_MEMBER_SUBGROUP) * MEMBERS_PER_RAID_GROUP;
             let end = (base + MEMBERS_PER_RAID_GROUP).min(MASTER_LOOT_CANDIDATE_SLOTS);
             if let Some(free) = (base..end).find(|&i| slots[i].is_none()) {
                 slots[free] = Some(guid);
@@ -278,11 +272,11 @@ pub(crate) struct LootState {
     /// (`0x48f264` → `0x4c1fa0`), run by its step on the lane ([`Step::Sweep`]), which holds the
     /// VM; a response or a close since cancels it.
     sweep_owed: bool,
-    /// The `UnlockItem` (`0x495420`) calls the closes and the copier's ending owe on an item
-    /// source, run ahead of the inventory feeds ([`crate::ui_items::locks::apply_item_releases`])
-    /// unless the close's own path runs them; a window's clear keeps them. The flag marks a window
-    /// source's, owed only while the guid resolves as a live item object. A refusal's unlock rides
-    /// the lane instead ([`Self::unlock_item_here`]).
+    /// The `UnlockItem` (`0x495420`) calls a close owes on an item source that a call or a turn
+    /// runs in place, after its line ([`close_interaction_in_place`]); a window's clear keeps
+    /// them. The flag marks a window source's, owed only while the guid resolves as a live item
+    /// object. Every other close and the copier's ending put theirs on the lane at their place
+    /// ([`close_interaction`], [`Self::open`]), as a refusal's does ([`Self::unlock_item_here`]).
     item_unlocks: Vec<(u64, bool)>,
     /// The response's copier end, `LOOT_OPENED` or the sweep, waits on its item records: the
     /// copier returns with a fetch outstanding (`0x4c1ea6`) and the cache callback ends it at the
@@ -300,10 +294,11 @@ impl LootState {
     /// The copier (`0x4c1cb0`) at a response: it ends the session in progress, then fills the
     /// window; quest items ride the same rows at `slot = items.len() + i`.
     pub(crate) fn open(&mut self, source: u64, loot_type: u8, gold: u32, items: Vec<LootItem>) {
-        // The ending unlocks an item source (`0x5ebc35` → `0x48f3a0` → `0x4c1d36`) and clears
-        // the money line's flag (`0x4c1d95`).
+        // The ending unlocks an item source (`0x5ebc35` → `0x48f3a0` → `0x4c1d36`), on the lane
+        // ahead of the step whose firing signals the ended session's `LOOT_CLOSED` (`0x4c1dac`),
+        // and clears the money line's flag (`0x4c1d95`).
         if let Some(old) = self.window.source {
-            self.unlock_item_source(old);
+            self.queue_source_unlocks(old, 1);
             self.coin_line_shown = false;
         }
         let ended = Window {
@@ -538,6 +533,21 @@ impl LootState {
         }
     }
 
+    /// The lane's queued unlock steps, taken unfired, in order, each flagged when it needs a live
+    /// item object.
+    #[cfg(test)]
+    pub(crate) fn take_queued_unlocks(&mut self) -> Vec<(u64, bool)> {
+        let mut out = Vec::new();
+        self.steps.retain(|(_, s)| match s {
+            Step::Unlocks(u) => {
+                out.extend(u.iter().copied());
+                false
+            }
+            _ => true,
+        });
+        out
+    }
+
     /// The guids the lane's queued unlock steps will unlock, in order.
     #[cfg(test)]
     pub(crate) fn queued_unlocks(&self) -> Vec<u64> {
@@ -560,30 +570,13 @@ impl LootState {
         }
     }
 
-    /// How many unlocks are owed, a mark for [`Self::defer_close_unlocks`].
-    pub(crate) fn owed_unlocks(&self) -> usize {
-        self.item_unlocks.len()
-    }
-
-    /// Signal the unlocks a close owed past `mark` in their place on the lane, ahead of its
-    /// teardown's step, the last queued: for a close inside a packet, which the lane shows.
-    pub(crate) fn defer_close_unlocks(&mut self, mark: usize) {
-        let unlocks = self
-            .item_unlocks
-            .split_off(mark.min(self.item_unlocks.len()));
-        if unlocks.is_empty() {
-            return;
+    /// `n` of the window teardown's `UnlockItem`s on its source, on the lane at the caller's
+    /// place, ahead of what it queues next: each runs only while the source resolves as a live
+    /// item object (`0x48f299`/`0x48f2ab`, `0x4c1cdf`/`0x4c1d23`), checked as the step fires.
+    fn queue_source_unlocks(&mut self, guid: u64, n: usize) {
+        if benilla_protocol::guid::is_item(guid) {
+            self.queue(Step::Unlocks(vec![(guid, true); n]));
         }
-        let teardown = self.steps.pop_back().map(|(_, step)| step);
-        self.queue(Step::Unlocks(unlocks));
-        if let Some(step) = teardown {
-            self.queue(step);
-        }
-    }
-
-    /// Whether any unlock is owed.
-    pub(crate) fn owes_unlocks(&self) -> bool {
-        !self.item_unlocks.is_empty()
     }
 
     /// The owed unlocks, in order, each flagged when it needs a live item object.
@@ -620,6 +613,18 @@ impl LootState {
         self.window.source
     }
 
+    /// `ClearLootRollState` (`0x5ebcf0`), from `SMSG_LOOT_ALL_PASSED` (`0x61b5dd`) and
+    /// `SMSG_LOOT_ROLL_WON` (`0x61b97c`): the row at `slot` of the open source `guid` goes back to
+    /// the type 0 its click re-reads (`0x4c28a9` → `0x5ebce0`), so the freed item loots.
+    pub(crate) fn roll_resolved(&mut self, guid: u64, slot: u8) {
+        if self.window.source != Some(guid) {
+            return;
+        }
+        if let Some(row) = self.window.items.iter_mut().find(|i| i.slot == slot) {
+            row.slot_type = benilla_protocol::messages::slot_type::ALLOW_LOOT;
+        }
+    }
+
     /// `LootHasContents` (`0x4c2a70`): the source resolves as any object (`0x4c2a8c`, mask 1) and
     /// has money above 0 or a row left.
     fn has_contents(&self, objects: &crate::net::Objects) -> bool {
@@ -649,7 +654,11 @@ impl LootState {
 
     /// `0xb71b44` above 0: a row's item record is still being fetched, counted from the copier
     /// (`0x4c1e77`) until its callback (`0x4c2ac0`); a negative answer releases the row, as
-    /// [`templates_outstanding`] has it.
+    /// [`templates_outstanding`] has it. Deviation: a row cleared meanwhile stops counting, where
+    /// `ClearLootRow` (`0x4c1f00`) cancels its callback (`0x4c1f52`) and never lowers the count
+    /// (its writers are `0x4c1def`, `0x4c1e94` and `0x4c2af6` alone), so in 1.12.1 a group
+    /// member's take of an uncached item before the answer leaves that corpse's window shut until
+    /// the next loot response resets the count (`0x4c1def`), and ours opens.
     fn records_pending(&self, items: &Items) -> bool {
         let w = &self.window;
         w.items.iter().any(|it| {
@@ -810,7 +819,8 @@ impl Plugin for UiLootPlugin {
             .add_systems(
                 Update,
                 (
-                    // The window as it stands before the input pass and the drain after it. The
+                    // The window as the packets left it, before the tick and the drain after it;
+                    // the next frame's input records read it. The
                     // drain's deselect lands before the selection writers read it, and their
                     // teardown's close finds this frame's window.
                     feed_loot.in_set(UiFeed),
@@ -836,24 +846,6 @@ impl Plugin for UiLootPlugin {
 /// ([`feed_loot`]). The pushes wait for it, as they wait for a VM.
 fn drop_loot_steps(mut loot: ResMut<LootState>) {
     loot.steps.retain(|(_, s)| matches!(s, Step::Push(_)));
-}
-
-/// The coin row's name: each nonzero denomination as "<n> <Word>", joined by spaces. The
-/// reference's composer `0x6c6260` emits the same "%d %s" parts but separates them with a newline
-/// (`0x835144`).
-fn format_money(copper: u32) -> String {
-    let (g, s, c) = (copper / 10000, (copper % 10000) / 100, copper % 100);
-    let mut parts: Vec<String> = Vec::new();
-    if g > 0 {
-        parts.push(format!("{g} {GOLD_WORD}"));
-    }
-    if s > 0 {
-        parts.push(format!("{s} {SILVER_WORD}"));
-    }
-    if c > 0 || parts.is_empty() {
-        parts.push(format!("{c} {COPPER_WORD}"));
-    }
-    parts.join(" ")
 }
 
 /// The coin row's icon: the reference's six-step ladder (`0x4c2460` → `0x6c62d0`), shared with
@@ -899,6 +891,7 @@ fn resolve_item(
         quantity: item.count,
         quality,
         is_coin: false,
+        money: 0,
         item_id: item.item_id,
         link,
         // The raw id, as the client's loot record keeps it; the tooltip resolves it (`0x52b7bf`).
@@ -932,7 +925,9 @@ fn snapshot(
     let mut rows = Vec::with_capacity(window.items.len() + 1);
     if window.coin_slot {
         rows.push(window.has_coin().then(|| LootRow {
-            name: Some(format_money(window.gold)),
+            // Spelled out at `GetLootSlotInfo`'s call, from the money cell (`0x4c2550`).
+            name: None,
+            money: window.gold,
             texture: Some(coin_icon(window.gold).into()),
             // 0: `0x4c22e0`'s coin guard returns before the record read (`0x4c22fd`).
             quantity: 0,
@@ -1369,18 +1364,21 @@ fn feed_loot(mut vm: VmWith<(LootSteps<'static, 'static>, ())>, reads: LootReads
         let Some(script) = script else {
             return;
         };
-        let loot = &mut *steps.loot;
-        let (held, mut still): (Vec<_>, Vec<_>) = std::mem::take(&mut loot.waiting)
-            .into_iter()
-            .partition(|r| reads.items.template(r.entry, 0, Ask::Read).is_some());
-        still.retain_mut(|r| {
-            r.tries += 1;
-            r.tries < RECEIVE_MAX_TRIES
-        });
-        loot.waiting = still;
-        for r in held {
-            loot.queue(Step::Push(r));
+        if !steps.loot.waiting.is_empty() {
+            let loot = &mut *steps.loot;
+            let (held, mut still): (Vec<_>, Vec<_>) = std::mem::take(&mut loot.waiting)
+                .into_iter()
+                .partition(|r| reads.items.template(r.entry, 0, Ask::Read).is_some());
+            still.retain_mut(|r| {
+                r.tries += 1;
+                r.tries < RECEIVE_MAX_TRIES
+            });
+            loot.waiting = still;
+            for r in held {
+                loot.queue(Step::Push(r));
+            }
         }
+        let loot = &*steps.loot;
         if loot.window_steps_queued() {
             return;
         }
@@ -1508,7 +1506,8 @@ fn end_open<X: bevy::ecs::system::SystemParam + 'static>(
 fn run_then<X: bevy::ecs::system::SystemParam + 'static>(
     vm: &mut VmWith<(LootSteps<'static, 'static>, X)>,
 ) {
-    loop {
+    // Read before it is taken, so a turn with nothing owed leaves the window unchanged.
+    while !vm.own().0.loot.then.is_empty() {
         let Some(then) = vm.own().0.loot.then.pop() else {
             break;
         };
@@ -1622,7 +1621,7 @@ pub(crate) fn seat_loot_steps(world: &mut World) {
     world.init_resource::<crate::net::GuidIndex>();
     world.init_resource::<Items>();
     world.init_resource::<Messages<crate::sound::LootPickupSound>>();
-    world.init_resource::<Messages<crate::target::DeselectGuid>>();
+    world.init_resource::<crate::target::OwedSelects>();
 }
 
 /// Whether a take must raise `LOOT_BIND_CONFIRM` first (`0x4c28f2`/`0x4c28fb`): bind on pickup
@@ -1635,12 +1634,41 @@ fn bind_confirm_required(items: &Items, item_id: u32) -> bool {
 
 /// `CloseInteraction 0x48f200` past its early returns, the one close every loot close shares: the
 /// latch drops (`0x48f2c9`), the release goes out when `release` is given (the `cl` argument,
-/// `0x48f2da`) and the frame closes (`0x48f33d`). Returns the closed source for
-/// [`DeadUnitDeselect`], the close's last step.
+/// `0x48f2da`) and the frame closes (`0x48f33d`). An item source's two unlocks go on the lane at
+/// the close's place, ahead of the teardown's step, so a packet's close signals them inside its
+/// packet and an engine step's at its own. Returns the closed source for [`DeadUnitDeselect`], the
+/// close's last step.
 pub(crate) fn close_interaction(
     loot: &mut LootState,
     latch: &mut LootLatch,
     release: Option<&NetCommands>,
+) -> Option<u64> {
+    close_with(loot, latch, release, Unlocks::OnTheLane)
+}
+
+/// [`close_interaction`] for a call or a turn that signals the unlocks in place itself, after the
+/// line the close's flag shows (`0x48f27b`): they wait in the session's own list
+/// ([`unlock_closed_source`]).
+pub(crate) fn close_interaction_in_place(
+    loot: &mut LootState,
+    latch: &mut LootLatch,
+    release: Option<&NetCommands>,
+) -> Option<u64> {
+    close_with(loot, latch, release, Unlocks::InPlace)
+}
+
+/// Where a close's two unlocks go.
+#[derive(Clone, Copy)]
+enum Unlocks {
+    OnTheLane,
+    InPlace,
+}
+
+fn close_with(
+    loot: &mut LootState,
+    latch: &mut LootLatch,
+    release: Option<&NetCommands>,
+    unlocks: Unlocks,
 ) -> Option<u64> {
     let source = loot.source()?;
     latch.clear_for(source);
@@ -1648,10 +1676,16 @@ pub(crate) fn close_interaction(
         let _ = commands.0.send(ClientCommand::LootRelease { guid: source });
     }
     // An item source unlocks twice, each with its `ITEM_LOCK_CHANGED`: the close's own
-    // `UnlockItem` (`0x48f2bd`), then the frame teardown's (`0x4c1d36`). A move-start close, the
-    // one with `dl` set, returns before both and never reaches here with an item.
-    loot.unlock_item_source(source);
-    loot.unlock_item_source(source);
+    // `UnlockItem` (`0x48f2bd`), then the frame teardown's (`0x4c1d36`), both ahead of the
+    // teardown's `LOOT_CLOSED` (`0x4c1dac`). A move-start close, the one with `dl` set, returns
+    // before both and never reaches here with an item.
+    match unlocks {
+        Unlocks::OnTheLane => loot.queue_source_unlocks(source, 2),
+        Unlocks::InPlace => {
+            loot.unlock_item_source(source);
+            loot.unlock_item_source(source);
+        }
+    }
     loot.clear();
     Some(source)
 }
@@ -1670,7 +1704,8 @@ pub(crate) fn close_loot_on_leave_world(mut vm: VmWith<(LootSteps<'static, 'stat
             }
             return None;
         }
-        let closed = close_interaction(&mut steps.loot, &mut steps.latch, Some(&steps.net))?;
+        let closed =
+            close_interaction_in_place(&mut steps.loot, &mut steps.latch, Some(&steps.net))?;
         if let Some(script) = script {
             unlock_closed_source(script, &mut steps.loot, &steps.objects);
         }
@@ -1690,15 +1725,8 @@ pub(crate) fn close_loot_on_leave_world(mut vm: VmWith<(LootSteps<'static, 'stat
 
 /// Tell the VM in the world that a close the feed will not see closed the window: the UI
 /// shutdown's deselect closing the loot on its target (`0x490bdf` → `0x493910` → `0x48f200`).
-pub(crate) fn tell_loot_closed(
-    mut vm: VmWith<ResMut<'static, LootState>>,
-    objects: crate::net::Objects,
-) {
-    vm.turn(|script, mut loot| {
-        if let Some(script) = script {
-            unlock_closed_source(script, &mut loot, &objects);
-        }
-    });
+/// That close is on the selected unit, never an item, so it owes no unlock (`0x48f2ab`).
+pub(crate) fn tell_loot_closed(mut vm: VmWith<()>) {
     vm.turn(|script, _| {
         if let Some(script) = script {
             announce_loot_closed(script);
@@ -1749,16 +1777,22 @@ pub(crate) struct DeadUnitDeselect<'w, 's> {
             &'static crate::net::ObjectStore,
         ),
     >,
-    asks: MessageWriter<'w, crate::target::DeselectGuid>,
+    /// Where the deselect is owed ([`crate::target::OwedSelect::Deselect`]); absent in a harness
+    /// without targets.
+    owed: Option<ResMut<'w, crate::target::OwedSelects>>,
 }
 
 impl DeadUnitDeselect<'_, '_> {
     pub(crate) fn after_close(&mut self, closed: Option<u64>) {
-        let Some(source) = closed else {
-            return;
-        };
-        let dead_unit = self
-            .index
+        if let Some(source) = self.dead_unit(closed) {
+            self.deselect(source);
+        }
+    }
+
+    /// The closed source, when it is a dead unit.
+    pub(super) fn dead_unit(&self, closed: Option<u64>) -> Option<u64> {
+        let source = closed?;
+        self.index
             .0
             .get(&source)
             .and_then(|&e| self.objects.get(e).ok())
@@ -1767,10 +1801,20 @@ impl DeadUnitDeselect<'_, '_> {
                     net_entity.kind,
                     benilla_protocol::EntityKind::Unit | benilla_protocol::EntityKind::Player
                 ) && (store.0.unit_health().unwrap_or(0) as i32) <= 0 // signed, `jg` at `0x48f360`
-            });
-        if dead_unit {
-            self.asks.write(crate::target::DeselectGuid(source));
+            })
+            .then_some(source)
+    }
+
+    /// Owe `0x493910(source, 1)`.
+    pub(super) fn deselect(&mut self, source: u64) {
+        if let Some(owed) = self.owed.as_deref_mut() {
+            owed.deselect(source);
         }
+    }
+
+    /// Where a handler that owes its own selects owes them, beside this deselect.
+    pub(crate) fn owed_selects(&mut self) -> Option<&mut crate::target::OwedSelects> {
+        self.owed.as_deref_mut()
     }
 }
 
@@ -1917,7 +1961,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut app = App::new();
         app.add_message::<crate::sound::LootPickupSound>()
-            .add_message::<crate::target::DeselectGuid>()
+            .init_resource::<crate::target::OwedSelects>()
             .init_resource::<LootState>()
             .init_resource::<LootLatch>()
             .init_resource::<LootMoveStart>()
@@ -2533,6 +2577,30 @@ mod tests {
         );
     }
 
+    /// `0x61c550` places a candidate only off its row below the roster's count: a guid on no row
+    /// is skipped (`0x61c5f9`), taking no slot, so the next candidate of that block files first.
+    #[test]
+    fn a_raid_candidate_on_no_row_is_placed_nowhere() {
+        let mut raid = GroupState {
+            group_type: crate::ui_party::GROUPTYPE_RAID,
+            members: vec![GroupMemberEntry {
+                name: "Cairne".into(),
+                guid: 0xB,
+                status: 0,
+                flags: 0,
+            }],
+            ..GroupState::default()
+        };
+        raid.rebuild_raid(0xA);
+        let mut loot = LootState::default();
+        loot.set_master_candidates(vec![0xE, 0xB, 0xA]);
+        loot.open(0x42, loot_type::CORPSE, 0, vec![master_item(0, 117, 1)]);
+        let placed: Vec<Option<u64>> = (1..=4)
+            .map(|i| loot.window.master_candidate(i, &raid))
+            .collect();
+        assert_eq!(placed, [Some(0xB), Some(0xA), None, None], "0xE has no row");
+    }
+
     /// `0x61c550`'s raid placement: each guid in the first free slot of its subgroup's block.
     #[test]
     fn raid_candidates_file_into_their_own_subgroup_block() {
@@ -2545,7 +2613,6 @@ mod tests {
         let mut raid = GroupState {
             group_type: crate::ui_party::GROUPTYPE_RAID,
             own_flags: 0, // we are in subgroup 0
-            own_raid_row: Some(0xA),
             ..GroupState::default()
         };
         raid.members = vec![
@@ -2553,6 +2620,7 @@ mod tests {
             member(0xC, "Vol", 2),
             member(0xD, "Sylvanas", 2),
         ];
+        raid.rebuild_raid(0xA);
 
         let mut loot = LootState::default();
         // The wire order interleaves the subgroups; placement ignores it.
@@ -2962,14 +3030,53 @@ mod tests {
         assert!(!(20..=23).contains(&push_container(63, 0)));
     }
 
+    /// The coin row's name is `GetLootRowName`'s (`0x4c2550`): gold, silver and copper in that
+    /// order, each non-zero one as `"%d %s%s"` (`0x847ffc`) with the word read from the
+    /// `GOLD`/`SILVER`/`COPPER` global at the call (`0x6c6230`, `0x703bf0`) and `"\n"`
+    /// (`0x835144`) after gold and silver, `""` (`0x882748`) after copper.
     #[test]
-    fn money_formats_with_real_words_dropping_zero_denominations() {
-        assert_eq!(format_money(0), "0 Copper");
-        assert_eq!(format_money(4), "4 Copper");
-        assert_eq!(format_money(25), "25 Copper");
-        assert_eq!(format_money(10025), "1 Gold 25 Copper");
-        assert_eq!(format_money(12_345), "1 Gold 23 Silver 45 Copper");
-        assert_eq!(format_money(10_000), "1 Gold");
+    fn the_coin_rows_name_puts_each_denomination_on_its_own_line_in_the_globals_words() {
+        let items = Items::default();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let commands = NetCommands(tx);
+        let (grp, nm) = nobody();
+        let mut script = UiScript::new().expect("VM");
+        script
+            .run(r#"GOLD = "Gold" SILVER = "Silver" COPPER = "Copper""#)
+            .expect("the words");
+        let name_of = |script: &mut UiScript, copper: u32| {
+            let mut loot = LootState::default();
+            loot.open(0x42, loot_type::CORPSE, copper, vec![]);
+            let snap = snapshot(
+                &loot.window,
+                &items,
+                None,
+                Ask::Event(&commands),
+                RollCatalogs::NONE,
+                Candidates {
+                    group: &grp,
+                    names: &nm,
+                },
+            );
+            script.set_loot(snap);
+            script
+                .eval::<String>("local _, name = GetLootSlotInfo(1) return name")
+                .expect("the coin row")
+        };
+        let s = &mut script;
+        assert_eq!(name_of(s, 12_345), "1 Gold\n23 Silver\n45 Copper");
+        assert_eq!(name_of(s, 10_000), "1 Gold\n", "gold's newline stays");
+        assert_eq!(name_of(s, 10_025), "1 Gold\n25 Copper");
+        assert_eq!(name_of(s, 2_300), "23 Silver\n");
+        assert_eq!(name_of(s, 4), "4 Copper");
+
+        s.run(r#"GOLD = "Or" SILVER = "Argent" COPPER = "Cuivre""#)
+            .expect("an addon's words");
+        assert_eq!(
+            name_of(s, 12_345),
+            "1 Or\n23 Argent\n45 Cuivre",
+            "the words are the globals' at the call"
+        );
     }
 
     /// The reference's six-step ladder (`0x6c6307`-`0x6c6386`), both sides of every boundary.
@@ -2991,13 +3098,13 @@ mod tests {
     }
 
     #[test]
-    fn coin_row_uses_real_words_and_the_ladders_icon() {
+    fn coin_row_carries_its_copper_and_the_ladders_icon() {
         let items = Items::default();
         let (tx, _rx) = crossbeam_channel::unbounded();
         let commands = NetCommands(tx);
         let (grp, nm) = nobody();
         let mut loot = LootState::default();
-        // A pure-copper drop: name reads "4 Copper", icon is the copper coin pile (_05).
+        // A pure-copper drop: its copper for the name, and the copper coin pile (_05).
         loot.open(0x42, loot_type::CORPSE, 4, vec![]);
         let snap = snapshot(
             &loot.window,
@@ -3014,7 +3121,7 @@ mod tests {
         assert_eq!(snap.rows.len(), 1, "coin row only");
         let coin = snap.rows[0].as_ref().expect("coin row present");
         assert!(coin.is_coin);
-        assert_eq!(coin.name.as_deref(), Some("4 Copper"));
+        assert_eq!(coin.money, 4, "the name is spelled out at the call");
         assert_eq!(coin.texture.as_deref(), Some(coin_icon(4)));
     }
 
@@ -3053,7 +3160,7 @@ mod tests {
         assert_eq!(snap.rows.len(), 2, "coin + one item");
         let coin = snap.rows[0].as_ref().expect("coin row present");
         assert!(coin.is_coin);
-        assert_eq!(coin.name.as_deref(), Some("1 Gold 23 Silver 45 Copper"));
+        assert_eq!(coin.money, 12_345);
         assert_eq!(coin.texture.as_deref(), Some(coin_icon(12_345)));
         // The item's name is nil while its template is in flight; its quantity is present.
         let row = snap.rows[1].as_ref().expect("item row present");
@@ -3133,11 +3240,7 @@ mod tests {
 
     /// The deselects asked for since the last call.
     fn deselects(app: &mut App) -> Vec<u64> {
-        app.world_mut()
-            .resource_mut::<bevy::ecs::message::Messages<crate::target::DeselectGuid>>()
-            .drain()
-            .map(|d| d.0)
-            .collect()
+        crate::target::take_owed_deselects(app.world_mut())
     }
 
     /// Opens a window as an admitted response does: the rows and the latch.
@@ -3402,9 +3505,9 @@ mod tests {
             assert_eq!(
                 app.world_mut()
                     .resource_mut::<LootState>()
-                    .take_item_unlocks(),
+                    .take_queued_unlocks(),
                 vec![(LOCKBOX, true), (LOCKBOX, true)],
-                "the close's unlock and the teardown's"
+                "the close's unlock and the teardown's, on the lane at the close"
             );
         }
 
@@ -3569,22 +3672,6 @@ mod tests {
         app.update();
         app.update();
         assert_eq!(seen_in(&app), ["LOOT_OPENED", "LOOT_CLOSED"]);
-    }
-
-    /// Every close but the sweep's and the reload's (`CloseLoot`, the release response, the
-    /// auto-release, the at-rest close) owes an item source's two unlocks (`0x48f2bd`, `0x4c1d36`)
-    /// to `apply_item_releases` and leaves `LOOT_CLOSED` to the lane. Both unlocks come before the
-    /// teardown signals it (`0x4c1dac`), so the releases run first and each `ITEM_LOCK_CHANGED`
-    /// handler reads the window open. The VM pass holds the order by registration
-    /// (`crate::vm_pass`), so a move that flips it fails here.
-    #[test]
-    fn the_owed_unlocks_run_before_the_lanes_loot_closed() {
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
-        assert!(crate::test_support::runs_before(
-            &mut app,
-            crate::ui_items::locks::apply_item_releases,
-            crate::lanes::fire_in_order,
-        ));
     }
 
     /// The sweep's loot leg on a lockbox: `CloseInteraction`'s unlock (`0x48f2bd`) and the

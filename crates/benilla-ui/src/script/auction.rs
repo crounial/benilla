@@ -358,11 +358,17 @@ pub enum AuctionCall {
     /// `StartAuction` past its slot: with an auctioneer (`0x4ce7da`), the damaged item's refusal
     /// or the send and the sell slot's clear (`0x4ce925`, `0x4ce92a`).
     Start(Result<AuctionStartRequest, &'static str>),
+    /// `SortAuctionItems` past its names (`0x4cfc00`): list `list`'s driver promotes `column` in
+    /// the engine's stack, with a session or without (`0x4cd850`).
+    Sort { list: usize, column: u8 },
+    /// `CloseAuctionHouse()` (`0x4ce160`): the close core `0x4cd5f0`.
+    Close,
 }
 
 impl super::UiScript {
-    /// Push the Browse tab's class tree. Login-scoped: the stock `AuctionFrameBrowse_OnLoad` reads
-    /// the classes when the addon loads, before any auctioneer session.
+    /// Seat the Browse tab's class tree. Seeded in each VM's prepare: the reference reads the DBCs
+    /// inside the verbs, so file scope and the stock `AuctionFrameBrowse_OnLoad` see the classes
+    /// before any auctioneer session.
     pub fn set_auction_item_classes(&mut self, classes: Vec<AuctionCategory>) {
         self.model_mut().auction_item_classes = classes;
     }
@@ -461,11 +467,15 @@ impl super::UiScript {
         })
     }
 
-    /// The guids `GetAuctionItemInfo` read and missed in the name cache since the last take, each
-    /// with the list whose callback it registers, in read order, for the app to ask
-    /// (`0x4cf167`, `0x4cf1c8`).
+    /// The names `GetAuctionItemInfo` missed, each with the list whose callback it registers, as a
+    /// harness's VM kept them ([`Self::keep_calls`]), in read order (`0x4cf167`, `0x4cf1c8`).
     pub fn take_auction_name_asks(&mut self) -> Vec<(u64, usize)> {
-        std::mem::take(&mut self.model_mut().auction_name_asks)
+        self.take_calls_where(|call| match call {
+            super::ScriptCall::RecordAsk(super::RecordAsk::AuctionName { guid, list }) => {
+                Some((*guid, *list))
+            }
+            _ => None,
+        })
     }
 
     /// `0x4cdfe0` as a result or notice runs it (`0x4cc658`, `0x4cd173`, `0x4cd468`,
@@ -495,17 +505,6 @@ impl super::UiScript {
         super::tick::verb(&self.lua, |model| {
             patch_row(model, list, page, auction_id, bid)
         });
-    }
-
-    /// Drain the header clicks: `(list index, sort key)`, in click order, which the app replays
-    /// onto its own copy of the stacks, the one that outlives the session and the VM.
-    pub fn take_auction_sorts(&mut self) -> Vec<(usize, String)> {
-        std::mem::take(&mut self.model_mut().auction_sorts)
-    }
-
-    /// Whether `CloseAuctionHouse` was called since the last drain (and clear the flag).
-    pub fn take_auction_close(&mut self) -> bool {
-        std::mem::take(&mut self.model_mut().auction_close)
     }
 
     /// The sell slot's `(bag, slot)`, resolved by the app to the item guid on `StartAuction`.
@@ -544,18 +543,13 @@ pub(crate) fn clear_sell_slot(model: &mut Model) {
 /// `ERR_AUCTION_WRAPPED_ITEM` (`0x4ce4b1`); record flags `& 4` are `ERR_AUCTION_LOOT_ITEM`
 /// (`0x4ce4d6`). The record is the item cache's, read with no callback (`0x55ba30`); without one
 /// its flags read 0 (`0x5da2b3`).
-fn sell_refusal(model: &Model, item: &cursor::CursorItem) -> Option<&'static str> {
+fn sell_refusal(lua: &Lua, model: &Model, item: &cursor::CursorItem) -> Option<&'static str> {
     let (bound, flags, duration, seats) = if item.bag == cursor::EQUIPMENT_BAG {
-        let s = model
-            .player_slot_object(item.slot as usize)
+        let s = crate::script::char_stats::player_slot_object(lua, model, item.slot as usize)
             .filter(|s| s.guid == item.guid)?;
         (s.already_bound, s.flags, s.field_duration, s.occupied_seats)
     } else {
-        let s = model
-            .containers
-            .get(&item.bag)?
-            .slots
-            .get(&item.slot)
+        let s = super::held::held_slot(lua, model, item.bag, item.slot)
             .filter(|s| s.guid == item.guid)?;
         (s.already_bound, s.flags, s.field_duration, s.occupied_seats)
     };
@@ -761,15 +755,18 @@ fn row_at(model: &Model, kind: &str, index: usize) -> Option<AuctionItemRow> {
 
 /// The sell slot's `(name, texture, count, quality, canUse, stackValue)`, `stackValue` being the
 /// vendor price times the stack: the base of the suggested opening price and the deposit.
-fn sell_item_info(model: &Model) -> Option<(String, Option<String>, u32, i64, bool, u32)> {
+fn sell_item_info(
+    lua: &Lua,
+    model: &Model,
+) -> Option<(String, Option<String>, u32, i64, bool, u32)> {
     let it = model.auction_sell_item.as_ref()?;
     // The real stack size, not the split-carry field: the deposit is per stack.
-    let count = cursor::held_count(model, it);
+    let count = cursor::held_count(lua, model, it);
     let template = model.item_templates.get(&it.item_id);
     let name = cursor::item_link_name(it.link.as_deref());
     let quality = it.quality.map_or(-1, i64::from);
     let sell_price = template.map_or(0, |v| v.sell_price);
-    let can_use = super::item_stats::item_usable_by_id(model, it.item_id);
+    let can_use = super::item_stats::item_usable_by_id(lua, model, it.item_id);
     // The price is a 32-bit `imul` in both readers (`0x4ce295`, `0x4ce703`).
     Some((
         name,
@@ -799,7 +796,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // GetNumAuctionItems(type) → numBatchAuctions (at most 50), totalAuctions (before the cap).
     g.set(
         "GetNumAuctionItems",
-        lua.create_function(|lua, kind: String| {
+        lua.create_function(|lua, kind: Value| {
+            // `is-number-or-string` else `Usage: GetNumAuctionItems("type")` (`0x849424`,
+            // `0x4ced37`).
+            let kind = binding_abi::string_arg(lua, kind, r#"Usage: GetNumAuctionItems("type")"#)?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let Some((batch, total)) = list_index(&kind).and_then(|i| {
                 model
@@ -822,12 +822,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // GetAuctionItemInfo(type, index) → twelve values; `highBidder` is a name, `1` or nil.
     g.set(
         "GetAuctionItemInfo",
-        lua.create_function(|lua, (kind, index): (String, Value)| {
-            let index = crate::script::binding_abi::index_arg(
-                lua,
-                index,
-                "Usage: GetAuctionItemInfo(\"type\", index)",
-            )?;
+        lua.create_function(|lua, (kind, index): (Value, Value)| {
+            // `is-number-or-string` and `is-number` else `Usage: GetAuctionItemInfo("type", index)`
+            // (`0x849448`, `0x4cf270`).
+            const USAGE: &str = r#"Usage: GetAuctionItemInfo("type", index)"#;
+            let kind = binding_abi::string_arg(lua, kind, USAGE)?;
+            let index = binding_abi::index_arg(lua, index, USAGE)?;
             let row = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
                 row_at(&model, &kind, index)
@@ -855,20 +855,33 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             // `canUse` is per call, not pushed: it follows the player's level, class and spellbook.
             let can_use = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                super::item_stats::item_usable_by_id(&model, r.item_id)
+                super::item_stats::item_usable_by_id(lua, &model, r.item_id)
             };
-            // A name the cache misses is asked with the list's callback, the bidder's on an owned
-            // row first (`0x4cf167`), then the seller's (`0x4cf1c8`); nothing else asks a name.
+            // The names off the name cache as the call runs, the bidder's on an owned row first
+            // (`0x4cf167`), then the seller's (`0x4cf1c8`); the push's only with no host lent. A
+            // miss is asked inside the call with the list's callback; nothing else asks a name.
+            let mut r = r;
+            let live = |guid: u64| super::live::ask(lua, &super::PlayerNameQuery(guid));
+            let bidder = (r.named_bidder != 0).then(|| match live(r.named_bidder) {
+                Some(name) => name,
+                None => match &r.high_bidder {
+                    AuctionHighBidder::Name(n) => Some(n.clone()),
+                    _ => None,
+                },
+            });
+            let owner = (r.owner_guid != 0).then(|| live(r.owner_guid).unwrap_or(r.owner.take()));
+            if let Some(name) = &bidder {
+                r.high_bidder = name
+                    .clone()
+                    .map_or(AuctionHighBidder::Nil, AuctionHighBidder::Name);
+            }
+            if let Some(name) = &owner {
+                r.owner.clone_from(name);
+            }
             if let Some(list) = list_index(&kind) {
-                let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-                let bidder_missed = r.named_bidder != 0 && r.high_bidder == AuctionHighBidder::Nil;
-                let seller_missed = r.owner_guid != 0 && r.owner.is_none();
-                for (missed, guid) in [
-                    (bidder_missed, r.named_bidder),
-                    (seller_missed, r.owner_guid),
-                ] {
-                    if missed && !model.auction_name_asks.contains(&(guid, list)) {
-                        model.auction_name_asks.push((guid, list));
+                for (name, guid) in [(&bidder, r.named_bidder), (&owner, r.owner_guid)] {
+                    if matches!(name, Some(None)) {
+                        super::calls::ask(lua, super::RecordAsk::AuctionName { guid, list })?;
                     }
                 }
             }
@@ -939,12 +952,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     g.set(
         "GetAuctionItemLink",
-        lua.create_function(|lua, (kind, index): (String, Value)| {
-            let index = crate::script::binding_abi::index_arg(
-                lua,
-                index,
-                "Usage: GetAuctionItemLink(\"type\", index)",
-            )?;
+        lua.create_function(|lua, (kind, index): (Value, Value)| {
+            // `is-number-or-string` and `is-number` else `Usage: GetAuctionItemLink("type", index)`
+            // (`0x849474`, `0x4cf44d`).
+            const USAGE: &str = r#"Usage: GetAuctionItemLink("type", index)"#;
+            let kind = binding_abi::string_arg(lua, kind, USAGE)?;
+            let index = binding_abi::index_arg(lua, index, USAGE)?;
             let link = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
                 row_at(&model, &kind, index).and_then(|r| r.link)
@@ -1017,8 +1030,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     // SortAuctionItems(type, sort) (`0x4cfc00`): the sort name is matched first, then the type;
     // either unknown sorts nothing (`0x4cfd90`). Otherwise the list's driver promotes the column
-    // and runs the sort tail, which sorts and signals before the call returns (`0x4cd850`,
-    // `0x4cdc70`, `0x4cdd60`); the click is queued for the app's copy of the stack.
+    // in the engine's stack, the one that outlives the session and the VM, then runs the sort
+    // tail, which sorts and signals before the call returns (`0x4cd850`, `0x4cdc70`, `0x4cdd60`).
     g.set(
         "SortAuctionItems",
         lua.create_function(|lua, (kind, sort): (Value, Value)| {
@@ -1034,10 +1047,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let Some(list) = list_index(&kind) else {
                 return Ok(());
             };
+            submit(lua, AuctionCall::Sort { list, column })?;
             super::tick::verb(lua, |model| {
-                model
-                    .auction_sorts
-                    .push((list, SORT_KEYS[usize::from(column)].to_string()));
                 if let Some(a) = model.auction.as_mut() {
                     a.lists[list].sort.promote(column);
                 }
@@ -1080,7 +1091,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     // GetAuctionItemClasses() → the ten auctionable class names in the reference's menu order, off
-    // the player's ItemClass.dbc; pushed at login, no session needed.
+    // the player's ItemClass.dbc; seeded in the prepare, no session needed.
     g.set(
         "GetAuctionItemClasses",
         lua.create_function(|lua, ()| {
@@ -1324,11 +1335,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 // A damaged item, not wrapped (`flags & 8`), with a max durability whose current
                 // falls short, refuses with `ERR_AUCTION_REPAIR_ITEM` (`0x4ce80f`-`0x4ce83f`). An
                 // item not found skips the check (`0x4ce802`).
-                let damaged = model
-                    .containers
-                    .values()
-                    .flat_map(|c| c.slots.values())
-                    .find(|s| s.guid == guid)
+                let damaged = super::held::find_guid(lua, &model, guid)
+                    .map(|(_, _, s)| s)
                     .is_some_and(|s| {
                         s.flags & 0x8 == 0
                             && s.durability.is_some_and(|(cur, max)| max > 0 && cur < max)
@@ -1406,7 +1414,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 binding_abi::index_arg32(lua, minutes, "Usage: CalculateAuctionDeposit(runTime)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let rate = model.auction.as_ref().map_or(0, |a| a.deposit_percent);
-            let stack_value = sell_item_info(&model).map_or(0, |(_, _, _, _, _, v)| v);
+            let stack_value = sell_item_info(lua, &model).map_or(0, |(_, _, _, _, _, v)| v);
             Ok(i64::from(deposit_for(rate, stack_value, minutes)))
         })?,
     )?;
@@ -1418,7 +1426,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, ()| {
             let info = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                sell_item_info(&model)
+                sell_item_info(lua, &model)
             };
             let Some((name, texture, count, quality, can_use, price)) = info else {
                 return Ok(MultiValue::from_vec(vec![
@@ -1458,7 +1466,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let refusal = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
                 match &model.cursor {
-                    Some(cursor::CursorPayload::Item(item)) => sell_refusal(&model, item),
+                    Some(cursor::CursorPayload::Item(item)) => sell_refusal(lua, &model, item),
                     _ => None,
                 }
             };
@@ -1474,14 +1482,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // CloseAuctionHouse(): the client-side close; nothing goes on the wire.
+    // CloseAuctionHouse() (`0x4ce160`): the close core `0x4cd5f0` inside the call; nothing goes
+    // on the wire.
     g.set(
         "CloseAuctionHouse",
-        lua.create_function(|lua, ()| {
-            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            model.auction_close = true;
-            Ok(())
-        })?,
+        lua.create_function(|lua, ()| submit(lua, AuctionCall::Close))?,
     )?;
 
     Ok(())
@@ -1574,6 +1579,7 @@ mod tests {
     #[test]
     fn list_types_and_sort_names_match_without_case() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_auction(page(&[7]));
         assert_eq!(
             s.eval::<i64>(r#"return (GetNumAuctionItems("LIST"))"#)
@@ -1586,12 +1592,19 @@ mod tests {
             "Item 7"
         );
         s.run(r#"SortAuctionItems("LIST", "Name")"#).unwrap();
-        assert_eq!(s.take_auction_sorts(), [(LIST, "name".to_string())]);
+        let name = crate::auction_sort::sort_column("name").unwrap();
+        assert_eq!(
+            s.take_auction_calls(),
+            [AuctionCall::Sort {
+                list: LIST,
+                column: name
+            }]
+        );
         s.run(r#"SortAuctionItems("list", "nonsense") SortAuctionItems("nowhere", "name")"#)
             .unwrap();
         s.run("SortAuctionItems(1, 2)").unwrap();
         assert!(
-            s.take_auction_sorts().is_empty(),
+            s.take_auction_calls().is_empty(),
             "an unknown one sorts nothing"
         );
         let err = s
@@ -1640,6 +1653,7 @@ mod tests {
     #[test]
     fn a_sort_signals_its_list_inside_the_call_with_the_rows_in_order() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         let mut state = page(&[1, 2]);
         state.lists[LIST].rows[0].name = Some("Cheap".into());
         state.lists[LIST].rows[0].buyout_price = 100;
@@ -1794,6 +1808,7 @@ mod tests {
     #[test]
     fn the_selection_follows_its_auction_through_a_resort() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_auction(page(&[11, 22]));
 
         s.eval::<()>(r#"SetSelectedAuctionItem("list", 2)"#)
@@ -2694,16 +2709,15 @@ mod tests {
         rows[2].owner_guid = 0x56;
         rows[2].quality = None;
         s.set_auction(state);
+        s.keep_calls();
         s.run(
             r#"for i = 1, 3 do GetAuctionItemInfo("owner", i) end GetAuctionItemInfo("owner", 1)"#,
         )
         .unwrap();
-        assert_eq!(s.take_auction_name_asks(), [(0x99, OWNER), (0x77, OWNER)]);
-        s.run(r#"GetAuctionItemInfo("owner", 1)"#).unwrap();
+        // Every read asks; the host keeps each name and list once.
         assert_eq!(
             s.take_auction_name_asks(),
-            [(0x99, OWNER), (0x77, OWNER)],
-            "every read asks"
+            [(0x99, OWNER), (0x77, OWNER), (0x99, OWNER), (0x77, OWNER)]
         );
         assert!(s.take_auction_name_asks().is_empty());
     }

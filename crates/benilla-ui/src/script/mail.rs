@@ -6,7 +6,8 @@ use mlua::{Lua, MultiValue, Value};
 
 use super::binding_abi::{self, flag};
 use super::cursor;
-use super::Model;
+use super::item_read::read_live;
+use super::{ItemKey, Model};
 
 /// The GM stationery, `Stationery.dbc` row 61 (`0x4af2cb cmp [rec+0x11c],0x3d`).
 const STATIONERY_GM: u32 = 61;
@@ -82,6 +83,8 @@ pub struct MailInboxRow {
     pub item_name: Option<String>,
     pub item_texture: Option<String>,
     pub item_quality: Option<u32>,
+    /// The record's `InventoryType`, 0 while uncached; the quality shows only for a nonzero one.
+    pub item_inventory_type: u32,
 }
 
 /// One auction invoice, `GetInboxInvoiceInfo`'s answer, parsed by the app from the mail's subject
@@ -186,6 +189,8 @@ pub enum MailCall {
     },
     /// `SendMail` past its guards: `CMSG_SEND_MAIL` (`0x4aea6c`).
     Send(MailSendRequest),
+    /// `CloseMail()` (`0x4aded0`): the close core's ordinary arm, `0x4acd50` with `cl = 0`.
+    Close,
 }
 
 /// `0x4acdc0`'s clears: the attachment, whose lock it lifts (`0x495420`, firing an argless
@@ -278,11 +283,6 @@ impl super::UiScript {
     /// there is no change for the scripts.
     pub fn holds_mail(&self, state: &Option<MailState>) -> bool {
         self.model_ref().mail == *state
-    }
-
-    /// Take the `CloseMail` flag; 1.12 has no close opcode, so the app only ends its mail session.
-    pub fn take_mail_close(&mut self) -> bool {
-        std::mem::take(&mut self.model_mut().mail_close)
     }
 
     /// The reference's compose-tab reset (`0x4acdc0(1)`), run on mailbox open and a sent mail:
@@ -384,7 +384,12 @@ pub enum MailRowVerb {
 
 impl MailRowVerb {
     /// `Ok` when the reference sends for `row`, else the refusal's message key, if it shows one.
-    fn sends(self, model: &Model, row: &MailInboxRow) -> Result<(), Option<&'static str>> {
+    fn sends(
+        self,
+        lua: &Lua,
+        model: &Model,
+        row: &MailInboxRow,
+    ) -> Result<(), Option<&'static str>> {
         // An item (`[rec+0x120]`, `0x4af96d`), then the player's object (`0x4af992`) and the purse
         // to pay its COD (`[rec+0x144]` against the coinage, `0x4af9c5`); either miss shows
         // `ERR_NOT_ENOUGH_MONEY` (`0x4afa4c`, `push 0x25`).
@@ -393,7 +398,7 @@ impl MailRowVerb {
                 return Err(None);
             }
             let player = model.units_by_lower.contains_key("player");
-            if !player || model.money < u64::from(row.cod) {
+            if !player || super::stat_read::purse(lua, model) < u64::from(row.cod) {
                 return Err(Some("ERR_NOT_ENOUGH_MONEY"));
             }
             return Ok(());
@@ -616,7 +621,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     // GetInboxItem(index): name, texture, count, quality, canUse (`MailFrame.lua:379`); canUse is
-    // the shared item-usable gate, true while the template is in flight.
+    // the shared item-usable gate. A template the cache lacks takes the miss exit with the five
+    // values `nil, nil, 0, 0, nil` (`0x4af674`-`0x4af679`, `0x4af792`); the count is the row's raw
+    // byte (`0x4af704`) and the quality the record's only for a nonzero inventory type, else -1
+    // (`0x4af721`-`0x4af730`).
     g.set(
         "GetInboxItem",
         lua.create_function(|lua, index: Value| {
@@ -627,34 +635,60 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 let row = row_at(&model, index);
                 let usable = row
                     .as_ref()
-                    .is_none_or(|r| super::item_stats::item_usable_by_id(&model, r.item_id));
+                    .is_none_or(|r| super::item_stats::item_usable_by_id(lua, &model, r.item_id));
                 (row, usable)
             };
-            // Five values on every path; with no item, `nil, nil, 0, 0, nil` (`0x4af5d0`).
-            let Some(r) = row.filter(|r| r.item_id != 0) else {
-                return Ok(MultiValue::from_vec(vec![
+            let miss = || {
+                MultiValue::from_vec(vec![
                     Value::Nil,
                     Value::Nil,
                     Value::Integer(0),
                     Value::Integer(0),
                     Value::Nil,
-                ]));
+                ])
             };
-            let name = match &r.item_name {
+            let Some(r) = row.filter(|r| r.item_id != 0) else {
+                return Ok(miss());
+            };
+            // The attachment's record off the item cache as the call runs.
+            let key = ItemKey::Record {
+                entry: r.item_id,
+                roll: super::ItemRoll {
+                    property: r.item_random_property_id,
+                    ..Default::default()
+                },
+            };
+            let (cached, name, texture, quality) = read_live(lua, Some(key), |item| {
+                let quality =
+                    super::item_stats::gated_quality(item.quality(), item.inventory_type());
+                (item.cached(), item.name(), item.texture(), quality)
+            })
+            .unwrap_or_else(|| {
+                let quality =
+                    super::item_stats::gated_quality(r.item_quality, r.item_inventory_type);
+                (
+                    r.item_quality.is_some(),
+                    r.item_name.clone(),
+                    r.item_texture.clone(),
+                    quality,
+                )
+            });
+            if !cached {
+                return Ok(miss());
+            }
+            let name = match &name {
                 Some(n) => Value::String(lua.create_string(n)?),
                 None => Value::Nil,
             };
-            let texture = match &r.item_texture {
+            let texture = match &texture {
                 Some(t) => Value::String(lua.create_string(t)?),
                 None => Value::Nil,
             };
-            // A number on every path, as in `GetSendMailItem`.
-            let quality = Value::Integer(i64::from(r.item_quality.unwrap_or(0)));
             Ok(MultiValue::from_vec(vec![
                 name,
                 texture,
-                Value::Integer(i64::from(r.item_count.max(1))),
-                quality,
+                Value::Integer(i64::from(r.item_count)),
+                Value::Integer(quality),
                 flag(usable),
             ]))
         })?,
@@ -669,7 +703,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             // the lock or the mailbox.
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let can = row_at(&model, index)
-                .is_some_and(|r| MailRowVerb::Delete.sends(&model, &r).is_ok());
+                .is_some_and(|r| MailRowVerb::Delete.sends(lua, &model, &r).is_ok());
             Ok(flag(can))
         })?,
     )?;
@@ -754,7 +788,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                     let Some(row) = row_at(&model, index as usize) else {
                         return Ok(());
                     };
-                    if let Err(refusal) = verb.sends(&model, &row) {
+                    if let Err(refusal) = verb.sends(lua, &model, &row) {
                         drop(model);
                         return match refusal {
                             Some(key) => super::calls::display_error(lua, key),
@@ -773,18 +807,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         )?;
     }
 
+    // CloseMail() (`0x4aded0`): the close core's ordinary arm, `0x4acd50` with `cl = 0`, inside
+    // the call; 1.12 has no close opcode.
     g.set(
         "CloseMail",
-        lua.create_function(|lua, ()| {
-            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            model.mail_close = true;
-            // The close core zeroes the mailbox inside the verb (`0x4aded0` → `0x4acd8f`), so a
-            // mail verb later in the same chunk finds none.
-            if let Some(mail) = model.mail.as_mut() {
-                mail.open = false;
-            }
-            Ok(())
-        })?,
+        lua.create_function(|lua, ()| submit(lua, MailCall::Close))?,
     )?;
 
     g.set(
@@ -816,7 +843,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 // send below. Checked before the money (`0x4ae917` ahead of `0x4ae99e`). The
                 // attachment is locked, so it cannot have moved.
                 if let Some(item) = model.mail_send_item.as_ref() {
-                    if !holds(model, item) {
+                    if !holds(lua, model, item) {
                         return Some(Err(()));
                     }
                 }
@@ -871,7 +898,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 copper,
                 "Usage: SetSendMailMoney(amount)",
             )? as u32;
-            let money = lua.app_data_ref::<Model>().expect("model app_data").money;
+            let money = {
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                super::stat_read::purse(lua, &model)
+            };
             if u64::from(n) > money {
                 super::calls::display_error(lua, "ERR_NOT_ENOUGH_MONEY")?;
                 return Ok(Value::Nil);
@@ -935,21 +965,41 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "GetSendMailItem",
         lua.create_function(|lua, ()| {
-            // A whole-stack pickup records no count, so the size comes from the source slot.
+            // Off the snapshot, a whole-stack pickup records no count, so the size comes from the
+            // source slot.
             // The template's lookup (`0x4ae604`) misses with nothing to read (`0x4ae60e`).
-            let item = {
+            let held = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                model.mail_send_item.clone().and_then(|it| {
-                    let template = model.item_templates.get(&it.item_id)?;
-                    let quality = match template.inventory_type {
-                        0 => -1,
-                        _ => i64::from(template.quality),
-                    };
-                    let count = cursor::held_count(&model, &it);
-                    Some((it, count, quality))
+                model.mail_send_item.clone().map(|it| {
+                    let count = cursor::held_count(lua, &model, &it);
+                    // Off the snapshot: the VM's record copy, and the link's name.
+                    let snapshot = model.item_templates.get(&it.item_id).map(|t| {
+                        let name = cursor::item_link_name(it.link.as_deref());
+                        let name = (!name.is_empty()).then_some(name);
+                        (name, it.texture.clone(), t.inventory_type, t.quality)
+                    });
+                    (it.guid, count, snapshot)
                 })
             };
-            let Some((it, count, quality)) = item else {
+            // The attached object and its record as the call runs: its stack (`0x4ae68e`) and its
+            // record's fields.
+            let item = held.and_then(|(guid, count, snapshot)| {
+                let read = read_live(lua, Some(ItemKey::Object(guid)), |item| {
+                    let name = item.name();
+                    let quality = item.quality();
+                    let count = item.stack_count().unwrap_or(count);
+                    quality.map(|q| (name, item.texture(), item.inventory_type(), q, count))
+                })
+                .unwrap_or_else(|| snapshot.map(|(n, t, i, q)| (n, t, i, q, count)));
+                read.map(|(name, texture, inventory_type, quality, count)| {
+                    let quality = match inventory_type {
+                        0 => -1,
+                        _ => i64::from(quality),
+                    };
+                    (name, texture, count, quality)
+                })
+            });
+            let Some((name, texture, count, quality)) = item else {
                 return Ok(MultiValue::from_vec(vec![
                     Value::Nil,
                     Value::Nil,
@@ -957,13 +1007,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                     Value::Integer(0),
                 ]));
             };
-            let name = cursor::item_link_name(it.link.as_deref());
-            let name = if name.is_empty() {
-                Value::Nil
-            } else {
-                Value::String(lua.create_string(&name)?)
+            let name = match name {
+                Some(n) => Value::String(lua.create_string(&n)?),
+                None => Value::Nil,
             };
-            let texture = match &it.texture {
+            let texture = match &texture {
                 Some(t) => Value::String(lua.create_string(t)?),
                 None => Value::Nil,
             };
@@ -1151,18 +1199,13 @@ fn submit(lua: &Lua, call: MailCall) -> mlua::Result<()> {
 /// (`0x4adf6d`, `0x4adf97`); record flags conjured `0x2` (`0x4adfbd`), an area (`0x5da500`, record
 /// `+0x1c8`) or a map (`0x5da570`, `+0x1cc`) is `ERR_MAIL_CONJURED_ITEM`; a container holding an
 /// item is `ERR_MAIL_BAG` (`0x4ae019`-`0x4ae042`).
-fn attach_refusal(model: &Model, item: &cursor::CursorItem) -> Option<&'static str> {
+fn attach_refusal(lua: &Lua, model: &Model, item: &cursor::CursorItem) -> Option<&'static str> {
     let (bound, seats) = if item.bag == cursor::EQUIPMENT_BAG {
-        let s = model
-            .player_slot_object(item.slot as usize)
+        let s = crate::script::char_stats::player_slot_object(lua, model, item.slot as usize)
             .filter(|s| s.guid == item.guid)?;
         (s.already_bound, s.occupied_seats)
     } else {
-        let s = model
-            .containers
-            .get(&item.bag)?
-            .slots
-            .get(&item.slot)
+        let s = super::held::held_slot(lua, model, item.bag, item.slot)
             .filter(|s| s.guid == item.guid)?;
         (s.already_bound, s.occupied_seats)
     };
@@ -1186,17 +1229,12 @@ fn attach_refusal(model: &Model, item: &cursor::CursorItem) -> Option<&'static s
 
 /// Whether the attachment's slot, a bag's or the doll's, still holds its object: the send
 /// resolves the guid and tests its owner (`0x4ae92e`-`0x4ae955`), and a locked item cannot move.
-fn holds(model: &Model, item: &cursor::CursorItem) -> bool {
+fn holds(lua: &Lua, model: &Model, item: &cursor::CursorItem) -> bool {
     if item.bag == cursor::EQUIPMENT_BAG {
-        model
-            .player_slot_object(item.slot as usize)
+        crate::script::char_stats::player_slot_object(lua, model, item.slot as usize)
             .is_some_and(|s| s.guid == item.guid)
     } else {
-        model
-            .containers
-            .get(&item.bag)
-            .and_then(|c| c.slots.get(&item.slot))
-            .is_some_and(|s| s.guid == item.guid)
+        super::held::held_slot(lua, model, item.bag, item.slot).is_some_and(|s| s.guid == item.guid)
     }
 }
 
@@ -1209,7 +1247,7 @@ fn click_send_mail_item(lua: &Lua) -> mlua::Result<()> {
     let refusal = {
         let model = lua.app_data_ref::<Model>().expect("model app_data");
         match &model.cursor {
-            Some(cursor::CursorPayload::Item(item)) => attach_refusal(&model, item),
+            Some(cursor::CursorPayload::Item(item)) => attach_refusal(lua, &model, item),
             _ => None,
         }
     };
@@ -1382,6 +1420,7 @@ mod tests {
             item_texture: (item_id != 0)
                 .then(|| "Interface\\Icons\\INV_Fabric_Linen_01".to_string()),
             item_quality: (item_id != 0).then_some(1),
+            item_inventory_type: 0,
             item_random_property_id: 0,
             item_charges: 0,
             item_durability: (0, 0),
@@ -1675,12 +1714,35 @@ mod tests {
     fn get_inbox_item_and_can_delete() {
         let mut s = kept();
         s.set_mail(Some(state()));
+        // Linen Cloth has no inventory type: the quality is -1 (`0x4af721`-`0x4af730`).
         let (name, _tex, count, quality, canuse): (String, String, i64, i64, i64) =
             s.eval("return GetInboxItem(1)").unwrap();
         assert_eq!(
             (name.as_str(), count, quality, canuse),
-            ("Linen Cloth", 3, 1, 1)
+            ("Linen Cloth", 3, -1, 1)
         );
+        // An equippable record shows its own quality.
+        let mut st = state();
+        st.inbox[0].item_inventory_type = 4;
+        s.set_mail(Some(st));
+        assert_eq!(
+            s.eval::<i64>("local _, _, _, q = GetInboxItem(1) return q")
+                .unwrap(),
+            1
+        );
+        // An uncached template takes the miss exit: `nil, nil, 0, 0, nil` (`0x4af674`-`0x4af679`).
+        let mut st = state();
+        st.inbox[0].item_quality = None;
+        st.inbox[0].item_name = None;
+        s.set_mail(Some(st));
+        assert_eq!(s.arity("GetInboxItem(1)").unwrap(), 5);
+        assert!(s
+            .eval::<bool>(
+                "local n, t, c, q, u = GetInboxItem(1) \
+                 return n == nil and t == nil and c == 0 and q == 0 and u == nil"
+            )
+            .unwrap());
+        s.set_mail(Some(state()));
         assert!(s.eval::<bool>("return GetInboxItem(2) == nil").unwrap());
         // A player's unreturned mail is returnable, not deletable.
         assert!(s
@@ -1743,7 +1805,7 @@ mod tests {
         assert!(err.contains("Usage: TakeInboxItem(index)"), "{err}");
 
         s.run("CloseMail()").unwrap();
-        assert!(s.take_mail_close());
+        assert_eq!(s.take_mail_calls().last(), Some(&MailCall::Close));
     }
 
     /// `SendMail` (`0x4ae800`): an empty recipient or subject returns (`0x4ae875`, `0x4ae8a9`)
@@ -1833,17 +1895,6 @@ mod tests {
         s.run("SendMail('Bob', 'Hi', 'b')").unwrap();
         assert!(s.take_ui_errors().is_empty());
         assert_eq!(sends(&mut s).map(|r| r.item_guid), Some(0x716));
-    }
-
-    /// `CloseMail` zeroes the mailbox inside the verb (`0x4aded0` → `0x4acd8f`): a mail verb
-    /// later in the same chunk finds none.
-    #[test]
-    fn close_mail_closes_before_the_next_verb() {
-        let mut s = kept();
-        s.set_mail(Some(state()));
-        s.run("CloseMail() CheckInbox()").unwrap();
-        assert!(s.take_mail_close());
-        assert!(!checks(&mut s));
     }
 
     /// Each row verb refuses a row the reference does not send for, and then takes no lock:

@@ -44,7 +44,9 @@ pub(crate) use corpse::fixture as corpse_fixture;
 pub(crate) use corpse::{corpse_pick_admits, publish_corpse_pick, CorpsePick};
 pub(crate) use cursor::{drive_targeting_cursor, ground_cast_radius};
 pub(crate) use item::EnchantConfirmItem;
-pub(crate) use pick::{publish_unit_pick, PickChecks, UnitPick};
+pub(crate) use pick::{
+    publish_go_pick, publish_unit_pick, spell_opens_go, GoPick, GoPickChecks, PickChecks, UnitPick,
+};
 pub(crate) use world::{commit_ground_cast_on_click, commit_object_cast_on_click};
 
 use bevy::prelude::*;
@@ -70,7 +72,8 @@ pub(crate) struct BindChecks<'w, 's> {
     guids: Query<'w, 's, &'static crate::net::Guid>,
     factions: Option<Res<'w, crate::target::Factions>>,
     reputations: Res<'w, crate::net::Reputations>,
-    /// The party slots and raid roster as the frame began; a harness without them has no group.
+    /// The party slots and raid roster as the feed last published them; a harness without them has
+    /// no group.
     roster: Option<Res<'w, super::group_relation::GroupRoster>>,
     names: Option<Res<'w, crate::names::NameCache>>,
     /// The range leg's positions: the pose the hover picks against, as last frame propagated it,
@@ -452,6 +455,21 @@ impl SpellTargeting {
             .map(|t| (t.spell_id, t.commit))
     }
 
+    /// `BindLocation 0x6e60f0` at `point` (WoW space): the pending cast, its commit and the bind,
+    /// when the word wants a location; `None` binds nothing. The terrain click's and the minimap
+    /// click's.
+    pub(crate) fn location_commit(
+        &self,
+        point: [f32; 3],
+    ) -> Option<(
+        u32,
+        super::cast_send::CastCommit,
+        super::cast_send::TargetedBind,
+    )> {
+        let (spell_id, commit) = self.pending_for(TargetingWants::Location)?;
+        Some((spell_id, commit, self.location_bind(point)?))
+    }
+
     /// `BindLocation 0x6e60f0`'s fork: SOURCE (`0x20`) is tested before DEST (`0x40`). The
     /// reference takes a second click for a word carrying both; no 1.12 spell does, so only the
     /// precedence is built.
@@ -494,13 +512,13 @@ pub(crate) fn cancel_targeting_on_right_press(
     cursor.stop_targeting();
 }
 
-/// [`SpellTargeting::picks_self`] as the frame began, which the world pick reads
+/// [`SpellTargeting::picks_self`] as the feed published it, which the world pick reads
 /// ([`crate::target`]'s hover): the word the VM's `SpellIsTargeting` answers from, in a declared
-/// order against every cast drain that arms or ends the cursor after the input pass.
+/// order against every cast drain that arms or ends the cursor after the feed.
 #[derive(Resource, Default)]
 pub(crate) struct PicksSelf(pub(crate) bool);
 
-/// Publish [`PicksSelf`] before the input pass.
+/// Publish [`PicksSelf`] in the feed, after the packets and the clicks.
 pub(crate) fn publish_picks_self(
     targeting: Res<SpellTargeting>,
     spells: Option<Res<crate::ui_action::Spells>>,
@@ -512,11 +530,25 @@ pub(crate) fn publish_picks_self(
     }
 }
 
-/// Push the targeting state into the VM each frame, before the input pass, so a word armed last
-/// frame stands for this frame's clicks: the ESC chain's word and the bag and doll pickup
-/// reroute's item half. A script call pushes the same view inside the call
-/// ([`ScriptCursor::push_view`]). The word's changes signal `CURRENT_SPELL_CAST_CHANGED` where they
-/// are made ([`crate::ui_cast::CastReport::Changed`]).
+/// Push the targeting state into the VM ahead of the frame's input records, so the word as the
+/// frame began stands for this frame's clicks and keys: the ESC chain's word and the bag and doll
+/// pickup reroute's item half. A writer outside the calls (a cast drain, a walk's bind) may have
+/// moved it after the last frame's feed. The reference reads the word itself (`SpellIsTargeting`,
+/// `0x6e6cd0`).
+pub(crate) fn feed_targeting_to_input(
+    vm: crate::script_calls::VmWith<(
+        Res<'static, SpellTargeting>,
+        crate::ui_unit::UnitTokens<'static, 'static>,
+        BindChecks<'static, 'static>,
+    )>,
+) {
+    feed_targeting_to_vm(vm);
+}
+
+/// Push the targeting state into the VM again in the unit feed, after the packets and the
+/// frame's clicks moved it, for the handlers and the `OnUpdate` after them. A script call pushes
+/// the same view inside the call ([`ScriptCursor::push_view`]). The word's changes signal
+/// `CURRENT_SPELL_CAST_CHANGED` where they are made ([`crate::ui_cast::CastReport::Changed`]).
 pub(crate) fn feed_targeting_to_vm(
     mut vm: crate::script_calls::VmWith<(
         Res<'static, SpellTargeting>,
@@ -526,21 +558,24 @@ pub(crate) fn feed_targeting_to_vm(
 ) {
     vm.turn(|script, (targeting, tokens, checks)| {
         if let Some(script) = script {
+            script.set_spell_targeting(targeting.active());
             push_targeting_view(script, &targeting, &checks, &tokens);
         }
     })
 }
 
-/// Push what the VM reads of the targeting word: `SpellIsTargeting`, the pickup reroute's item
-/// half and `SpellCanTargetUnit`'s units.
+/// Push what the VM reads of the targeting word beside `SpellIsTargeting`, which rides the cast
+/// view ([`crate::ui_cast::CastViews`]): the pickup reroute's item half and `SpellCanTargetUnit`'s
+/// units.
 fn push_targeting_view(
     script: &mut benilla_ui::script::UiScript,
     targeting: &SpellTargeting,
     checks: &BindChecks,
     tokens: &crate::ui_unit::UnitTokens,
 ) {
-    script.set_spell_targeting(targeting.active());
     script.set_item_pick_armed(targeting.wants(TargetingWants::Item));
+    // `SpellTargetWantsLocation` (`0x6e6320`), which `Minimap:PingLocation` asks (`0x4eee74`).
+    script.set_location_pick_armed(targeting.wants(TargetingWants::Location));
     // `SpellCanTargetUnit(unit)`: the VM resolves the token to a guid (`0x6e6d3a`), and
     // `0x6e6460`'s unit leg answers for that guid. The units to ask are the held ones the
     // resolver's inputs list, the `target` chains' included.
@@ -660,6 +695,19 @@ impl ScriptCursor<'_, '_> {
     /// ([`CursorPicks`]), before the next call reads the cursor and the selection.
     pub(crate) fn bind_parked(&mut self) {
         self.picks.bind_all(&mut self.ladder, &self.checks);
+    }
+
+    /// `Minimap:PingLocation`'s ground cast (`0x4eef05`): the ground point `at` (WoW space) bound
+    /// as the waiting spell's location and sent ([`SpellTargeting::location_commit`]).
+    pub(crate) fn bind_location(&mut self, at: [f32; 3]) {
+        let Some((spell_id, commit, bound)) = self.ladder.ground.location_commit(at) else {
+            return;
+        };
+        debug!(
+            "ui_action: minimap ground cast {spell_id} at wow ({:.2}, {:.2}, {:.2}) as {bound:?}",
+            at[0], at[1], at[2]
+        );
+        self.ladder.commit_targeted(spell_id, commit, bound);
     }
 
     /// The ESC chain's `SpellStopTargeting()` (`0x6e6e30`): `StopTargeting 0x6e4900`.
@@ -1506,8 +1554,8 @@ mod tests {
                         Party => group.members = vec![member(0)],
                         Raid => {
                             group.group_type = crate::ui_party::GROUPTYPE_RAID;
-                            group.own_raid_row = Some(ME);
                             group.members = vec![member(1)];
+                            group.rebuild_raid(ME);
                         }
                     }
                 }

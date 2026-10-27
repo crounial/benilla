@@ -57,12 +57,25 @@ pub(super) fn wire_packets(packets: Vec<Vec<SessionEvent>>) -> Vec<SessionEvent>
         .collect()
 }
 
-/// A create block of `kind` whose fields are `pairs`, as the wire's whole descriptor.
+/// A create block of `kind` whose fields are `pairs`, as the wire's whole descriptor, with the
+/// `OBJECT_FIELD_TYPE` every create carries (object, unit and, for a player, player bits) unless
+/// `pairs` sets its own: the resolver's hop and the getters' lookups test it (typemask 8,
+/// `0x515a0f`).
 pub(super) fn created(guid: u64, kind: EntityKind, pairs: &[(u16, u32)]) -> SessionEvent {
     let as_type = match kind {
         EntityKind::Player => ObjectType::Player,
         _ => ObjectType::Unit,
     };
+    const OBJECT_TYPE: u16 = 2;
+    let mut pairs = pairs.to_vec();
+    if !pairs.iter().any(|&(i, _)| i == OBJECT_TYPE) {
+        let mask = match as_type {
+            ObjectType::Player => 0x19,
+            _ => 0x9,
+        };
+        pairs.insert(0, (OBJECT_TYPE, mask));
+    }
+    let pairs = &pairs[..];
     SessionEvent::ObjectCreate {
         guid,
         kind,
@@ -112,7 +125,7 @@ pub(super) fn health(n: u32) -> [(u16, u32); 1] {
 /// with [`BOAR`] (50 health) beside it; a VM whose spy records `UNIT_HEALTH`, `UNIT_MANA` and
 /// `UNIT_COMBAT`, each with its token and what `Look(event, token)` reads as it fires.
 pub(super) fn client() -> App {
-    let mut app = crate::game_plugins::schedule_tests::headless_client();
+    let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
     let (tx, _rx) = crossbeam_channel::unbounded();
     app.insert_resource(crate::net::NetCommands(tx));
     let world = app.world_mut();
@@ -159,6 +172,9 @@ pub(super) fn client() -> App {
     // Our create tagged as ours, as the net stage's pass does (`net::apply`).
     let me = world.resource::<crate::net::GuidIndex>().0[&ME];
     world.entity_mut(me).insert(crate::net::SelfPlayer);
+    // The world entry first, as a session has it: the target comes after.
+    frame(&mut app, vec![]);
+    let world = app.world_mut();
     let wolf = world.resource::<crate::net::GuidIndex>().0[&WOLF];
     *world.resource_mut::<crate::target::Selection>() = crate::target::Selection {
         target: Some(wolf),
@@ -393,9 +409,9 @@ fn a_write_the_log_missed_fails_the_rewind() {
     );
 }
 
-/// A worldport drops every streamed object without an update block (`SMSG_NEW_WORLD`): logged as
-/// the stores it takes, the rewind of the target the frame creates again lands on the store the
-/// frame started from.
+/// A worldport drops every streamed object without an update block (`SMSG_NEW_WORLD`), logged as
+/// the stores it takes: the transfer ends the selection, so no seat reads the dropped target's
+/// store, and the target the frame creates again is read live.
 #[test]
 fn a_worldport_is_logged_as_the_stores_it_takes() {
     let mut app = client();
@@ -417,10 +433,7 @@ fn a_worldport_is_logged_as_the_stores_it_takes() {
     );
     let views = app.world().resource::<crate::ui_unit::views::UnitViews>();
     #[cfg(debug_assertions)]
-    assert_eq!(
-        views.starts_checked, 1,
-        "the target, checked against the snapshot"
-    );
+    assert_eq!(views.starts_checked, 0, "no seat reads a dropped store");
     assert!(!views.holds(WOLF), "and read live again");
 }
 
@@ -521,6 +534,7 @@ fn player_dead_reads_its_packets_health_after_an_earlier_packets_line() {
 /// line (`0x62c160`) and ends in `SignalDeathState` (`0x6251cc` → `0x495850`).
 #[test]
 fn our_deaths_list_signals_before_its_line_and_player_dead_after() {
+    #[cfg(debug_assertions)]
     use bevy::ecs::system::RunSystemOnce;
 
     let mut app = client();
@@ -547,11 +561,8 @@ fn our_deaths_list_signals_before_its_line_and_player_dead_after() {
     world
         .run_system_once(crate::ui_unit::views::mark_frame_start)
         .unwrap();
+    // The packet's end writes the line among the death's legs.
     crate::net::handlers::dispatch(world, wire([values(ME, &health(0))]));
-    // The death line's watcher, which the frame runs ahead of the drain.
-    world
-        .run_system_once(crate::ui_chat::combat::watch::death_lines)
-        .unwrap();
     crate::ui_unit::run_feed_units_once(world);
     crate::lanes::fire_in_order(world);
     let seen = world
@@ -564,6 +575,54 @@ fn our_deaths_list_signals_before_its_line_and_player_dead_after() {
         .filter(|s| !s.starts_with("UNIT_"))
         .collect();
     assert_eq!(ours, ["PLAYER_TARGET_CHANGED", "death line", "PLAYER_DEAD"]);
+}
+
+/// The death line's listener runs where the health watcher wrote it, inside its update packet
+/// (`0x465277` → `0x6046f0` → `0x605860` → `0x62c160`), before the next packet's handler runs
+/// (`0x537ae5`): its `SendChatMessage` goes out ahead of the name query the next packet's create
+/// asks in its handler (`0x5dec12` → `0x609210`). The lanes fire after the whole dispatch until
+/// they fire inside it, so the query goes first today.
+#[test]
+#[ignore = "the lanes fire inside the dispatch only from the flip on"]
+fn a_death_lines_listener_sends_ahead_of_the_next_packets_handler() {
+    const STRANGER: u64 = 0x31;
+    let mut app = client();
+    let (tx, sent) = crossbeam_channel::unbounded();
+    app.insert_resource(crate::net::NetCommands(tx));
+    app.world_mut()
+        .resource_mut::<crate::net::NetStatus>()
+        .connected = true;
+    app.world()
+        .non_send_resource::<UiScript>()
+        .run(
+            r#"UNITDIESOTHER = "%s dies."
+            local d = CreateFrame("Frame")
+            d:RegisterEvent("CHAT_MSG_COMBAT_HOSTILE_DEATH")
+            d:SetScript("OnEvent", function() SendChatMessage("down", "SAY") end)"#,
+        )
+        .unwrap();
+    let world = app.world_mut();
+    crate::net::handlers::dispatch(
+        world,
+        wire_packets(vec![
+            vec![values(BOAR, &health(0))],
+            vec![created(
+                STRANGER,
+                EntityKind::Player,
+                &[(FIELD_UNIT_HEALTH, 100)],
+            )],
+        ]),
+    );
+    crate::lanes::fire_in_order(world);
+    let order: Vec<&str> = sent
+        .try_iter()
+        .filter_map(|c| match c {
+            crate::net::ClientCommand::Chat { .. } => Some("chat"),
+            crate::net::ClientCommand::NameQuery { guid: STRANGER } => Some("name query"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order, ["chat", "name query"]);
 }
 
 /// A spy on the level-up's events, each with its arguments, into the client's `Seen`.

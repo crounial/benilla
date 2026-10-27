@@ -52,7 +52,9 @@ pub(super) struct Shown {
 
 impl Shown {
     pub(super) fn of(v: &benilla_ui::script::SpellTooltipView) -> Self {
-        let text = |t: &benilla_ui::script::TooltipText| t.text(&shipped);
+        let text = |t: &benilla_ui::script::TooltipText| {
+            t.text(benilla_ui::strings::Strings::Host(&shipped))
+        };
         let cell = |t: &Option<benilla_ui::script::TooltipText>| t.as_ref().map(text);
         let line = |key: &str, name: &Option<String>| {
             name.as_ref()
@@ -324,7 +326,8 @@ fn aura_text(spell_id: u32, level: u8, stack: u8, spells: &Spells, vctx: &ViewCt
         stack,
     };
     let (view, _) = build_aura_view(key, spells, vctx).expect("an aura view");
-    view.description.text(&shipped)
+    view.description
+        .text(benilla_ui::strings::Strings::Host(&shipped))
 }
 
 /// The aura builder expands the aura text at the aura's level, and at its count when the spell
@@ -1414,18 +1417,6 @@ fn the_locked_line_greens_when_the_lock_can_be_opened() {
     assert_eq!(locked_line_tint(None, None), TooltipTint::LockOpen);
 }
 
-/// A trainer list that lands this frame is hoverable in this frame's tick: the trainer feed derives
-/// the subjects the spell feed pushes.
-#[test]
-fn the_spell_feed_runs_after_the_trainer_feed() {
-    let mut app = crate::game_plugins::schedule_tests::headless_client();
-    assert!(crate::test_support::runs_before(
-        &mut app,
-        crate::ui_trainer::feed_trainer,
-        feed_spell_tooltips
-    ));
-}
-
 pub(super) const ME: u64 = 0x77;
 pub(super) const WOLF: u64 = 0xF130_0000_4500_0001;
 pub(super) const BOAR: u64 = 0xF130_0000_4600_0002;
@@ -1555,97 +1546,6 @@ fn the_mouseover_answers_get_guild_info_from_the_cache() {
     assert_eq!(info(&mut app), (Some("Probe Guild".to_string()), 2));
 }
 
-/// A player hovered for the first time answers inside its own `UPDATE_MOUSEOVER_UNIT`: the
-/// publisher writes the mouseover pair (`0x492890`) before it signals (`0x4929b3`), and
-/// `CanInspect` (`0x48a1b0`), `CheckInteractDistance` (`0x48ba00`) and the slot getters
-/// (`0x4c8328`) read the object it names at once. The hover twin of the target's case.
-#[test]
-fn a_fresh_hovers_reach_and_slots_answer_inside_its_mouseover_event() {
-    use crate::net::{Guid, GuidIndex};
-    use crate::target::relations::fixture::{factions, HUMAN};
-    use benilla_protocol::field::FIELD_PLAYER_VISIBLE_ITEM_1_CREATOR;
-    use benilla_protocol::ObjectFields;
-    const OTHER: u64 = 0x1002;
-    const HELM: u32 = 7366;
-    /// `OBJECT_FIELD_TYPE` and `UNIT_FIELD_FACTIONTEMPLATE`.
-    const OBJECT_TYPE: u16 = 2;
-    const TEMPLATE: u16 = 35;
-    let (mut app, _, _) = mouseover_app();
-    app.insert_resource(factions())
-        .insert_resource(crate::net::SelfGuid(Some(ME)));
-    app.world_mut()
-        .resource_mut::<Items>()
-        .insert_template(HELM, Some(crate::items::test_template("Helm")));
-    let me = app
-        .world_mut()
-        .query_filtered::<Entity, With<SelfPlayer>>()
-        .single(app.world())
-        .unwrap();
-    app.world_mut().entity_mut(me).insert((
-        Guid(ME),
-        ObjectStore(ObjectFields::from_pairs(&[
-            (OBJECT_TYPE, 0x19),
-            (TEMPLATE, HUMAN),
-        ])),
-        Transform::default(),
-    ));
-    // A Human 3 yards off wearing the helm, whom no token names.
-    let other = app
-        .world_mut()
-        .spawn((
-            Guid(OTHER),
-            ObjectStore(ObjectFields::from_pairs(&[
-                (OBJECT_TYPE, 0x19),
-                (TEMPLATE, HUMAN),
-                (FIELD_PLAYER_VISIBLE_ITEM_1_CREATOR + 2, HELM),
-            ])),
-            Transform::from_xyz(3.0, 0.0, 0.0),
-        ))
-        .id();
-    app.world_mut()
-        .resource_mut::<GuidIndex>()
-        .0
-        .insert(OTHER, other);
-    {
-        let mut script = app.world_mut().non_send_resource_mut::<UiScript>();
-        script.set_unit_guids(&benilla_ui::script::UnitGuids {
-            player: ME,
-            held: [(ME, 0)].into_iter().collect(),
-            ..Default::default()
-        });
-        crate::ui_script::test_ui::load_tooltip_template(&script);
-        script
-            .run(
-                r#"
-                UIParent = CreateFrame("Frame", "UIParent"); UIParent:SetAllPoints()
-                local tt = CreateFrame("GameTooltip", "GameTooltip", UIParent, "TestTooltipTemplate")
-                tt:Hide()
-                tt:SetScript("OnTooltipSetDefaultAnchor", function()
-                    GameTooltip:SetOwner(UIParent, "ANCHOR_NONE")
-                end)
-                SEEN = {}
-                local f = CreateFrame("Frame")
-                f:RegisterEvent("UPDATE_MOUSEOVER_UNIT")
-                f:SetScript("OnEvent", function()
-                    table.insert(SEEN, tostring(CanInspect("mouseover")) .. " "
-                        .. tostring(CheckInteractDistance("mouseover", 1)) .. " "
-                        .. tostring(GetInventoryItemLink("mouseover", 1)))
-                end)
-            "#,
-            )
-            .unwrap();
-        script.resolve();
-    }
-    hover_unit(&mut app, other, OTHER);
-    let mut s = app.world_mut().non_send_resource_mut::<UiScript>();
-    s.resolve();
-    let seen = s.eval::<Vec<String>>("return SEEN").unwrap();
-    assert!(
-        matches!(seen.as_slice(), [one] if one.starts_with("1 1 ") && one.contains("[Helm]")),
-        "{seen:?}"
-    );
-}
-
 /// `UnitCreatureType("mouseover")` goes through the resolver `0x605570` for a hovered player as
 /// for a creature: a druid in Cat Form is a Beast, and out of form a Humanoid by race. The plate
 /// itself is built for a player from its race and class, whatever type the snapshot carries.
@@ -1754,17 +1654,6 @@ fn the_mouseover_token_clears_when_no_unit_is_hovered() {
     }
 }
 
-/// A quest panel that opens this frame is hoverable in its tick.
-#[test]
-fn the_spell_feed_runs_after_the_quest_feed() {
-    let mut app = crate::game_plugins::schedule_tests::headless_client();
-    assert!(crate::test_support::runs_before(
-        &mut app,
-        crate::ui_quest::feed_quest,
-        feed_spell_tooltips
-    ));
-}
-
 /// The pet bar, Beast Training and target-of-target hovers are whole on the first hover.
 #[test]
 fn the_feed_pushes_the_spells_the_vm_holds_before_a_hover() {
@@ -1799,6 +1688,13 @@ fn the_feed_pushes_the_spells_the_vm_holds_before_a_hover() {
     .init_resource::<crate::net::GuidIndex>()
     .init_resource::<crate::spell::SpellModifiers>()
     .add_systems(Update, feed_spell_tooltips);
+    // Firebolt on the pet's bar, the word the feed reads its subject off.
+    let mut bar = crate::ui_pet::PetBar::default();
+    bar.spells.pet_guid = 0x2A;
+    bar.spells.bar[0] = benilla_protocol::messages::PetActionEntry::from(
+        3110 | (u32::from(benilla_protocol::messages::PET_ACT_ENABLED) << 24),
+    );
+    app.insert_resource(bar);
 
     let mut script = UiScript::new().unwrap();
     crate::ui_script::test_ui::load_tooltip_template(&script);
@@ -1943,6 +1839,15 @@ fn the_feed_builds_the_pet_views_against_the_pet_and_rebuilds_them_on_its_level(
     let mut index = app.world_mut().resource_mut::<crate::net::GuidIndex>();
     index.0.insert(ME, me);
     index.0.insert(IMP, imp);
+    // Blood Pact on the imp's bar and in its book, the words the feed reads its subjects off.
+    let word = benilla_protocol::messages::PetActionEntry::from(
+        6307 | (u32::from(benilla_protocol::messages::PET_ACT_ENABLED) << 24),
+    );
+    let mut bar = crate::ui_pet::PetBar::default();
+    bar.spells.pet_guid = IMP;
+    bar.spells.bar[0] = word;
+    bar.spells.spells = vec![word];
+    app.insert_resource(bar);
 
     let mut script = UiScript::new().unwrap();
     crate::ui_script::test_ui::load_tooltip_template(&script);
@@ -2051,4 +1956,61 @@ fn a_refused_hover_name_is_asked_again_by_the_next_hover_only() {
         hover_unit(&mut app, boar, PLAYER);
     }
     assert!(crate::query_cache::queries(&rx).is_empty());
+}
+
+/// The questgiver panel's reward spell, which its getters read through the host, is pushed ahead
+/// of a hover like the VM's own subjects: the first `SetQuestRewardSpell` shows its whole view.
+#[test]
+fn the_feed_pushes_the_questgiver_panels_reward_spell_before_a_hover() {
+    let spell = benilla_formats::SpellDisplay {
+        name: "Firebolt".into(),
+        description: Some("Deals Fire damage.".into()),
+        ..Default::default()
+    };
+    let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    app.insert_resource(NetCommands(tx));
+    app.insert_resource(Spells {
+        catalog: benilla_formats::SpellCatalog::from_displays(std::collections::HashMap::from([(
+            3110, spell,
+        )])),
+        ..Spells::empty_for_tests()
+    });
+    app.world_mut()
+        .resource_mut::<crate::ui_quest::QuestGiver>()
+        .open(
+            0x42,
+            crate::ui_quest::QuestView::Detail(benilla_protocol::messages::QuestDetails {
+                npc: 0x42,
+                quest_id: 1,
+                title: "Fire".into(),
+                details: String::new(),
+                objectives: String::new(),
+                auto_finish: 0,
+                choices: Vec::new(),
+                rewards: Vec::new(),
+                money: 0,
+                reward_spell: 3110,
+            }),
+        );
+    let script = UiScript::new().unwrap();
+    crate::ui_script::test_ui::load_tooltip_template(&script);
+    app.insert_non_send_resource(script);
+    app.world_mut()
+        .run_system_cached(feed_spell_tooltips)
+        .expect("the feed runs");
+    let lines = crate::script_calls::with_hosted_vm(app.world_mut(), |s| {
+        s.expect("a VM").eval::<String>(
+            r#"
+            local a = CreateFrame("Button", "B"); a:SetPoint("CENTER", 0, 0)
+            CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
+            TT:SetOwner(B, "ANCHOR_RIGHT"); TT:SetQuestRewardSpell()
+            local t = {}
+            for i = 1, TT:NumLines() do t[i] = getglobal("TTTextLeft" .. i):GetText() end
+            return table.concat(t, " | ")
+            "#,
+        )
+    })
+    .unwrap();
+    assert_eq!(lines, "Firebolt | Deals Fire damage.");
 }

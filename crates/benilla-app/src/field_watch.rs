@@ -46,6 +46,9 @@ pub(crate) enum FieldNotice {
     /// `0x5de4e0` on `PLAYER_BYTES_2` byte 3: `UPDATE_EXHAUSTION` bare (`0x5de4e8`), then the
     /// rest-state line for the new state.
     RestState { old: u8, new: u8 },
+    /// A callback's `0x524e10(&guid)`: the portrait list's mark ([`crate::portrait::PortraitMarks`]),
+    /// whose drain signals later in the frame. The party record's pet display (`0x5e587f`).
+    PortraitMark { guid: u64 },
     /// `0x5ed990`: `UNIT_ATTACK`, `UNIT_DEFENSE` and `UNIT_RANGED_ATTACK_POWER`, each with
     /// `"player"`, from the skill value watch `0x5de180` (`0x5de214`) or the temporary-bonus watch
     /// `0x5de470` (`0x5de495`).
@@ -81,13 +84,28 @@ pub(crate) enum FieldNotice {
     /// `SMSG_LEVELUP_INFO`'s arm of the notice handler `0x5e38c0`: `PLAYER_LEVEL_UP` with the
     /// message's level, health, first power, `level >= 10` and five stats (`0x5e413e`).
     LevelUp(benilla_protocol::messages::LevelUpInfo),
+    /// `FireUsableEvents` (`0x4b31c0`) from a field watcher, inside its packet: the action bar's
+    /// usable cache refreshed off the stores as the packet left them (`0x4e5c00`), with its
+    /// `ACTIONBAR_UPDATE_USABLE` on a change, each reactive spell's `SPELL_ACTIVE`, then
+    /// `SPELL_UPDATE_USABLE` ([`crate::ui_action::ActionStates::usable_refresh`]). The callers:
+    /// the active player's health (`0x604848`), powers (`0x604876`) and aura state, the target's
+    /// too (`0x6048b6`); its unit flags' bits `0x1c20000` and combat bit `0x80000` (`0x5ff50e`,
+    /// `0x5ff51b`), `UNIT_FIELD_BYTES_1` byte 3's bit `0x2` (`0x5ff83a`), its form and its combo
+    /// points (`0x5de011`, `0x5ddff0`).
+    UsableRefresh,
+    /// `SetPlayerControl` (`0x4958e0`) on a change of our own `[0xb4b3e4]` (`0x4958ea`), from
+    /// `SMSG_CLIENT_CONTROL_UPDATE`'s handler through `0x5fa600` (`0x5fa6b1`): the flag
+    /// `HasFullControl` reads seated, then `PLAYER_CONTROL_GAINED` (`0x4958f7`) or
+    /// `PLAYER_CONTROL_LOST` (`0x49590b`); its usable refresh follows (`0x4958fc`, `0x495910`), its
+    /// [`Self::UsableRefresh`].
+    PlayerControl { in_control: bool },
     /// `OnShapeshiftFormChanged` (`0x5de010`) on the active player's form byte: after the usable
-    /// refresh (`0x5de011`, the action feed's), `ACTIONBAR_UPDATE_STATE` and
+    /// refresh (`0x5de011`, its [`Self::UsableRefresh`]), `ACTIONBAR_UPDATE_STATE` and
     /// `CURRENT_SPELL_CAST_CHANGED` (`0x5de016` → `0x4b3250`), then the bonus bar's offset and
     /// `UPDATE_BONUS_ACTIONBAR` (`0x5de01b` → `0x4e4fc0`).
     Shapeshift,
     /// `OnComboPointsChanged` (`0x5ddff0`) on the active player's combo count: after the usable
-    /// refresh (the action feed's), `PLAYER_COMBO_POINTS` (`0x5ddffa`).
+    /// refresh (its [`Self::UsableRefresh`]), `PLAYER_COMBO_POINTS` (`0x5ddffa`).
     ComboPoints,
     /// The temporary bonus's watch `0x5de470`: the rebuild of the skill list (`0x4d2cb0`,
     /// `0x5de49a`), which signals `SKILL_LINES_CHANGED` (`0x4d2fec`).
@@ -98,12 +116,33 @@ pub(crate) enum FieldNotice {
     /// The maximum's and the permanent bonus's watch `0x5de450`: the profession list's rebuild
     /// (`0x5de457`), then the skill list's (`0x5de45c`).
     SkillMax,
+    /// `0x4b25b0`'s live tail for a learned spell that entered the book: `LEARNED_SPELL_IN_TAB`
+    /// (510) with its tab's 1-based place (`0x4b2b92`).
+    LearnedInTab { tab: i64 },
+    /// A class trainer's respec question, `MSG_TALENT_WIPE_CONFIRM`'s arm of `0x5df980`:
+    /// `CONFIRM_TALENT_WIPE` with the cost in copper (`0x5dfa3f`), after the latch.
+    TalentWipe { cost: u32 },
+    /// The point counters' watch `0x4c7000`: `CHARACTER_POINTS_CHANGED` (264) with the change of
+    /// the talent points and of the free professions, in that order (`0x4c7086`-`0x4c7098`).
+    CharacterPoints { talent: i32, profession: i32 },
     /// The skill value watch `0x5de180`. Past its gate (`0x5de20c`, `shown` unlike `old`): the
     /// skill list's rebuild (`0x5de2a7`), then its line for the active player:
     /// `ERR_SKILL_GAINED_S` over an old value of 0 (`0x5de378`), else `ERR_SKILL_UP_SI` with the
-    /// shown value (`0x5de417`). Either way, the profession list's rebuild (`0x5de434`). `old` is
-    /// the value word's copy, `shown` the value plus the permanent bonus when the value is above 0.
+    /// shown value (`0x5de417`). Either way the trainer's pass and [`Self::Professions`] follow.
+    /// `old` is the value word's copy, `shown` the value plus the permanent bonus when the value is
+    /// above 0.
     SkillValue { skill_id: u16, old: u16, shown: u32 },
+    /// The mirror-timer handler `0x5e7990`'s signal for one edge: `MIRROR_TIMER_START`,
+    /// `_PAUSE` or `_STOP` (`0x5e7a9a`, `0x5e7a11`, `0x5e79cc`).
+    MirrorTimer(crate::ui_mirror::MirrorTimerEdge),
+    /// The trainer's state pass `0x4d7d40` from a watch on the active player: the coinage's
+    /// (`0x5ddf41`), the level's (`0x5edb80`) and the skill entries' (`0x5de42d`, `0x5de450`). The
+    /// packet's handler puts it on the trainer lane at its place ([`crate::ui_trainer`]), never on
+    /// this one.
+    TrainerPass,
+    /// The skill value watch's profession list rebuild (`0x5de434` → `0x4fca20`), behind its
+    /// trainer pass (`0x5de42d`).
+    Professions,
 }
 
 /// The notice lane: each notice stamped as a handler writes it ([`crate::lanes::stamp`]), fired
@@ -124,6 +163,20 @@ impl NoticeLane {
         for notice in notices {
             self.write(notice);
         }
+    }
+
+    /// The stamp of the first notice waiting after `at` that `which` picks: where a callback's
+    /// tail goes that comes after the signals the notify pass wrote for it.
+    pub(crate) fn first_after(
+        &self,
+        at: crate::lanes::Stamp,
+        which: impl Fn(&FieldNotice) -> bool,
+    ) -> Option<crate::lanes::Stamp> {
+        let from = self.0.partition_point(|(s, _)| *s <= at);
+        self.0
+            .range(from..)
+            .find(|(_, n)| which(n))
+            .map(|(s, _)| *s)
     }
 
     /// The head's stamp.
@@ -181,23 +234,36 @@ pub(crate) mod id {
     pub(crate) const UNIT_DISPLAYPOWER: u16 = 30;
     pub(crate) const UNIT_AURA: u16 = 41;
     pub(crate) const UNIT_NAME_UPDATE: u16 = 183;
+    pub(crate) const UNIT_PORTRAIT_UPDATE: u16 = 184;
+    pub(crate) const UNIT_MODEL_CHANGED: u16 = 185;
     pub(crate) const UNIT_INVENTORY_CHANGED: u16 = 186;
     pub(crate) const PLAYER_MONEY: u16 = 200;
     pub(crate) const PLAYERBANKSLOTS_CHANGED: u16 = 347;
+    pub(crate) const PLAYERBANKBAGSLOTS_CHANGED: u16 = 350;
     pub(crate) const UNIT_CLASSIFICATION_CHANGED: u16 = 187;
     pub(crate) const PLAYER_FLAGS_CHANGED: u16 = 407;
     pub(crate) const UNIT_QUEST_LOG_CHANGED: u16 = 522;
+    pub(crate) const INSPECT_HONOR_UPDATE: u16 = 525;
     pub(crate) const PLAYER_REGEN_DISABLED: u16 = 190;
     pub(crate) const PLAYER_REGEN_ENABLED: u16 = 191;
+    pub(crate) const PLAYER_FARSIGHT_FOCUS_CHANGED: u16 = 198;
+    pub(crate) const LANGUAGE_LIST_CHANGED: u16 = 258;
     pub(crate) const PET_ATTACK_START: u16 = 334;
     pub(crate) const PET_ATTACK_STOP: u16 = 335;
+    pub(crate) const LOCALPLAYER_PET_RENAMED: u16 = 331;
     pub(crate) const PLAYER_GUILD_UPDATE: u16 = 345;
     pub(crate) const UPDATE_FACTION: u16 = 372;
     pub(crate) const TABARD_CANSAVE_CHANGED: u16 = 376;
+    pub(crate) const MERCHANT_UPDATE: u16 = 317;
     pub(crate) const PLAYER_UNGHOST: u16 = 401;
     pub(crate) const PLAYER_UPDATE_RESTING: u16 = 405;
     pub(crate) const PET_UI_UPDATE: u16 = 427;
     pub(crate) const PLAYTIME_CHANGED: u16 = 530;
+    pub(crate) const SPELLS_CHANGED: u16 = 260;
+    pub(crate) const UPDATE_SHAPESHIFT_FORMS: u16 = 387;
+    pub(crate) const PET_BAR_UPDATE: u16 = 353;
+    pub(crate) const AREA_SPIRIT_HEALER_IN_RANGE: u16 = 527;
+    pub(crate) const AREA_SPIRIT_HEALER_OUT_OF_RANGE: u16 = 528;
 }
 
 /// `CGPlayer_C::RefreshGuildTag` (`0x5e08e0`) on the player `guid`: `TABARD_CANSAVE_CHANGED` bare
@@ -295,9 +361,17 @@ pub(crate) fn bridge_len(id: u16) -> u16 {
 const VISIBLE_ITEMS_WATCH: (u16, u16) = (0x118, 0x390);
 const QUEST_LOG_WATCH: (u16, u16) = (0x28, 0xf0);
 
+/// The active player's point counters' watch `0x4c7000`, `PLAYER_CHARACTER_POINTS1` and `2` at
+/// the player section's `+0xe48`, 8 bytes, registered at world entry (`0x4c6fce`, `0x4c6fd8`).
+const CHARACTER_POINTS: (u16, u16) = (0xe48, 8);
+
 /// The active player's ammunition watch `0x4c70b0`, `PLAYER_AMMO_ID` at the player section's
 /// `+0x102c`, registered at world entry (`0x4c6fea`, from `0x49097e`).
 const AMMO_ID: (u16, u16) = (0x102c, 4);
+
+/// The active player's buy-back watch `0x4faca0`, the 12 prices and 12 stamps at the player
+/// section's `+0x1038`, 0x60 bytes, registered at world entry (`0x4fac83`, from `0x4909b0`).
+const BUYBACK: (u16, u16) = (0x1038, 0x60);
 
 /// `0x5de4b0`'s registrations in `0x5dd8a0`, in registration order: the byte offset in the player
 /// section, the length, and the event id pushed as the argument.
@@ -331,6 +405,11 @@ const COINAGE: (u16, u16) = (0xf70, 4);
 /// `0x5de4e0`'s range, `PLAYER_BYTES_2` byte 3 (`0x5ddb0b`).
 const REST_STATE: u16 = 0x1b;
 
+/// The active player's bank-slot watch `0x4f8490`, `PLAYER_BYTES_2` byte 2, the bought bank bag
+/// slots, registered at world entry (`0x4f8460`, from `0x4909ba`), behind `0x5de4e0` on the same
+/// dword.
+const BANK_BAG_SLOTS: (u16, u16) = (0x1a, 1);
+
 /// The skill block: entry `k` at `0x848 + 12k` of the player section, 128 entries (`0x5dda54` to
 /// `0x5ddaf0`). Each entry's four watches cover two bytes each: the value at `+4`, the maximum at
 /// `+6`, the temporary bonus at `+8` and the permanent bonus at `+0xa`.
@@ -360,6 +439,19 @@ const PERSUADED: (u16, u16) = (0x30, 8);
 const PET_NUMBER: (u16, u16) = (0x214, 4);
 const DYNAMIC_FLAGS: (u16, u16) = (0x224, 4);
 const ENTRY: (u16, u16) = (0xc, 4);
+
+/// The unit type watcher `0x6045b0` on `UNIT_FIELD_LEVEL`, the unit section's `+0x70`
+/// (`0x604263`), whose level change `0x60cdd0` runs a player's `0x5edb60` (`0x60ce4b`).
+const LEVEL: (u16, u16) = (0x70, 4);
+
+/// The unit type watchers of `0x6041f0` whose callbacks run the usable refresh `0x4b31c0`: the
+/// health (`0x604294`, `0x6046f0`), the five powers as one watch (`0x6042ae`, `0x604860`), the
+/// aura state (`0x6042c8`, `0x604890`) and `UNIT_FIELD_BYTES_1` byte 3 (`0x6042fc`, `0x6044f0` →
+/// `0x5ff800`).
+const HEALTH: (u16, u16) = (0x40, 4);
+const POWERS: (u16, u16) = (0x44, 0x14);
+const AURA_STATE: (u16, u16) = (0x1dc, 4);
+const BYTES_1_BYTE_3: (u16, u16) = (0x213, 1);
 
 /// The player type watchers of `0x5e2510` whose callbacks signal, as (byte offset, length) in the
 /// player section: `PLAYER_FLAGS` (`0x5e2850` → `0x5ee990`), `PLAYER_GUILDID` (`0x5e258f` →
@@ -393,6 +485,10 @@ const PLAYER_AURAS: (u16, u16) = (0xa4, 0x138);
 const SHAPESHIFT_FORM: (u16, u16) = (0x212, 1);
 const COMBO_POINTS: (u16, u16) = (0x1029, 1);
 
+/// The active player's far-sight watch `0x5de0d0`, registered in `0x5dd8a0` (`0x5dda45`):
+/// `PLAYER_FARSIGHT`, the guid at the player section's `+0x830`, 8 bytes.
+const FARSIGHT: (u16, u16) = (0x830, 8);
+
 /// Which list a watch sits on: at one field the type watchers run ahead of the object's own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum List {
@@ -404,6 +500,8 @@ pub(crate) enum List {
 pub(crate) struct Around<'a> {
     /// The active player's guid.
     pub(crate) me: Option<u64>,
+    /// The selection's guid (`0xb4e2d8`), whose aura state refreshes the bar (`0x6048a6`).
+    pub(crate) target: Option<u64>,
     /// The creature cache's lookup with a callback (`0x60463f`): whether it holds `entry`'s
     /// record, which `0x604600` answers with the name signal at once; a miss asks for it and waits
     /// for the answer (`crate::names`).
@@ -639,6 +737,26 @@ pub(crate) fn placed_values(
     let mut pass = Pass::default();
 
     // The unit type watchers (`0x6041f0`), on every unit.
+    let mine = around.me == Some(guid);
+    // The health's and the powers' for the active player (`0x60483c`, `0x604868`), the aura
+    // state's for it or the target (`0x604898`-`0x6048b4`).
+    for (range, runs) in [
+        (HEALTH, mine),
+        (POWERS, mine),
+        (AURA_STATE, mine || around.target == Some(guid)),
+    ] {
+        if let Some(at) = at(UNIT_SECTION, range, List::Type).filter(|_| runs) {
+            pass.push(at, FieldNotice::UsableRefresh);
+        }
+    }
+    // `0x5ff800` on byte 3's bit 0x2 against its copy, for the active player (`0x5ff81a`,
+    // `0x5ff831`).
+    if let Some(at) = at(UNIT_SECTION, BYTES_1_BYTE_3, List::Type) {
+        let flipped = block.flipped(UNIT_SECTION + BYTES_1_BYTE_3.0 / 4);
+        if mine && flipped & 0x0200_0000 != 0 {
+            pass.push(at, FieldNotice::UsableRefresh);
+        }
+    }
     if let Some(at) = at(OBJECT_SECTION, ENTRY, List::Type) {
         // `0x604600`: a cached record names the unit at once (`0x604651`); a miss asks.
         if (around.creature_lookup)(fields.object_entry().unwrap_or(0)) {
@@ -654,10 +772,15 @@ pub(crate) fn placed_values(
         // `0x5ff580` on the flipped bits, against the new flags.
         let flipped = block.flipped(UNIT_SECTION + UNIT_FLAGS.0 / 4);
         let flags = fields.unit_flags();
-        // The active player's arm first (`0x5ff5b4`, `0x5ff5c7` → `0x5ff4e0`): the in-combat bit
-        // 0x80000 signals `PLAYER_REGEN_DISABLED` when now set, else `PLAYER_REGEN_ENABLED`
-        // (`0x5ff513`-`0x5ff533`).
-        if around.me == Some(guid) && flipped & 0x8_0000 != 0 {
+        // The active player's arm first (`0x5ff5b4`, `0x5ff5c7` → `0x5ff4e0`): a usable refresh
+        // on bits 0x1c20000 (`0x5ff50e`), then the in-combat bit 0x80000's own (`0x5ff51b`) and
+        // `PLAYER_REGEN_DISABLED` when now set, else `PLAYER_REGEN_ENABLED` (`0x5ff513`-
+        // `0x5ff533`).
+        if mine && flipped & 0x01c2_0000 != 0 {
+            pass.push(at, FieldNotice::UsableRefresh);
+        }
+        if mine && flipped & 0x8_0000 != 0 {
+            pass.push(at, FieldNotice::UsableRefresh);
             let id = if flags & 0x8_0000 != 0 {
                 id::PLAYER_REGEN_DISABLED
             } else {
@@ -720,6 +843,13 @@ pub(crate) fn placed_values(
         if flipped & 0x4 != 0 {
             pass.signal(at, guid, id::UNIT_FACTION);
         }
+    }
+    // A level change on the active player (`0x5edb6f`): the book's `SPELLS_CHANGED` with no sort
+    // (`0x5edb7b` → `0x4b2fd0(0, 0)`, `0x4b302a`), then the trainer's pass (`0x5edb80`).
+    if let Some(at) = at(UNIT_SECTION, LEVEL, List::Type).filter(|_| mine) {
+        let id = id::SPELLS_CHANGED;
+        pass.push(at, FieldNotice::Global { id });
+        pass.push(at, FieldNotice::TrainerPass);
     }
 
     // The bridge (`0x51bbb0`), the object's own watches.
@@ -828,13 +958,21 @@ pub(crate) fn placed_values(
             pass.reaction(at, guid, fields, around);
         }
         if let Some(at) = at(UNIT_SECTION, SHAPESHIFT_FORM, List::Object) {
+            pass.push(at, FieldNotice::UsableRefresh);
             pass.push(at, FieldNotice::Shapeshift);
         }
         if let Some(at) = at(UNIT_SECTION, PLAYER_AURAS, List::Object) {
             pass.push(at, FieldNotice::PlayerAuras);
         }
         if let Some(at) = at(PLAYER_SECTION, COMBO_POINTS, List::Object) {
+            pass.push(at, FieldNotice::UsableRefresh);
             pass.push(at, FieldNotice::ComboPoints);
+        }
+        // `0x5de0d0`: the far-sight update, then `PLAYER_FARSIGHT_FOCUS_CHANGED` bare on every
+        // change, whether or not the new guid resolves (`0x5de14e`, `0x5de167`).
+        if let Some(at) = at(PLAYER_SECTION, FARSIGHT, List::Object) {
+            let id = id::PLAYER_FARSIGHT_FOCUS_CHANGED;
+            pass.push(at, FieldNotice::Global { id });
         }
         // Registered at world entry (`0x4de430`), after the bridge's watch on the same range.
         if let Some(at) = at(PLAYER_SECTION, QUEST_LOG_WATCH, List::Object) {
@@ -855,18 +993,41 @@ pub(crate) fn placed_values(
                 );
             }
         }
+        // `0x4f8490`: `PLAYERBANKBAGSLOTS_CHANGED` bare (`0x4f8495`), a banker open or not.
+        if let Some(at) = at(PLAYER_SECTION, BANK_BAG_SLOTS, List::Object) {
+            let id = id::PLAYERBANKBAGSLOTS_CHANGED;
+            pass.push(at, FieldNotice::Global { id });
+        }
         for (offset, len, id) in PLAYER_EVENT_WATCHES {
             if let Some(at) = at(PLAYER_SECTION, (offset, len), List::Object) {
                 pass.push(at, FieldNotice::Player { id });
             }
         }
-        // `0x5ddf30` signals `PLAYER_MONEY` (`0x5ddf4b`) ahead of the trade offer's trim
-        // (`0x5ddfda`), which signals nothing and runs at the packet ([`crate::ui_trade`]).
+        // `0x5ddf30` runs the trainer's pass (`0x5ddf41`), then signals `PLAYER_MONEY`
+        // (`0x5ddf4b`) ahead of the trade offer's trim (`0x5ddfda`), which signals nothing and runs
+        // at the packet ([`crate::ui_trade`]).
         if let Some(at) = at(PLAYER_SECTION, COINAGE, List::Object) {
+            pass.push(at, FieldNotice::TrainerPass);
             pass.push(
                 at,
                 FieldNotice::Global {
                     id: id::PLAYER_MONEY,
+                },
+            );
+        }
+        // `0x4c7000`: each counter's change, against the copy its packet's write took
+        // (`0x4c7086`-`0x4c7098`).
+        if let Some(at) = at(PLAYER_SECTION, CHARACTER_POINTS, List::Object) {
+            let delta = |field: u16| {
+                block
+                    .edge(PLAYER_SECTION + field / 4)
+                    .map_or(0, |(old, new)| new.wrapping_sub(old) as i32)
+            };
+            pass.push(
+                at,
+                FieldNotice::CharacterPoints {
+                    talent: delta(CHARACTER_POINTS.0),
+                    profession: delta(CHARACTER_POINTS.0 + 4),
                 },
             );
         }
@@ -875,13 +1036,20 @@ pub(crate) fn placed_values(
             let id = id::UNIT_INVENTORY_CHANGED;
             pass.push(at, FieldNotice::Player { id });
         }
+        // `0x4faca0` rebuilds the buy-back list (`0x4fafd0`), which the getters derive at the
+        // call, and signals `MERCHANT_UPDATE` (`0x4facaa`), a vendor open or not.
+        if let Some(at) = at(PLAYER_SECTION, BUYBACK, List::Object) {
+            let id = id::MERCHANT_UPDATE;
+            pass.push(at, FieldNotice::Global { id });
+        }
         // Each entry's watches in their registration order (`0x5dda6c`, `0x5dda8e`, `0x5ddaaf`,
         // `0x5ddad1`), the order they run in at one field.
         for k in 0..SKILLS {
             let entry = SKILL_STRIDE * k;
             if let Some(at) = at(PLAYER_SECTION, (SKILL_VALUE + entry, 2), List::Object) {
                 // `0x5de180`: past its gate, `0x5ed990` (`0x5de214`), then the rebuild
-                // (`0x5de2a7`) and the line; on every run, the profession list's (`0x5de434`).
+                // (`0x5de2a7`) and the line; on every run, the trainer's pass (`0x5de42d`), then
+                // the profession list's rebuild (`0x5de434`).
                 let (old, _) = block.edge(at.0).unwrap_or_default();
                 let notice = skill_value_notice(fields, k, old);
                 if let FieldNotice::SkillValue { old, shown, .. } = notice {
@@ -890,11 +1058,14 @@ pub(crate) fn placed_values(
                     }
                 }
                 pass.push(at, notice);
+                pass.push(at, FieldNotice::TrainerPass);
+                pass.push(at, FieldNotice::Professions);
             }
-            // `0x5de450` on the maximum and the permanent bonus: the rebuilds (`0x5de457`,
-            // `0x5de45c`).
+            // `0x5de450` on the maximum and the permanent bonus: the trainer's pass, then the
+            // rebuilds (`0x5de457`, `0x5de45c`).
             for half in [SKILL_MAX, SKILL_PERM_BONUS] {
                 if let Some(at) = at(PLAYER_SECTION, (half + entry, 2), List::Object) {
+                    pass.push(at, FieldNotice::TrainerPass);
                     pass.push(at, FieldNotice::SkillMax);
                 }
             }
@@ -996,6 +1167,7 @@ mod tests {
     ) -> Vec<FieldNotice> {
         let around = Around {
             me,
+            target: None,
             creature_lookup: &|_| false,
             others: &Vec::new,
             pet_bar: 0,
@@ -1096,8 +1268,9 @@ mod tests {
         );
     }
 
-    /// The rank bar watch is one byte of `PLAYER_FIELD_BYTES2`, the rest-state watch one byte of
-    /// `PLAYER_BYTES_2`: the other bytes of their dwords run neither.
+    /// The rank bar watch is one byte of `PLAYER_FIELD_BYTES2`, the rest-state watch and the
+    /// bank-slot watch one byte each of `PLAYER_BYTES_2`: the other bytes of their dwords run
+    /// neither, and on one dword the rest state's runs first (`0x5ddb0b`, then `0x4f8460`).
     #[test]
     fn a_byte_watch_reads_its_own_byte_only() {
         let mut me = player();
@@ -1108,10 +1281,14 @@ mod tests {
             [FieldNotice::Player { id: 524 }]
         );
         let rest = pf(0x1b);
-        assert!(block(&mut me, Some(ME), ME, &[(rest, 0x00ff_ffff)]).is_empty());
+        assert!(block(&mut me, Some(ME), ME, &[(rest, 0x0000_ffff)]).is_empty());
+        let bank = FieldNotice::Global {
+            id: id::PLAYERBANKBAGSLOTS_CHANGED,
+        };
+        assert_eq!(block(&mut me, Some(ME), ME, &[(rest, 0x0002_ffff)]), [bank]);
         assert_eq!(
-            block(&mut me, Some(ME), ME, &[(rest, 0x02ff_ffff)]),
-            [FieldNotice::RestState { old: 0, new: 2 }]
+            block(&mut me, Some(ME), ME, &[(rest, 0x0203_ffff)]),
+            [FieldNotice::RestState { old: 0, new: 2 }, bank]
         );
         // The whole `PLAYER_BYTES_3` is the rank watch: its gender byte runs it.
         assert_eq!(
@@ -1228,27 +1405,35 @@ mod tests {
             combat(block(&mut me, Some(ME), ME, &[(value, (305 << 16) | 7)])),
             [FieldNotice::CombatSkill]
         );
-        // The gate skips its combat signals, not the run's notice (`0x5de20c` → `0x5de42d`).
+        // The gate skips its combat signals, not the run's notice nor the trainer's pass
+        // (`0x5de20c` → `0x5de42d`).
         assert_eq!(
             block(&mut me, Some(ME), ME, &[(value, (305 << 16) | 2)]),
-            [FieldNotice::SkillValue {
-                skill_id: 95,
-                old: 7,
-                shown: 7
-            }]
+            [
+                FieldNotice::SkillValue {
+                    skill_id: 95,
+                    old: 7,
+                    shown: 7
+                },
+                FieldNotice::TrainerPass,
+                FieldNotice::Professions
+            ]
         );
     }
 
     /// Each of the four watches of a skill slot (`0x5dda54`-`0x5ddaf0`) rebuilds a list: the value
-    /// its notice, past its gate after its combat signals (`0x5de214`, `0x5de2a7`, `0x5de434`), the
-    /// maximum and the permanent bonus theirs (`0x5de450` → `0x5de457`, `0x5de45c`), and the
+    /// its notice, past its gate after its combat signals (`0x5de214`, `0x5de2a7`, `0x5de434`),
+    /// then the trainer's pass (`0x5de42d`), the maximum and the permanent bonus the pass and their
+    /// rebuilds (`0x5de450` → `0x5de457`, `0x5de45c`), and the
     /// temporary bonus the skill list after its combat signals (`0x5de470` → `0x5de495`,
     /// `0x5de49a`); at one field the watches run in their registration
     /// order, value, maximum, permanent bonus, temporary bonus (`0x5dda6c`, `0x5dda8e`,
     /// `0x5ddaaf`, `0x5ddad1`).
     #[test]
     fn every_skill_watch_rebuilds_the_list() {
-        use FieldNotice::{CombatSkill, SkillLines, SkillMax, SkillValue};
+        use FieldNotice::{
+            CombatSkill, Professions, SkillLines, SkillMax, SkillValue, TrainerPass,
+        };
         let mut me = player();
         let value = pf(SKILL_VALUE);
         let bonus = pf(SKILL_TEMP_BONUS);
@@ -1267,6 +1452,9 @@ mod tests {
                     old: 0,
                     shown: 1
                 },
+                TrainerPass,
+                Professions,
+                TrainerPass,
                 SkillMax,
             ]
         );
@@ -1278,17 +1466,19 @@ mod tests {
                     skill_id: 95,
                     old: 1,
                     shown: 2
-                }
+                },
+                TrainerPass,
+                Professions
             ]
         );
         assert_eq!(
             block(&mut me, Some(ME), ME, &[(value, (305 << 16) | 2)]),
-            [SkillMax],
+            [TrainerPass, SkillMax],
             "the maximum alone"
         );
         assert_eq!(
             block(&mut me, Some(ME), ME, &[(bonus, 5 << 16)]),
-            [SkillMax],
+            [TrainerPass, SkillMax],
             "the permanent bonus alone"
         );
         assert_eq!(
@@ -1298,7 +1488,7 @@ mod tests {
         );
         assert_eq!(
             block(&mut me, Some(ME), ME, &[(bonus, (6 << 16) | 4)]),
-            [SkillMax, CombatSkill, SkillLines],
+            [TrainerPass, SkillMax, CombatSkill, SkillLines],
             "both bonuses: the permanent one's watch first"
         );
         // Shown 4 + 6 against the old word 2.
@@ -1311,6 +1501,9 @@ mod tests {
                     old: 2,
                     shown: 10
                 },
+                TrainerPass,
+                Professions,
+                TrainerPass,
                 SkillMax,
             ],
             "the value and the maximum in one dword"
@@ -1512,6 +1705,7 @@ mod tests {
             .into_created(ObjectType::Player);
         let around = Around {
             me: Some(ME),
+            target: None,
             creature_lookup: &|_| false,
             others: &|| vec![MOB, OTHER],
             pet_bar: 0,
@@ -1628,6 +1822,7 @@ mod tests {
         );
         let cached = Around {
             me: Some(ME),
+            target: None,
             creature_lookup: &|entry| entry == 299,
             others: &Vec::new,
             pet_bar: 0,
@@ -1645,6 +1840,7 @@ mod tests {
     fn the_bar_pets_number_signals_the_pet_ui() {
         let bar = Around {
             me: Some(ME),
+            target: None,
             creature_lookup: &|_| false,
             others: &Vec::new,
             pet_bar: PET,
@@ -1742,14 +1938,19 @@ mod tests {
         );
     }
 
-    /// `0x5ff580` on `UNIT_FIELD_FLAGS`: the active player's combat bit first (`0x5ff4e0`), the
-    /// reactions, then the combat bit of a unit whose charmer, else summoner, is the player.
+    /// `0x5ff580` on `UNIT_FIELD_FLAGS`: the active player's combat bit first (`0x5ff4e0`, its
+    /// usable refresh ahead of its regen event), the reactions, then the combat bit of a unit
+    /// whose charmer, else summoner, is the player.
     #[test]
     fn the_unit_flags_arms_signal_combat_for_the_player_and_its_pet() {
         let mut me = player();
         assert_eq!(
             block(&mut me, Some(ME), ME, &[(46, 0x8_0000)]),
-            [FieldNotice::Global { id: 190 }, bridge(ME, 40)]
+            [
+                FieldNotice::UsableRefresh,
+                FieldNotice::Global { id: 190 },
+                bridge(ME, 40)
+            ]
         );
         assert_eq!(
             block(&mut me, Some(ME), ME, &[(46, 0x8_0080)]),
@@ -1759,6 +1960,7 @@ mod tests {
         assert_eq!(
             block(&mut me, Some(ME), ME, &[(46, 0)]),
             [
+                FieldNotice::UsableRefresh,
                 FieldNotice::Global { id: 191 },
                 signal(ME, 29),
                 bridge(ME, 40)
@@ -1913,6 +2115,7 @@ mod tests {
         let mut me = player();
         let around = Around {
             me: Some(ME),
+            target: None,
             creature_lookup: &|_| false,
             others: &|| vec![MOB],
             pet_bar: 0,
@@ -1933,6 +2136,123 @@ mod tests {
         );
     }
 
+    /// The level's type watcher signals the book for the active player alone (`0x5edb6f`), then
+    /// runs the trainer's pass (`0x5edb80`), ahead of the bridge's `UNIT_LEVEL` on the same field.
+    #[test]
+    fn a_level_change_signals_the_book_for_the_active_player() {
+        let mut me = player();
+        assert_eq!(
+            block(&mut me, Some(ME), ME, &[(34, 2)]),
+            [
+                FieldNotice::Global {
+                    id: id::SPELLS_CHANGED
+                },
+                FieldNotice::TrainerPass,
+                bridge(ME, id::UNIT_LEVEL)
+            ]
+        );
+        let mut other = player();
+        assert_eq!(
+            block(&mut other, Some(ME), 0x08, &[(34, 2)]),
+            [bridge(0x08, id::UNIT_LEVEL)]
+        );
+    }
+
+    /// Each caller of the usable refresh `0x4b31c0` among the watchers places it where it runs,
+    /// ahead of the bridge's signal on the same field (the type watchers run first): the active
+    /// player's health (`0x604848`), powers (`0x604876`), aura state (`0x6048b6`, the target's
+    /// too), unit flags bits `0x1c20000` and `0x80000` (`0x5ff50e`, `0x5ff51b`, two refreshes when
+    /// both move), `UNIT_FIELD_BYTES_1` byte 3's bit `0x2` (`0x5ff83a`), its form and its combo
+    /// points (`0x5de011`, `0x5ddff0`). Another unit's, and the bits no caller compares, place
+    /// none.
+    #[test]
+    fn each_usable_refresh_caller_places_it_where_its_watcher_runs() {
+        use FieldNotice::UsableRefresh as R;
+        let refreshes = |notices: &[FieldNotice]| notices.iter().filter(|n| **n == R).count();
+        let mut me = player();
+        assert_eq!(
+            block(&mut me, Some(ME), ME, &[(22, 90)]),
+            [R, bridge(ME, 16)],
+            "the health"
+        );
+        assert_eq!(
+            block(&mut me, Some(ME), ME, &[(23, 480)]),
+            [R, bridge(ME, 17)],
+            "the mana, ahead of its UNIT_MANA"
+        );
+        assert_eq!(
+            block(&mut me, Some(ME), ME, &[(26, 80)]),
+            [R, bridge(ME, 20)],
+            "the energy"
+        );
+        assert_eq!(
+            refreshes(&block(&mut me, Some(ME), ME, &[(125, 2)])),
+            1,
+            "the aura state"
+        );
+        assert_eq!(
+            refreshes(&block(&mut me, Some(ME), ME, &[(46, 0x2_0000)])),
+            1,
+            "a usable bit (pacified)"
+        );
+        assert_eq!(
+            refreshes(&block(&mut me, Some(ME), ME, &[(46, 0xa_0000)])),
+            1,
+            "the combat bit"
+        );
+        assert_eq!(
+            refreshes(&block(&mut me, Some(ME), ME, &[(46, 0)])),
+            2,
+            "both at once: the usable bits' and the combat bit's"
+        );
+        assert_eq!(
+            refreshes(&block(&mut me, Some(ME), ME, &[(138, 0x0200_0000)])),
+            1,
+            "byte 3's bit 0x2"
+        );
+        assert_eq!(
+            refreshes(&block(&mut me, Some(ME), ME, &[(138, 0x0201_0000)])),
+            1,
+            "the form byte"
+        );
+        assert_eq!(
+            refreshes(&block(&mut me, Some(ME), ME, &[(pf(0x1028), 0x0100)])),
+            1,
+            "the combo points"
+        );
+        for (pairs, why) in [
+            (&[(46, 0x1000)][..], "a unit-flag bit no refresh compares"),
+            (&[(138, 0x0301_0000)][..], "byte 3's bit 0x1"),
+            (&[(pf(0x1028), 0x0108)][..], "PLAYER_FIELD_BYTES byte 0"),
+            (&[(34, 2)][..], "the level"),
+        ] {
+            assert_eq!(refreshes(&block(&mut me, Some(ME), ME, pairs)), 0, "{why}");
+        }
+        let mut mob = unit();
+        assert_eq!(
+            refreshes(&block(&mut mob, Some(ME), MOB, &[(23, 480), (125, 2)])),
+            0,
+            "another unit's power and aura state"
+        );
+        let target = Around {
+            me: Some(ME),
+            target: Some(MOB),
+            creature_lookup: &|_| false,
+            others: &Vec::new,
+            pet_bar: 0,
+        };
+        assert_eq!(
+            refreshes(&block_around(
+                &mut mob,
+                &target,
+                MOB,
+                &[(23, 470), (125, 0)]
+            )),
+            1,
+            "the target's aura state alone"
+        );
+    }
+
     /// The form watch `0x5de010` is one byte, `UNIT_FIELD_BYTES_1` byte 2, and the combo watch
     /// `0x5ddff0` one byte, `PLAYER_FIELD_BYTES` byte 1, both on the active player's own object
     /// (`0x5dda18`, `0x5dd9d0`): another byte of either dword, or another player, runs neither.
@@ -1942,7 +2262,14 @@ mod tests {
         let ours = |notices: Vec<FieldNotice>| -> Vec<FieldNotice> {
             notices
                 .into_iter()
-                .filter(|n| matches!(n, FieldNotice::Shapeshift | FieldNotice::ComboPoints))
+                .filter(|n| {
+                    matches!(
+                        n,
+                        FieldNotice::UsableRefresh
+                            | FieldNotice::Shapeshift
+                            | FieldNotice::ComboPoints
+                    )
+                })
                 .collect()
         };
         let mut me = player();
@@ -1955,7 +2282,12 @@ mod tests {
                 ME,
                 &[(bytes_1, 0x0001_0001), (bytes, 0x0201)]
             )),
-            [FieldNotice::Shapeshift, FieldNotice::ComboPoints]
+            [
+                FieldNotice::UsableRefresh,
+                FieldNotice::Shapeshift,
+                FieldNotice::UsableRefresh,
+                FieldNotice::ComboPoints
+            ]
         );
         let theirs = block(
             &mut other,
@@ -1979,6 +2311,7 @@ mod tests {
         mob.merge_diff(delta, |i, o, n| moved.push((i, o, n)));
         let around = Around {
             me: Some(ME),
+            target: None,
             creature_lookup: &|_| false,
             others: &Vec::new,
             pet_bar: 0,

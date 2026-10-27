@@ -328,8 +328,6 @@ fn click_select(c: &mut ClickSelect) -> Option<crate::script_calls::EngineSelect
 pub(crate) struct ServiceArms<'w> {
     /// The last `SMSG_QUESTGIVER_STATUS` per guid (`[unit+0xcb8]`), read by bit 1's `0x5df490`.
     pub(crate) quest: Res<'w, crate::ui_quest::QuestGiver>,
-    /// Bit 7: `0x5dfdc0` fires `CONFIRM_BINDER`; `CMSG_BINDER_ACTIVATE` is the dialog's Accept.
-    pub(crate) binder: ResMut<'w, crate::ui_binder::BinderState>,
     pub(crate) death: ResMut<'w, crate::death::DeathNet>,
     /// Bit 6 sends through the cache the proximity poll writes, so the two agree on the healer.
     pub(crate) spirit: ResMut<'w, crate::ui_dialog_verbs::AreaSpiritHealer>,
@@ -349,7 +347,8 @@ fn interaction_already_open_on(target: u64, interact: &crate::ui_session::Intera
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct Feedback<'w, 's> {
     errors: Res<'w, crate::ui_action::UiErrorKeys>,
-    // The mailbox's open, which registers on the interaction latch with the world in hand.
+    // The mailbox's open, which registers on the interaction latch with the world in hand, and
+    // `TalkToTrainer`, whose close core runs with it.
     windows: Commands<'w, 's>,
     item_text: ResMut<'w, crate::ui_item_text::ItemTextOpen>,
     // The cast queue: this system cannot also hold `CastLadder` (a second `Items` and
@@ -394,6 +393,7 @@ pub(crate) struct Dispatch<'w, 's> {
     // Through `creature_anim::gesture`, the chat path's entry, as the reference's dispatcher does.
     gestures: ResMut<'w, crate::creature_anim::GestureQueue>,
     go_inputs: GoLockInputs<'w, 's>,
+    opener_reach: super::lock::OpenerReach<'w, 's>,
     player_actions: Res<'w, crate::ui_action::PlayerActions>,
     // The skin leg's spells (`[0xb700e4]`, `[0xb700e8]`), already gated by the classifier.
     learned: Res<'w, crate::ui_action::LearnedAbilities>,
@@ -633,6 +633,38 @@ impl Dispatch<'_, '_> {
         Some(a.distance_squared(self.places.get(target).ok()?.translation))
     }
 
+    /// A GameObject within `usable 0x5f3130`'s distance test (`0x5f3346`), centre to centre: the
+    /// type's range, or the range of the spell that opens its lock (`0x5f3328`).
+    fn go_in_reach(&self, entity: Entity, d2: f32) -> bool {
+        let Ok((store, anim)) = self.stores.get(entity) else {
+            return false;
+        };
+        let opener = self.opener_reach.go_opener(
+            &self.go_inputs,
+            (store, crate::go_anim::go_state(anim, store)),
+            &self.player_actions.openers,
+            self.self_store(),
+        );
+        cursor_mode::go_in_reach(d2, store.0.gameobject_type_id(), opener.range)
+    }
+
+    /// The range the walk to a GameObject stops short of: slot 6's handed-back range
+    /// ([`cursor_mode::go_use_range`]), which a chair keeps at 100.0 when its base test failed.
+    fn go_stop_range(&self, entity: Entity, go_type: i32) -> f32 {
+        let base_passed = self.dist_sq(entity).is_none_or(|d2| {
+            let opener = self.stores.get(entity).ok().map(|(store, anim)| {
+                self.opener_reach.go_opener(
+                    &self.go_inputs,
+                    (store, crate::go_anim::go_state(anim, store)),
+                    &self.player_actions.openers,
+                    self.self_store(),
+                )
+            });
+            cursor_mode::go_base_in_reach(d2, go_type, opener.and_then(|o| o.range))
+        });
+        cursor_mode::go_use_range(go_type, base_passed)
+    }
+
     fn melee_reach(&self, target: Entity) -> f32 {
         match (self.stores.get(target).ok(), self.self_store()) {
             (Some((it, _)), Some(me)) => cursor_mode::melee_reach(it, me),
@@ -736,8 +768,7 @@ impl Dispatch<'_, '_> {
                 entity,
                 guid,
                 crate::player::Subject::GameObject,
-                crate::player::RANGE_STOP_FRACTION
-                    * cursor_mode::go_interact_range_sq(go_type).sqrt(),
+                crate::player::RANGE_STOP_FRACTION * self.go_stop_range(entity, go_type),
             );
         if !walked {
             self.feedback
@@ -755,14 +786,10 @@ impl Dispatch<'_, '_> {
             .me()
             .and_then(|(e, ..)| self.stores.get(e).ok())
             .map(|(s, _)| s);
-        let go = self
-            .stores
-            .get(entity)
-            .ok()
-            .map(|(s, anim)| (s, crate::go_anim::go_state(anim, s)));
-        let lock_id = go
-            .and_then(|(s, _)| self.go_inputs.templates.of(&s.0))
-            .map_or(0, |t| t.lock_id);
+        let go_entry = self.stores.get(entity).ok();
+        let go = go_entry.map(|(s, anim)| (s, crate::go_anim::go_state(anim, s)));
+        let tmpl = go.and_then(|(s, _)| self.go_inputs.templates.of(&s.0));
+        let lock_id = tmpl.map_or(0, |t| t.lock_id);
         let has_lock_row = lock_id != 0
             && self
                 .go_inputs
@@ -772,15 +799,44 @@ impl Dispatch<'_, '_> {
         let go_type = go.map_or(-1, |(s, _)| s.0.gameobject_type_id());
         // The player arms refuse ahead of the range arm, so a dead player is never walked there,
         // and before the opener: no packet, no cast, no mail window.
-        if let Some(refusal) =
-            self_store.and_then(|me| cursor_mode::go_player_refusal(me, has_lock_row, go_type))
-        {
+        let control_lost = self.seam.own_control_lost();
+        let forms = self.go_inputs.spells.as_deref().map(|s| &s.forms);
+        let refusal = self_store.zip(go_entry).and_then(|(me, (store, anim))| {
+            cursor_mode::go_player_refusal(&cursor_mode::GoUse {
+                me,
+                control_lost,
+                forms,
+                go: store,
+                anim,
+                template: tmpl,
+                has_lock_row,
+            })
+        });
+        if let Some(refusal) = refusal {
             debug!("right-click gameobject {guid:#x}: refused, {refusal:?} (type {go_type})");
             if let Some(key) = refusal.error_key() {
                 self.feedback
                     .errors
                     .push(crate::ui_action::UiError::key(key));
             }
+            return;
+        }
+        // `usable`'s state arm (`0x5f3395`), after its lock arm and ahead of the range arm: state 2
+        // refuses with `ERR_USE_DESTROYED` unless a spell opens the lock. The lock-less legs below
+        // have no opener; a locked object's is known once its lock resolves.
+        let state = go.map_or(0, |(_, state)| state);
+        let flag_locked = super::lock::go_facts(go).flag_locked;
+        let destroyed = cursor_mode::go_destroyed(state, false);
+        let lockless_leg = matches!(
+            go_type,
+            cursor_mode::GO_TYPE_MAILBOX
+                | cursor_mode::GO_TYPE_TEXT
+                | cursor_mode::GO_TYPE_MEETINGSTONE
+        );
+        if destroyed && lockless_leg {
+            self.feedback
+                .errors
+                .push(crate::ui_action::UiError::key("ERR_USE_DESTROYED"));
             return;
         }
         // MAILBOX (type 19) opens locally: its use handler `0x5f6820` sends no
@@ -832,6 +888,17 @@ impl Dispatch<'_, '_> {
             self_store,
             &self.seam.net,
         ) {
+            // No opener spell, and the lock arm (flagged locked) did not already refuse.
+            GoAction::Use if destroyed => {
+                self.feedback
+                    .errors
+                    .push(crate::ui_action::UiError::key("ERR_USE_DESTROYED"));
+            }
+            GoAction::Refuse(_) if destroyed && !flag_locked => {
+                self.feedback
+                    .errors
+                    .push(crate::ui_action::UiError::key("ERR_USE_DESTROYED"));
+            }
             GoAction::Use | GoAction::OpenLock(_) | GoAction::OpenByKey(_) if !in_reach => {
                 self.walk_to_object(entity, guid, go_type, walk);
             }
@@ -1031,6 +1098,13 @@ impl Dispatch<'_, '_> {
             debug!("right-click interact: {guid:#x} — its window is already open, nothing sent");
             return;
         }
+        // Dialog status 1, unavailable, triggers Unavailable Quest Givers ahead of the ladder
+        // (`0x5f0268`-`0x5f0278`).
+        if self.service.quest.status(guid) == Some(1) {
+            if let Some(tutorials) = self.seam.slots.tutorials() {
+                tutorials.trigger_now(crate::tutorial::id::UNAVAILABLE_QUEST_GIVERS);
+            }
+        }
         let npc_flags = self
             .stores
             .get(entity)
@@ -1069,9 +1143,19 @@ impl Dispatch<'_, '_> {
                     script.take_cursor_item_for_sale();
                 }
             }
+            ServiceAction::TalkToTrainer => {
+                debug!("right-click interact: {guid:#x} (trainer)");
+                // With the world in hand: the close core runs inside it.
+                self.feedback.windows.queue(move |world: &mut World| {
+                    crate::ui_trainer::talk_to_trainer(world, guid)
+                });
+            }
             ServiceAction::AskBinder => {
                 debug!("right-click interact: {guid:#x} (innkeeper — CONFIRM_BINDER, no packet)");
-                self.service.binder.ask(guid);
+                // `0x5dfdc0` with the guid, its gate, latch and signal, with the world in hand.
+                self.feedback.windows.queue(move |world: &mut World| {
+                    let _ = world.run_system_cached_with(crate::ui_binder::ask_binder, guid);
+                });
             }
             ServiceAction::AskSpiritHealer => {
                 debug!(
@@ -1211,13 +1295,9 @@ fn interact(
         // Walking, the range arm (`0x5f330c`) is the object's own: the PickLock cursor never
         // grays, and the gray folds the lock in.
         let in_reach = if walk {
-            let go_type = dispatch
-                .stores
-                .get(entity)
-                .map_or(-1, |(s, _)| s.0.gameobject_type_id());
             dispatch
                 .dist_sq(entity)
-                .is_some_and(|d2| d2 <= cursor_mode::go_interact_range_sq(go_type))
+                .is_some_and(|d2| dispatch.go_in_reach(entity, d2))
         } else {
             !cursor.unable
         };
@@ -1576,18 +1656,10 @@ fn act_on_arrival_with(
             }
         }
         ApproachVerb::Use if kind == Some(EntityKind::GameObject) => {
-            let go_type = dispatch
-                .stores
-                .get(entity)
-                .map_or(-1, |(s, _)| s.0.gameobject_type_id());
             // Still out of range, `0x5f86b0`'s range arm walks again (`0x610300`).
             let walk = dispatch.auto.can_auto_interact();
-            dispatch.use_gameobject(
-                entity,
-                guid,
-                d2 <= cursor_mode::go_interact_range_sq(go_type),
-                walk,
-            );
+            let in_reach = dispatch.go_in_reach(entity, d2);
+            dispatch.use_gameobject(entity, guid, in_reach, walk);
         }
         // The spell by the target: a corpse or a player's body takes `[0xb700e8]` (`0x5f0608`).
         ApproachVerb::Skin => {
@@ -1932,6 +2004,9 @@ pub(crate) enum ServiceAction {
     AskSpiritHealer,
     /// Adopt this guide as the area's spirit healer; `0x5df950` → `0x4921c0` sends the query.
     AcquireSpiritGuide,
+    /// `TalkToTrainer` (`0x5f0385` → `0x5df680`): the asked guid, the open trainer closed, then
+    /// `CMSG_TRAINER_LIST`.
+    TalkToTrainer,
     /// Nothing goes out; the payload says why, for the debug line.
     Silent(&'static str),
 }
@@ -1962,7 +2037,7 @@ pub(crate) fn service_action(
             None => ServiceAction::Send(ClientCommand::ListInventory { guid }),
         },
         ServiceArm::FlightMaster => ServiceAction::Send(ClientCommand::TaxiQueryNodes { guid }),
-        ServiceArm::Trainer => ServiceAction::Send(ClientCommand::TrainerList { trainer: guid }),
+        ServiceArm::Trainer => ServiceAction::TalkToTrainer,
         ServiceArm::SpiritHealer if ghost => ServiceAction::AskSpiritHealer,
         ServiceArm::SpiritHealer => ServiceAction::Silent("spirit healer, and we are alive"),
         // The query goes through the proximity poll's routine after a `(0,0)` cache bust, so a
@@ -1987,33 +2062,6 @@ pub(crate) fn service_action(
             ServiceAction::Send(ClientCommand::ListStabledPets { npc: guid })
         }
     }
-}
-
-/// Drain the guid-scoped deselects ([`DeselectGuid`]). `ClearTarget()`, the last leg of the Esc
-/// chain (`UIParent.lua:1492`), is a script call and lands in call order
-/// ([`crate::script_calls`]).
-#[allow(clippy::type_complexity)] // a Bevy system's full input set
-pub(crate) fn clear_target_requests(
-    mut vm: crate::script_calls::VmWith<(
-        ResMut<'static, Selection>,
-        crate::creature_anim::AttackSeam<'static, 'static>,
-        // In the set: the host's loot verbs write it.
-        MessageReader<'static, 'static, DeselectGuid>,
-    )>,
-) {
-    let select = {
-        let (mut selection, mut seam, mut guid_asks) = vm.own();
-        if !guid_asks.read().any(|ask| selection.guid == Some(ask.0)) {
-            return;
-        }
-        let before = Standing::of(&selection, &seam);
-        let send = clear_owing(&mut selection, &mut seam);
-        before.owing(scan::Owed { send, swing: None })
-    };
-    // The teardown signals inside the deselect ([`crate::script_calls::ScriptCallHost::engine_select`]).
-    vm.engine_select(select, |(mut selection, mut seam, ..), owed| {
-        owed.pay(&mut selection, &mut seam);
-    });
 }
 
 /// The UI shutdown's own deselect (`0x490bdf` → `SetSelection(0, 0)`), ahead of its
@@ -2057,6 +2105,12 @@ pub(crate) fn signal_ui_shutdown_deselect(
 /// the selection is stamped as the last target (`0x493622`) and cleared (`0x4939d3`), and
 /// `0x4939df` returns before the swing stop, the send and the event.
 pub(crate) fn clear_selection_on_world_teardown(mut selection: ResMut<Selection>) {
+    clear_with_no_world(&mut selection);
+}
+
+/// `SetSelection(0, 0)` with no object manager: stamped as the last target (`0x493622`) and
+/// cleared (`0x4939d3`), returning before the swing stop, the send and the event (`0x4939df`).
+pub(crate) fn clear_with_no_world(selection: &mut Selection) {
     if selection.guid.is_some() {
         selection.last = selection.guid;
     }
@@ -2064,11 +2118,6 @@ pub(crate) fn clear_selection_on_world_teardown(mut selection: ResMut<Selection>
     selection.guid = None;
     selection.lit = None;
 }
-
-/// A deselect that applies only if the selection is this guid (`0x493910(guid, 1)`), raised by
-/// every loot close for a dead unit (`0x48f369`) and drained by [`clear_target_requests`].
-#[derive(bevy::ecs::message::Message, Clone, Copy, Debug)]
-pub(crate) struct DeselectGuid(pub(crate) u64);
 
 /// `SetSelection(0,0)` (`0x493540` → `0x4938f3`): the deselect of Esc, a click off and a target's
 /// death, which stamps the outgoing target into the last-target pair before its teardown
@@ -2403,6 +2452,7 @@ mod tests {
             ServiceAction::AskBinder => "ask-binder".to_string(),
             ServiceAction::AskSpiritHealer => "ask-spirit-healer".to_string(),
             ServiceAction::AcquireSpiritGuide => "acquire-spirit-guide".to_string(),
+            ServiceAction::TalkToTrainer => "talk-to-trainer".to_string(),
             ServiceAction::Silent(_) => "silent".to_string(),
         };
         assert!(matches!(
@@ -2411,7 +2461,7 @@ mod tests {
         ));
         assert!(matches!(
             service_action(ServiceArm::Trainer, 0x42, false, None),
-            ServiceAction::Send(ClientCommand::TrainerList { trainer: 0x42 })
+            ServiceAction::TalkToTrainer
         ));
         assert!(matches!(
             service_action(ServiceArm::Petitioner, 0x42, false, None),
@@ -2497,6 +2547,7 @@ mod tests {
                     ServiceAction::AskBinder => "ask-binder".into(),
                     ServiceAction::AskSpiritHealer => "ask-xp-loss".into(),
                     ServiceAction::AcquireSpiritGuide => "acquire-spirit-guide".into(),
+                    ServiceAction::TalkToTrainer => "talk-to-trainer".into(),
                     ServiceAction::Silent(w) => format!("silent {w}"),
                 };
                 let empty = describe(service_action(arm, VENDOR, ghost, None));
@@ -2545,6 +2596,7 @@ mod tests {
         });
         let with_quest = armed(&|w| {
             w.init_resource::<crate::ui_quest::QuestGiver>();
+            crate::ui_quest::hold_for_test(w, NPC);
             crate::ui_quest::open_panel(
                 w,
                 NPC,
@@ -2767,6 +2819,7 @@ mod tests {
         world.init_resource::<crate::player::Approach>();
         world.init_resource::<crate::player::FollowState>();
         world.init_resource::<crate::player::Player>();
+        world.init_resource::<crate::player::MoverLock>();
         world.init_resource::<crate::player::OwnControlLost>();
         world.init_resource::<crate::ui_script::CursorPayloadHeld>();
         world.init_resource::<Messages<Interact>>();
@@ -2877,11 +2930,12 @@ mod tests {
             (true, true, Some(0x61)),
         ] {
             let label = format!("in flight {in_flight}, mounted {mounted}");
-            let mut app = crate::game_plugins::schedule_tests::headless_client();
+            let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
             let (tx, rx) = crossbeam_channel::unbounded();
             // In world: the body we drive.
             app.insert_resource(NetCommands(tx))
-                .init_resource::<crate::player::Player>();
+                .init_resource::<crate::player::Player>()
+                .init_resource::<crate::player::MoverLock>();
             let world = app.world_mut();
             let mut mine = vec![(2, 0x19), (F_HEALTH, 100), (F_MAXHEALTH, 100)];
             if mounted {
@@ -3184,6 +3238,77 @@ mod tests {
         world.run_system_once(act_on_right_click).unwrap();
     }
 
+    /// Bit 7's arm runs `0x5dfdc0` with the innkeeper's guid: past the range gate (`0x5dfe3c`) it
+    /// latches and queues `CONFIRM_BINDER` on the dialogs' lane; out of range, or with no unit
+    /// under the guid, nothing.
+    #[test]
+    fn an_innkeeper_click_asks_through_the_binders_gate() {
+        const F_NPC_FLAGS: u16 = 147;
+        const INNKEEPER: u64 = 0x1AA;
+        for (at, held, asks) in [(3.0, true, true), (10.0, true, false), (3.0, false, false)] {
+            let label = format!("at {at}, held {held}");
+            let (mut world, _boar) = right_click_world();
+            world.init_resource::<crate::ui_dialog_verbs::DialogLane>();
+            let me = world
+                .query_filtered::<Entity, With<SelfPlayer>>()
+                .single(&world)
+                .unwrap();
+            world.entity_mut(me).insert((
+                store(&[(F_HEALTH, 100), (F_MAXHEALTH, 100)]),
+                Transform::default(),
+            ));
+            let inn = world
+                .spawn((
+                    Guid(INNKEEPER),
+                    store(&[(F_HEALTH, 100), (F_MAXHEALTH, 100), (F_NPC_FLAGS, 0x80)]),
+                    Transform::from_xyz(at, 0.0, 0.0),
+                    crate::net::NetEntity {
+                        kind: benilla_protocol::EntityKind::Unit,
+                        display_id: None,
+                        scale: 1.0,
+                    },
+                ))
+                .id();
+            if held {
+                world
+                    .resource_mut::<crate::net::GuidIndex>()
+                    .0
+                    .insert(INNKEEPER, inn);
+            }
+            *world.resource_mut::<PressPick>() = PressPick {
+                hovered: Hovered {
+                    target: Some(inn),
+                    guid: Some(INNKEEPER),
+                    distance: 1.0,
+                    ..Hovered::default()
+                },
+                cursor: WorldCursor {
+                    kind: cursor_mode::CursorKind::Interact,
+                    unable: false,
+                },
+                ..PressPick::default()
+            };
+            world
+                .resource_mut::<Messages<WorldRightClick>>()
+                .write(WorldRightClick);
+            world.run_system_once(act_on_right_click).unwrap();
+            let signals = world
+                .resource_mut::<crate::ui_dialog_verbs::DialogLane>()
+                .take();
+            let expected = if asks {
+                vec![crate::ui_dialog_verbs::DialogSignal::ConfirmBinder { leaf: None }]
+            } else {
+                vec![]
+            };
+            assert_eq!(signals, expected, "{label}");
+            assert_eq!(
+                world.resource::<crate::ui_binder::BinderState>().pending(),
+                asks.then_some(INNKEEPER),
+                "{label}: the latch"
+            );
+        }
+    }
+
     /// `0x5f0130`: out of reach, `CanAutoInteract` starts the walk and nothing goes out; with the
     /// option off the click stays refused.
     #[test]
@@ -3412,6 +3537,514 @@ mod tests {
                 .map(|e| e.key)
                 .collect();
             assert_eq!(keys, error.into_iter().collect::<Vec<_>>(), "{label}");
+        }
+    }
+
+    /// The rest of `usable 0x5f3130`'s player arms and the door's own slot (`0x5f4360`), each
+    /// graying the cursor and raising its error on the use with nothing sent:
+    /// - locked out, `[0xb4b3e4]` clear: 0x7f (`0x5f316e`-`0x5f3183`);
+    /// - shapeshifted at an object with no lock row, a form without flag `0x8` (`0x5f31e1`,
+    ///   `0x5f3210`): 0x1a0;
+    /// - in combat (`UNIT_FLAG` `0x80000`) at an object whose notInCombat column is set
+    ///   (`0x5f5970`, a chest's `data[12]`): 0x1a1 (`0x5f325d`);
+    /// - `UNIT_FLAG` `0x80000000` at a chest, or at an object whose noDamageImmune column is set
+    ///   (`0x5f59a0`, a goober's `data[11]`): 0x169 (`0x5f3297`);
+    /// - a door with autoClose (`data[2]`) at the rest state opposite its start (`0x5f42f0`:
+    ///   `startOpen ? substate != 1 : substate != 3`): 0xe3.
+    #[test]
+    fn the_player_and_door_arms_refuse_an_object_in_reach() {
+        use benilla_protocol::field::{FIELD_OBJECT_ENTRY, FIELD_UNIT_FLAGS};
+        const F_BYTES_1: u16 = 138;
+        const F_GO_FLAGS_STATE: u16 = 14;
+        const IN_COMBAT: u32 = 0x8_0000;
+        const IMMUNE: u32 = 0x8000_0000;
+        /// One case: our fields, whether we lost control, the form row's flags, the object's
+        /// type, its template data and wire state, and the expected error, `None` for a use.
+        struct Case {
+            label: &'static str,
+            own: Vec<(u16, u32)>,
+            locked_out: bool,
+            form_flags: u32,
+            go_type: u32,
+            data: Vec<(usize, i32)>,
+            state: u32,
+            error: Option<&'static str>,
+        }
+        let live = |extra: &[(u16, u32)]| {
+            let mut own = vec![(F_HEALTH, 100), (F_MAXHEALTH, 100)];
+            own.extend_from_slice(extra);
+            own
+        };
+        let case = |label, own, go_type, data: &[(usize, i32)], state, error| Case {
+            label,
+            own,
+            locked_out: false,
+            form_flags: 0,
+            go_type,
+            data: data.to_vec(),
+            state,
+            error,
+        };
+        let cases = [
+            Case {
+                locked_out: true,
+                ..case(
+                    "locked out",
+                    live(&[]),
+                    3,
+                    &[],
+                    1,
+                    Some("ERR_CLIENT_LOCKED_OUT"),
+                )
+            },
+            case(
+                "in cat form",
+                live(&[(F_BYTES_1, 1 << 16)]),
+                3,
+                &[],
+                1,
+                Some("ERR_NOT_WHILE_SHAPESHIFTED"),
+            ),
+            Case {
+                form_flags: 0x8,
+                ..case(
+                    "in a form that may interact",
+                    live(&[(F_BYTES_1, 1 << 16)]),
+                    3,
+                    &[],
+                    1,
+                    None,
+                )
+            },
+            Case {
+                form_flags: 0x1,
+                ..case(
+                    "in a stance",
+                    live(&[(F_BYTES_1, 1 << 16)]),
+                    3,
+                    &[],
+                    1,
+                    None,
+                )
+            },
+            case(
+                "in combat at a notInCombat chest",
+                live(&[(FIELD_UNIT_FLAGS, IN_COMBAT)]),
+                3,
+                &[(12, 1)],
+                1,
+                Some("ERR_NOT_IN_COMBAT"),
+            ),
+            case(
+                "in combat at an ordinary chest",
+                live(&[(FIELD_UNIT_FLAGS, IN_COMBAT)]),
+                3,
+                &[],
+                1,
+                None,
+            ),
+            case(
+                "immune at a chest",
+                live(&[(FIELD_UNIT_FLAGS, IMMUNE)]),
+                3,
+                &[],
+                1,
+                Some("ERR_USE_CANT_IMMUNE"),
+            ),
+            case(
+                "immune at a noDamageImmune goober",
+                live(&[(FIELD_UNIT_FLAGS, IMMUNE)]),
+                10,
+                &[(11, 1)],
+                1,
+                Some("ERR_USE_CANT_IMMUNE"),
+            ),
+            case(
+                "immune at an ordinary goober",
+                live(&[(FIELD_UNIT_FLAGS, IMMUNE)]),
+                10,
+                &[],
+                1,
+                None,
+            ),
+            case(
+                "an auto-closing door left open",
+                live(&[]),
+                0,
+                &[(2, 1)],
+                0,
+                Some("ERR_USE_OBJECT_MOVING"),
+            ),
+            case(
+                "an auto-closing door at rest",
+                live(&[]),
+                0,
+                &[(2, 1)],
+                1,
+                None,
+            ),
+            case(
+                "an auto-closing door that starts open, left closed",
+                live(&[]),
+                0,
+                &[(0, 1), (2, 1)],
+                1,
+                Some("ERR_USE_OBJECT_MOVING"),
+            ),
+            case(
+                "a door that never closes itself",
+                live(&[]),
+                0,
+                &[],
+                0,
+                None,
+            ),
+        ];
+        for c in cases {
+            let (mut world, _vendor, rx) = walking_world(Vec3::ZERO, false);
+            let me = world
+                .query_filtered::<Entity, With<SelfPlayer>>()
+                .single(&world)
+                .unwrap();
+            world.entity_mut(me).insert(store(&c.own));
+            world.resource_mut::<crate::player::OwnControlLost>().0 = c.locked_out;
+            let mut spells = crate::ui_action::Spells::empty_for_tests();
+            spells.forms.insert(
+                1,
+                benilla_formats::ShapeshiftForm {
+                    flags: c.form_flags,
+                    ..Default::default()
+                },
+            );
+            world.insert_resource(spells);
+            let mut data = [0; 24];
+            for &(i, v) in &c.data {
+                data[i] = v;
+            }
+            world
+                .resource_mut::<crate::go_templates::GameObjectTemplates>()
+                .insert(77, c.go_type, "Object".into(), &data);
+            let object = spawn_object(&mut world, c.go_type, Vec3::new(2.0, 0.0, 0.0));
+            world.entity_mut(object).insert(store(&[
+                (GO_TYPE_FIELD, c.go_type),
+                (FIELD_OBJECT_ENTRY, 77),
+                (F_GO_FLAGS_STATE, c.state),
+            ]));
+            let hovered = HoveredObject {
+                target: Some(object),
+                guid: Some(CHEST),
+                distance: 2.0,
+            };
+            let cursor = world
+                .run_system_once(move |inputs: cursor_mode::CursorInputs| {
+                    cursor_mode::classify(&inputs, &Hovered::default(), &hovered).0
+                })
+                .unwrap();
+            assert_eq!(cursor.unable, c.error.is_some(), "{}: {cursor:?}", c.label);
+            interact_with(&mut world, object);
+            let sent_use = rx
+                .try_iter()
+                .any(|c| matches!(c, ClientCommand::GameObjUse { .. }));
+            assert_eq!(sent_use, c.error.is_none(), "{}", c.label);
+            let keys: Vec<&str> = world
+                .resource::<crate::ui_action::UiErrorKeys>()
+                .snapshot()
+                .iter()
+                .map(|e| e.key)
+                .collect();
+            assert_eq!(keys, c.error.into_iter().collect::<Vec<_>>(), "{}", c.label);
+        }
+    }
+
+    /// `0x5f59a0` reads the object's own `GAMEOBJECT_TYPE_ID` (`[go+0x110]+0x3c`, `0x5f59a9`) to
+    /// pick the column, not the template's type: a DOOR whose template says GOOBER reads the door's
+    /// noDamageImmune column 3, here 0, not the goober's column 11.
+    #[test]
+    fn the_columns_follow_the_objects_own_type() {
+        use benilla_protocol::field::{FIELD_OBJECT_ENTRY, FIELD_UNIT_FLAGS};
+        let (mut world, _vendor, rx) = walking_world(Vec3::ZERO, false);
+        let me = world
+            .query_filtered::<Entity, With<SelfPlayer>>()
+            .single(&world)
+            .unwrap();
+        world.entity_mut(me).insert(store(&[
+            (F_HEALTH, 100),
+            (F_MAXHEALTH, 100),
+            (FIELD_UNIT_FLAGS, 0x8000_0000),
+        ]));
+        let mut data = [0; 24];
+        data[11] = 1;
+        world
+            .resource_mut::<crate::go_templates::GameObjectTemplates>()
+            .insert(77, 10, "Object".into(), &data);
+        let object = spawn_object(&mut world, 0, Vec3::new(2.0, 0.0, 0.0));
+        world.entity_mut(object).insert(store(&[
+            (GO_TYPE_FIELD, 0),
+            (FIELD_OBJECT_ENTRY, 77),
+            (14, 1),
+        ]));
+        interact_with(&mut world, object);
+        assert!(rx
+            .try_iter()
+            .any(|c| matches!(c, ClientCommand::GameObjUse { .. })));
+        assert!(world
+            .resource::<crate::ui_action::UiErrorKeys>()
+            .snapshot()
+            .is_empty());
+    }
+
+    /// What the cursor and an interaction make of a GameObject of `go_type` at `x` yards: whether
+    /// the cursor grays, whether the use went out (`CMSG_GAMEOBJ_USE` or an opener cast), and the
+    /// error keys raised. `opener` gives the known spell that opens the template's lock and its
+    /// `SpellRange` maximum.
+    fn range_verdict(
+        go_type: u32,
+        x: f32,
+        opener: Option<(u32, f32)>,
+    ) -> (bool, bool, Vec<&'static str>) {
+        range_verdict_in_state(go_type, x, opener, 0)
+    }
+
+    /// A world with a GameObject of `go_type` `x` yards off the player; the wire `GAMEOBJECT_STATE`
+    /// is `state` and the opener's lock slot is Action 4 at state 2 (the destroyed state's only
+    /// action), else any state. `walk` is Click to Move.
+    fn go_world(
+        go_type: u32,
+        x: f32,
+        opener: Option<(u32, f32)>,
+        state: u32,
+        walk: bool,
+    ) -> (World, Entity, crossbeam_channel::Receiver<ClientCommand>) {
+        use benilla_formats::{LockCatalog, LockSlot, OpenLock, SpellDisplay, SpellRange};
+        use benilla_protocol::field::FIELD_OBJECT_ENTRY;
+        const LOCK: u32 = 55;
+        let (mut world, _vendor, rx) = walking_world(Vec3::ZERO, walk);
+        let mut data = [0; 24];
+        if let Some((spell, max)) = opener {
+            // A lock whose one skill slot (LockType 1, any state) the known spell opens.
+            let mut slots = [LockSlot::default(); benilla_formats::MAX_LOCK_SLOTS];
+            slots[0] = LockSlot {
+                key_type: benilla_formats::LOCK_KEY_SKILL,
+                index: 1,
+                skill: 0,
+                action: if state == 2 { 4 } else { 5 },
+            };
+            world.insert_resource(crate::go_templates::Locks(LockCatalog::from_rows([(
+                LOCK, slots,
+            )])));
+            let mut spells = crate::ui_action::Spells::empty_for_tests();
+            spells.catalog =
+                benilla_formats::SpellCatalog::from_displays(std::collections::HashMap::from([(
+                    spell,
+                    SpellDisplay {
+                        range_index: 12,
+                        effects: [0x21, 0, 0],
+                        effect_misc_value: [1, 0, 0],
+                        open_lock: Some(OpenLock {
+                            lock_type: 1,
+                            effect: 0,
+                        }),
+                        ..SpellDisplay::default()
+                    },
+                )]));
+            spells.ranges =
+                benilla_formats::SpellRangeCatalog::from_rows(std::collections::HashMap::from([(
+                    12,
+                    SpellRange {
+                        min: 0.0,
+                        max,
+                        flags: 0,
+                    },
+                )]));
+            world.insert_resource(spells);
+            world
+                .resource_mut::<crate::ui_action::PlayerActions>()
+                .openers
+                .push(spell);
+            // DOOR(0) and BUTTON(1) hold the lock at `data[1]`, the others at `data[0]`.
+            data[usize::from(go_type <= 1)] = LOCK as i32;
+        }
+        world
+            .resource_mut::<crate::go_templates::GameObjectTemplates>()
+            .insert(77, go_type, "Object".into(), &data);
+        let object = spawn_object(&mut world, go_type, Vec3::new(x, 0.0, 0.0));
+        world.entity_mut(object).insert(store(&[
+            // `OBJECT_FIELD_TYPE`: object and GameObject, which the lock chain's lookup filters on.
+            (2, 0x21),
+            (GO_TYPE_FIELD, go_type),
+            (FIELD_OBJECT_ENTRY, 77),
+            (14, state),
+        ]));
+        (world, object, rx)
+    }
+
+    /// [`range_verdict`] with the object's wire `GAMEOBJECT_STATE`; the opener's lock slot is
+    /// Action 4 at state 2 (the destroyed state's only action), else any state.
+    /// [`range_verdict`] in a state.
+    fn range_verdict_in_state(
+        go_type: u32,
+        x: f32,
+        opener: Option<(u32, f32)>,
+        state: u32,
+    ) -> (bool, bool, Vec<&'static str>) {
+        let (mut world, object, rx) = go_world(go_type, x, opener, state, false);
+        let hovered = HoveredObject {
+            target: Some(object),
+            guid: Some(CHEST),
+            distance: x,
+        };
+        let cursor = world
+            .run_system_once(move |inputs: cursor_mode::CursorInputs| {
+                cursor_mode::classify(&inputs, &Hovered::default(), &hovered).0
+            })
+            .unwrap();
+        interact_with(&mut world, object);
+        let used = rx
+            .try_iter()
+            .any(|c| matches!(c, ClientCommand::GameObjUse { .. }))
+            || !world
+                .resource::<crate::ui_action::ClickCasts>()
+                .0
+                .is_empty();
+        let keys = world
+            .resource::<crate::ui_action::UiErrorKeys>()
+            .snapshot()
+            .iter()
+            .map(|e| e.key)
+            .collect();
+        (cursor.unable, used, keys)
+    }
+
+    /// `usable 0x5f3130` tests the distance against the handler's range (`0x5f3346`): a door's
+    /// 5.0, not the NPC services' 5.5556, which lit the Hyjal gate from beyond its reach.
+    #[test]
+    fn a_door_lights_and_opens_within_five_yards_only() {
+        assert_eq!(
+            range_verdict(0, 5.2, None),
+            (true, false, vec!["ERR_USE_TOO_FAR"])
+        );
+        assert_eq!(range_verdict(0, 4.9, None), (false, true, vec![]));
+        // Equality passes.
+        assert_eq!(range_verdict(0, 5.0, None), (false, true, vec![]));
+    }
+
+    /// The nine types that store another range over the base 5.0 (`0x5f45c2`, `0x5f478b`): a quest
+    /// giver 5.5555553, a binder 10.0.
+    #[test]
+    fn a_types_own_range_replaces_the_doors() {
+        assert_eq!(range_verdict(2, 5.5, None), (false, true, vec![]));
+        assert_eq!(
+            range_verdict(2, 5.7, None),
+            (true, false, vec!["ERR_USE_TOO_FAR"])
+        );
+        assert_eq!(range_verdict(4, 9.9, None), (false, true, vec![]));
+        assert_eq!(
+            range_verdict(4, 10.1, None),
+            (true, false, vec!["ERR_USE_TOO_FAR"])
+        );
+    }
+
+    /// `0x5f3328`: a known spell that opens the lock supplies the range, so a longer one reaches
+    /// farther than the handler's 5.0 and a shorter one less far; its absence leaves the handler's.
+    #[test]
+    fn a_known_openers_range_replaces_the_handlers() {
+        let near = |x| range_verdict(0, x, Some((6477, 8.0)));
+        assert_eq!(near(7.9), (false, true, vec![]));
+        assert_eq!(near(8.0), (false, true, vec![]), "equality passes");
+        assert_eq!(near(8.1), (true, false, vec!["ERR_USE_TOO_FAR"]));
+        assert_eq!(
+            range_verdict(0, 3.1, Some((6477, 3.0))),
+            (true, false, vec!["ERR_USE_TOO_FAR"]),
+            "a shorter spell range shortens the door's"
+        );
+    }
+
+    /// `0x5f3395`: state 2 gives `ERR_USE_DESTROYED` (0xe5) ahead of the distance error and unless
+    /// a spell opens the lock (`0x5f3315`), the cursor graying with it.
+    #[test]
+    fn a_destroyed_object_refuses_unless_a_spell_opens_it() {
+        const DESTROYED: &str = "ERR_USE_DESTROYED";
+        assert_eq!(
+            range_verdict_in_state(0, 2.0, None, 0),
+            (false, true, vec![])
+        );
+        assert_eq!(
+            range_verdict_in_state(0, 2.0, None, 2),
+            (true, false, vec![DESTROYED])
+        );
+        // Beyond the range too, 0xe5 comes first: no walk, no `ERR_USE_TOO_FAR`.
+        assert_eq!(
+            range_verdict_in_state(0, 30.0, None, 2),
+            (true, false, vec![DESTROYED])
+        );
+        // A mailbox is lock-less and refuses the same.
+        assert_eq!(
+            range_verdict_in_state(19, 2.0, None, 2),
+            (true, false, vec![DESTROYED])
+        );
+        // A known spell opens the lock (Action 4, the destroyed state's): the test is skipped.
+        assert_eq!(
+            range_verdict_in_state(0, 2.0, Some((6477, 8.0)), 2),
+            (false, true, vec![])
+        );
+    }
+
+    /// Click to Move on: a door 12 yd off with a known 8 yd opener walks and stops 0.9 of the
+    /// door's own 5.0, not the spell's range (`0x5f86b0` hands the walk `[handler+0xc]`); on
+    /// arrival 7.9 yd off the spell's range reaches (`Dispatch::go_in_reach`) and the opener is
+    /// cast, where the type's 5.0 would walk again.
+    #[test]
+    fn a_far_door_walks_to_four_and_a_half_and_an_openers_range_ends_the_walk() {
+        let (mut world, door, _rx) = go_world(0, 12.0, Some((6477, 8.0)), 0, true);
+        interact_with(&mut world, door);
+        let approach = world.resource::<crate::player::Approach>();
+        assert!(approach.active(), "out of reach, so the walk starts");
+        assert_eq!(approach.stop_distance(), Some(4.5), "0.9 of 5.0");
+        assert!(world
+            .resource::<crate::ui_action::ClickCasts>()
+            .0
+            .is_empty());
+        // Arrival at 7.9 yd, inside the spell's 8.0: the opener goes out and no new walk starts.
+        world.resource_mut::<crate::player::Approach>().stop();
+        world
+            .entity_mut(door)
+            .insert(Transform::from_xyz(7.9, 0.0, 0.0));
+        world.resource_mut::<crate::player::Approach>().arrived =
+            Some((crate::player::ApproachVerb::Use, CHEST));
+        world.run_system_once(act_on_arrival).unwrap();
+        assert!(!world.resource::<crate::player::Approach>().active());
+        assert_eq!(world.resource::<crate::ui_action::ClickCasts>().0.len(), 1);
+        // Past the spell's range the arrival walks again.
+        world
+            .resource_mut::<crate::ui_action::ClickCasts>()
+            .0
+            .clear();
+        world
+            .entity_mut(door)
+            .insert(Transform::from_xyz(8.1, 0.0, 0.0));
+        world.resource_mut::<crate::player::Approach>().arrived =
+            Some((crate::player::ApproachVerb::Use, CHEST));
+        world.run_system_once(act_on_arrival).unwrap();
+        assert!(world.resource::<crate::player::Approach>().active());
+        assert!(world
+            .resource::<crate::ui_action::ClickCasts>()
+            .0
+            .is_empty());
+    }
+
+    /// `0x5f5689`: a chair keeps the 100.0 it was handed when its base test failed, so beyond
+    /// 100 yd the walk stops 90 short; within it, the 3.0 gives 2.7.
+    #[test]
+    fn a_chair_beyond_the_base_test_walks_to_ninety() {
+        // The stop the walk would take, asked of the dispatcher (the leash refuses a start this far).
+        for (x, stop) in [(150.0, 90.0), (20.0, 2.7)] {
+            let (mut world, chair, _rx) = go_world(7, x, None, 0, true);
+            let got = world
+                .run_system_once(move |dispatch: Dispatch| {
+                    crate::player::RANGE_STOP_FRACTION * dispatch.go_stop_range(chair, 7)
+                })
+                .unwrap();
+            assert!((got - stop).abs() < 1e-3, "{x} yd: {got}");
         }
     }
 

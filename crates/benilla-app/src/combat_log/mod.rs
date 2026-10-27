@@ -24,6 +24,7 @@ use crate::net::{
 };
 use crate::ui_chat::combat::{CombatLogRanges, LogPeriodicSpells};
 use crate::ui_chat::ChatLog;
+use crate::vplates::PlateFlashes;
 
 pub(crate) mod chat;
 #[cfg(test)]
@@ -132,6 +133,8 @@ impl Plugin for CombatLogPlugin {
             .net_handler(K::PvpCredit, on_pvp_credit)
             // Written by the missile flight; declared here too, as registering is idempotent.
             .add_message::<MissileMiss>()
+            // Taken by the plate driver; declared here too, as registering is idempotent.
+            .init_resource::<PlateFlashes>()
             // After the flight that writes the arrivals (`entities::move_missiles`), so the
             // flash and the line queue together, in `0x61dd50`'s order, the frame the missile
             // lands. The flight runs after the frame's feeds (the sheath request it follows is
@@ -155,10 +158,17 @@ fn on_attacker_state(In(ev): In<SessionEvent>, c: Ctx, l: Sinks) {
     }
 }
 
-fn on_spell_damage_log(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
+fn on_spell_damage_log(
+    In(ev): In<SessionEvent>,
+    c: Ctx,
+    mut l: Sinks,
+    mut flashes: ResMut<PlateFlashes>,
+) {
     if let SessionEvent::SpellDamageLog(s) = ev {
         let ctx = c.ctx();
-        chat::spell_damage_log(s, &ctx, &l.stores, &l.poses, &l.log);
+        if let Some(victim) = chat::spell_damage_log(s, &ctx, &l.stores, &l.poses, &l.log) {
+            flashes.0.push(victim);
+        }
         text::spell_damage_log(
             s,
             &c.index,
@@ -402,10 +412,17 @@ fn on_spell_log_execute(In(ev): In<SessionEvent>, c: Ctx, caches: LockCaches, l:
     }
 }
 
-fn on_environmental_damage_log(In(ev): In<SessionEvent>, c: Ctx, l: Sinks) {
+fn on_environmental_damage_log(
+    In(ev): In<SessionEvent>,
+    c: Ctx,
+    l: Sinks,
+    mut flashes: ResMut<PlateFlashes>,
+) {
     if let SessionEvent::EnvironmentalDamageLog(e) = ev {
         let ctx = c.ctx();
-        chat::environmental_damage_log(e, &ctx, &l.stores, &l.poses, &l.log);
+        if let Some(victim) = chat::environmental_damage_log(e, &ctx, &l.stores, &l.poses, &l.log) {
+            flashes.0.push(victim);
+        }
     }
 }
 
@@ -923,7 +940,6 @@ mod tests {
         app.add_message::<crate::creature_anim::SwingMessage>()
             .add_message::<crate::creature_anim::SwingImpact>()
             .add_message::<crate::creature_anim::SheathRequest>()
-            .add_message::<crate::swing_refusal::SwingRefusalEdge>()
             .init_resource::<crate::creature_anim::PendingImpacts>()
             .init_resource::<crate::creature_anim::PlaySeq>()
             .init_resource::<crate::creature_anim::AttackStopInFlight>()
@@ -982,6 +998,42 @@ mod tests {
             kinds(&app),
             ["combat", "unit combat", "combat", "unit combat"]
         );
+    }
+
+    /// The swing's log step triggers Spells and Abilities for a swing of the active player's
+    /// whose victim state is 1, a hit (`0x629b1a`-`0x629b37`), on the state the record read
+    /// left; a dodge, or a hit on us, triggers nothing.
+    #[test]
+    fn our_own_landed_swing_triggers_spells_and_abilities() {
+        let swing = |attacker: u64, victim: u64, victim_state: u32| {
+            SessionEvent::AttackerState(benilla_protocol::messages::AttackerState {
+                attacker,
+                victim,
+                hit_info: 0x2,
+                damage: 30,
+                victim_state,
+                absorb: 0,
+                resist: 0,
+                blocked: 0,
+                melee_spell_id: 0,
+                school: 0,
+            })
+        };
+        let mut app = swing_world(&[ME, MOB]);
+        app.init_resource::<crate::tutorial::Tutorials>();
+        app.world()
+            .resource::<crate::tutorial::Tutorials>()
+            .lock()
+            .apply_flags(&[0u8; 32]);
+        let fired = |app: &mut App, ev: SessionEvent| {
+            crate::net::handlers::dispatch(app.world_mut(), vec![ev]);
+            app.world()
+                .resource::<crate::tutorial::Tutorials>()
+                .take_fired()
+        };
+        assert!(fired(&mut app, swing(ME, MOB, 2)).is_empty(), "a dodge");
+        assert!(fired(&mut app, swing(MOB, ME, 1)).is_empty(), "a hit on us");
+        assert_eq!(fired(&mut app, swing(ME, MOB, 1)), [0x06], "our hit");
     }
 
     /// `HandleUnitCombatMessage` signals `PLAYER_ENTER_COMBAT` inside our `SMSG_ATTACKSTART`
