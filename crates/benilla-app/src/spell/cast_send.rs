@@ -174,6 +174,8 @@ pub(crate) struct CastLadder<'w, 's> {
     pub(crate) spell_mods: Res<'w, crate::spell::SpellModifiers>,
     /// The cast's reports, in the order they are made ([`crate::ui_cast`]).
     pub(crate) reports: ResMut<'w, CastReports>,
+    /// The tutorial bank ([`CastCore::tutorials`]).
+    pub(crate) tutorials: Option<Res<'w, crate::tutorial::Tutorials>>,
     /// The skill lines the cost's and the cast time's level is found through (`0x5ea690`).
     pub(crate) skill_lines: Option<Res<'w, crate::ui_spellbook::SkillLines>>,
     pub(crate) auto_repeat: ResMut<'w, AutoRepeatActive>,
@@ -266,6 +268,7 @@ impl CastLadder<'_, '_> {
             ground: &mut self.ground,
             reports: &mut self.reports,
             net: &self.commands,
+            tutorials: self.tutorials.as_deref(),
         }
     }
 
@@ -294,6 +297,7 @@ impl CastLadder<'_, '_> {
             ground: &mut self.ground,
             reports: &mut self.reports,
             net: &self.commands,
+            tutorials: self.tutorials.as_deref(),
         };
         crate::creature_anim::cancel_auto_repeat_local(
             me,
@@ -500,6 +504,7 @@ impl CastLadder<'_, '_> {
             ground: &mut self.ground,
             reports: &mut self.reports,
             net: &self.commands,
+            tutorials: self.tutorials.as_deref(),
         };
         send_spell_cast(
             spell_id,
@@ -1253,7 +1258,13 @@ fn send_spell_cast(
                 // queued strike, which the repeat's push moved into the save, so its cancel is
                 // the packet alone. This is where melee and auto-repeat are kept exclusive. It
                 // runs after the arm above, so it never cancels this repeat.
-                crate::creature_anim::stop_attack_local(Some(e), edits, stop_word, core);
+                crate::creature_anim::stop_attack_local(
+                    Some(e),
+                    crate::tutorial::LowVitals::of(ctx.rel.self_store),
+                    edits,
+                    stop_word,
+                    core,
+                );
             }
         }
     }
@@ -2081,13 +2092,16 @@ mod tests {
         );
         assert!(rx.try_recv().is_err());
 
-        // `UNIT_FIELD_BYTES_0` (field 36) byte 1 is the class; `PLAYER_FIELD_BYTES` holds no
-        // combo points.
+        // `UNIT_FIELD_BYTES_0` (field 36) byte 1 is the class, `UNIT_FIELD_HEALTH` (22) alive;
+        // `PLAYER_FIELD_BYTES` holds no combo points.
         for (class, reason) in [(4u32, 0x46), (11, 0x12)] {
             let (mut world, rx) = combat_world(false);
             let held = world
                 .run_system_once(move |mut ladder: CastLadder| {
-                    let me = crate::net::ObjectStore(ObjectFields::from_pairs(&[(36, class << 8)]));
+                    let me = crate::net::ObjectStore(ObjectFields::from_pairs(&[
+                        (22, 1),
+                        (36, class << 8),
+                    ]));
                     let ctx = cast_target::CastContext {
                         rel: cast_target::TargetRelations {
                             self_store: Some(&me),

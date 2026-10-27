@@ -38,6 +38,9 @@ mod controller;
 mod world_focus;
 #[cfg(test)]
 pub(crate) use world_focus::insert_test_room;
+/// The reload gate and the destination's residency, which a cinematic's far shot waits on as a
+/// teleport does.
+pub(crate) use world_focus::{is_far_reload, residency_reached};
 pub(crate) use world_focus::{publish_caster_outdoors, BarUnitOutdoors, PlayerOutdoors};
 // The remembered camera pose, inside `player/` to read the rig's `pub(super)` fields.
 mod camera_saved;
@@ -57,6 +60,8 @@ pub(crate) mod land;
 mod move_trace;
 mod movement_net;
 mod posture;
+// A movement command's press or release, run inside the frame's input records.
+mod press;
 // `pub(crate)`: a remote mover's dead-reckon (`crate::net::motion::remote`) steps through the same
 // walk resolve, as the reference runs every mover through one controller.
 pub(crate) mod mover;
@@ -69,12 +74,18 @@ mod state;
 pub(crate) mod step_probe;
 mod swim;
 mod view_subject;
+/// A far-sight pose, for a test that seats the camera on another object.
+#[cfg(test)]
+pub(crate) use view_subject::RemoteView;
+#[cfg(test)]
+mod teleport_hold_tests;
 mod walk;
 mod wire_in;
 pub(crate) use wire_in::regain_control_on_arrival;
 
-/// The create's control restore (`regain_control_on_arrival`): every system that reads `Player`'s
-/// control flags runs after it in the frame, so it sees the restored flags, not the lost ones.
+/// The net drain, whose self create gives control back ([`regain_control_on_arrival`]): every
+/// system that reads the mover's lock runs after it in the frame, so it sees the restored lock,
+/// not the lost one.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ControlRestore;
 
@@ -82,6 +93,7 @@ pub(crate) struct ControlRestore;
 // itself before it.
 pub(crate) use camera::apply_self_model_fade;
 use controller::control;
+pub(crate) use controller::LookSample;
 // The private camera and `state` items are re-imported for the modules beside this one, which
 // name them `super::X`.
 pub(crate) use camera::{head_height, CameraControl, CameraPivot};
@@ -107,7 +119,7 @@ use state::{
     WEDGE_STILL_FRAMES,
 };
 pub(crate) use state::{
-    OwnControlLost, Player, PlayerCapsule, StandPending, CAPSULE_HEIGHT, CAPSULE_RADIUS,
+    MoverLock, OwnControlLost, Player, PlayerCapsule, StandPending, CAPSULE_HEIGHT, CAPSULE_RADIUS,
     CREATURE_STEP_UP_HEIGHT, DEFAULT_COLLISION_HEIGHT, FEATHER_TERMINAL_VELOCITY, GRAVITY,
     HOVER_CLIMB_RATE, HOVER_HEIGHT, SETTLE_TIMEOUT, STEP_UP_HEIGHT, TERMINAL_VELOCITY,
 };
@@ -116,7 +128,7 @@ pub(crate) use state::{
 pub(crate) use swim::{may_swim, swim_enter_depth};
 /// The camera's followed unit when not our body; [`crate::camera_shake`] takes its body frame and
 /// two suspend gates from it, as the reference does from `[cam+0x88]`.
-pub(crate) use view_subject::ViewSubject;
+pub(crate) use view_subject::{FarSight, ViewSubject};
 
 /// `UNIT_FLAG_STUNNED`, the `UNIT_FIELD_FLAGS` bit that stops turning. The reference reads it off
 /// the descriptor (`[[unit+0x110]+0xa0]`, predicate `0x5145b0`, an inverted `not/shr/and` test) at
@@ -239,7 +251,8 @@ pub(super) type BodyQuery<'w, 's> = Query<
     (With<Embodied>, Without<FlyCam>),
 >;
 
-/// The armed transports, for the deck carry ([`ride`]). `ColliderAabb` is for the ride trace:
+/// The armed transports, for the deck carry ([`ride`]) and its hold aboard (`TransportVolume`,
+/// `0x6173b0`). `ColliderAabb` is for the ride trace:
 /// avian refreshes it in `FixedPostUpdate`, before `tick_transports` moves the deck in `Update`, so
 /// the broad-phase box lags its deck by a frame.
 pub(super) type TransportQuery<'w, 's> = Query<
@@ -249,6 +262,7 @@ pub(super) type TransportQuery<'w, 's> = Query<
         &'static Transform,
         &'static crate::net::Guid,
         Option<&'static avian3d::prelude::ColliderAabb>,
+        Option<&'static crate::transport::TransportVolume>,
     ),
     (
         With<crate::transport::Transport>,
@@ -266,6 +280,14 @@ pub(crate) struct WorldFocusSet;
 /// `control` reads them (`capture::probe_look`, `capture::probe_cam`).
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct PlayerControlSet;
+
+/// The world's mouse among the frame's input records, after the UI's ([`crate::ui_script::UiInput`],
+/// whose hover and press consumption it reads) and ahead of the net drain: which buttons the world
+/// owns, the right press's hook, and the look session with its click tests
+/// ([`controller::sample_look`]), as the reference's world-frame mouse handlers run in the window
+/// input (`0x423920` at `0x420d23`).
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct WorldMouse;
 
 /// The player and camera: spawns the camera and avatar resources, and runs the controller.
 pub(crate) struct PlayerPlugin;
@@ -311,11 +333,14 @@ impl Plugin for PlayerPlugin {
         app.init_resource::<camera_zoom::ZoomLimit>();
         app.init_resource::<camera::FollowConfig>();
         app.init_resource::<OwnControlLost>();
+        app.init_resource::<MoverLock>();
         app.init_resource::<StandPending>();
         app.init_resource::<camera_dynamics::CameraOptions>();
         // Far sight resolves `PLAYER_FARSIGHT` to a pose before `control` seats the camera: a
         // separate system, as `control` holds our `Transform` mutably and cannot read another's.
+        view_subject::register(app);
         app.init_resource::<view_subject::ViewSubject>()
+            .init_resource::<view_subject::FarSight>()
             .init_resource::<scoped_view::ScopedView>()
             .add_systems(
                 Update,
@@ -406,26 +431,54 @@ impl Plugin for PlayerPlugin {
                 // Off in capture mode, where the camera is pinned.
                 .run_if(not(resource_exists::<crate::run_mode::CaptureMode>)),
         )
-        // Which mouse buttons the world owns, decoded ahead of its three readers: `/follow`'s
-        // both-button cancel, the look session and the camera's command word. Not in `control`:
-        // `steer_follow` runs before it and would read the latch a frame late.
+        // The cast bar's self-cancel inside the press, between its verdict and its tick, so
+        // `CMSG_CANCEL_CAST` goes out ahead of the start (`0x51512a` before `0x5151a0`).
+        .configure_sets(
+            Update,
+            crate::spell::LocalCancel
+                .after(press::press_commands)
+                .before(press::press_tick),
+        )
+        // The world's mouse input records, after the UI's and ahead of the packets.
+        .configure_sets(
+            Update,
+            WorldMouse
+                .after(crate::ui_script::UiInput)
+                .before(WorldStage::Net),
+        )
+        .init_resource::<LookSample>()
+        // Which mouse buttons the world owns, decoded ahead of its readers: the look session,
+        // `/follow`'s both-button cancel and the camera's command word.
         .add_systems(
             Update,
             camera::latch_world_mouse
-                .in_set(WorldStage::Input)
-                .before(control)
-                .before(follow::steer_follow)
+                .in_set(WorldMouse)
                 .in_set(crate::client_state::InWorldGated),
         )
-        // The world's right mouse-down, off that latch and ahead of `control`, the button's
-        // binding, as `0x483c40` runs its hook before `ExecuteBinding`; off in capture mode, like
-        // `control`.
+        // The look calls the packets' handlers made, after their events and ahead of the tick and
+        // the controller.
         .add_systems(
             Update,
-            camera::send_world_right_press
-                .in_set(WorldStage::Input)
+            camera::apply_late_look_calls
+                .in_set(crate::lanes::UiLanes)
+                .after(crate::lanes::fire_in_order)
+                .in_set(crate::client_state::InWorldGated),
+        )
+        // The world's right mouse-down, off that latch and ahead of the look session, as
+        // `0x483c40` runs its hook before `ExecuteBinding`; off in capture mode, like `control`.
+        // Then the look session, whose release settles the click tests, and the tick the frame's
+        // command presses and releases run (`0x515090` → `0x514640`), after the press's hand-off.
+        .add_systems(
+            Update,
+            (
+                camera::send_world_right_press,
+                controller::sample_look,
+                press::press_commands,
+                press::press_tick,
+            )
+                .chain()
+                .in_set(WorldMouse)
                 .after(camera::latch_world_mouse)
-                .before(control)
                 .run_if(not(resource_exists::<crate::run_mode::CaptureMode>))
                 .in_set(crate::client_state::InWorldGated),
         )

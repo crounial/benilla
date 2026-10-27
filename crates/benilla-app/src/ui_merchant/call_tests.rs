@@ -5,11 +5,11 @@
 
 use benilla_protocol::field::{FIELD_PLAYER_FIELD_COINAGE, FIELD_UNIT_NPC_FLAGS};
 use benilla_protocol::ObjectFields;
-use benilla_ui::script::{ContainerSlot, ContainerState};
+use benilla_ui::script::{ContainerSlot, ContainerState, MerchantState};
 use crossbeam_channel::Receiver;
 
 use super::*;
-use crate::net::ClientCommand;
+use crate::net::{ClientCommand, Guid, NetCommands, SelfPlayer};
 use crate::script_calls::with_hosted_vm;
 
 const ME: u64 = 0x10;
@@ -25,7 +25,7 @@ const BUYBACK_PRICE_1: u16 = 1226;
 /// Refreshing Spring Water (159) in row 1, our cloth in the backpack and one sold item in the
 /// buyback list.
 fn client() -> (App, Receiver<ClientCommand>) {
-    let mut app = crate::game_plugins::schedule_tests::headless_client();
+    let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
     let (tx, rx) = crossbeam_channel::unbounded();
     app.insert_resource(NetCommands(tx));
     let world = app.world_mut();

@@ -5,8 +5,8 @@ does that upstream does not. It is the current set, read by people and by agents
 before they change behaviour. Git holds the history. A modification adds, edits, or
 removes its row in the same change.
 
-The pin is `upstream/main` at `32b4d437` (Spell text, cast gates, ranges and missiles
-follow 1.12.1). When this tree takes new upstream commits, update the pin. Leave out
+The pin is `upstream/main` at `09c276fe` (Bag and item reads answer as of their packet;
+logout reads no player). When this tree takes new upstream commits, update the pin. Leave out
 any commit that is already on `upstream/main`.
 
 A row states what 1.12.1 does, what upstream does when that differs, what this fork
@@ -37,8 +37,9 @@ gnomes, are `storage/database/custom-sql/gnome-paladin.sql` in the
 1.12.1 hardcodes a 20-yard cap on V-key nameplates (`0x60f600`). Upstream keeps that
 cap.
 
-This fork draws those plates out to 41 yards, measured from the player's position to
-the unit. The cap is inclusive: a plate at 41 yards stays, and the next yard drops
+This fork draws those plates out to 41 yards, measured from the camera's unit to the
+plate's unit. That is the player's body, or the far-sight subject while the camera
+follows one. The cap is inclusive: a plate at 41 yards stays, and the next yard drops
 it. `MAX_DIST_YD` in `crates/benilla-app/src/vplates.rs`. Chat bubbles stay on the
 20-yard gate. Overhead names still have no distance cap.
 

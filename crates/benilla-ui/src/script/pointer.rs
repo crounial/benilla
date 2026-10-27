@@ -166,6 +166,12 @@ impl UiScript {
         model.arena.frame(fh)?.name.clone()
     }
 
+    /// The cursor the last mouse event left (`[root+0x1118]`, `+0x111c`), which the wheel walks at
+    /// (`0x766524`) whatever the wheel event's own position.
+    pub fn saved_cursor(&self) -> (f32, f32) {
+        self.model_ref().cursor_pos
+    }
+
     /// Move the cursor to `(x, y)`. When the hovered frame changes, fires `OnLeave` on the old one
     /// if still live and `OnEnter` on the new, both with the arg globals untouched; a disabled
     /// Button takes the hover but fires neither ([`button::hover_notify_runs`]). A frame move or
@@ -261,20 +267,8 @@ impl UiScript {
         if let Some((h, script)) = leave {
             super::mouseover::leave(&self.lua, h, script);
         }
-        if let Some(nid) = enter_id {
-            // A hyperlink button's enter is its text frame's `OnHyperlinkEnter` (`0x7a34b0`); the
-            // base enter's plain runner (`0x76b6e5` → `0x702690`) sets no arg global.
-            let routed = new_handle.is_some_and(|h| super::hyperlink::hover(&self.lua, h, true));
-            if !routed {
-                if let Err(e) = event::fire_widget_handler(&self.lua, nid, "OnEnter", Vec::new()) {
-                    self.push_error(e);
-                }
-            }
-            // An enabled Button's enter refreshes its label after the base enter and its
-            // `OnEnter` (`0x76b6a0`, then `0x7794ab`).
-            if let Some(h) = new_handle {
-                button::refresh_label(&mut self.model_mut(), h);
-            }
+        if let (Some(nid), Some(h)) = (enter_id, new_handle) {
+            super::mouseover::enter(&self.lua, h, nid);
         }
         new_id
     }
@@ -301,7 +295,7 @@ impl UiScript {
     /// next below (`0x76554a` → `0x765532`).
     fn layout_drag_target(&self, x: f32, y: f32) -> Option<FrameHandle> {
         let model = self.model_ref();
-        let sorted = order::pick_order(&model.arena);
+        let sorted = order::link_order(&model.arena);
         let mut below = order::Strata::Tooltip;
         loop {
             let hit = order::hit_test(&sorted, |fh| {
@@ -544,7 +538,7 @@ impl UiScript {
                     && over_world(&model, hit_handle)
                     && over_world(&model, pressed)
                     && !capture_lost
-                    && cursor::world_drop_click(&mut model);
+                    && cursor::world_drop_click(&self.lua, &mut model);
                 // The Button release slot `0x7792d0` (below, after `OnMouseUp`) does nothing on a
                 // started drag (`0x7792df` tests `0x76c040`), which already un-pressed the button.
                 (None, release, dropped, None, pressed.filter(|_| !started), None, None)

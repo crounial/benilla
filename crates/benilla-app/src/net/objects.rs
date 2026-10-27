@@ -23,9 +23,10 @@ use super::motion::{
 };
 use super::{
     ActiveMover, FieldChanged, Guid, GuidIndex, NetCommands, NetEntity, NetHandlerApp, ObjectStore,
-    RemoteMotion, SelfGuid, SpeedChangeMessage, Spline, UnitMoveModes, UnitSpeeds,
+    RemoteMotion, SelfGuid, SelfPlayer, SpeedChangeMessage, Spline, UnitMoveModes, UnitSpeeds,
 };
 
+mod arrival;
 mod update;
 
 pub(crate) use update::{release_unheld, Listed, ReleasePending, Released};
@@ -81,6 +82,8 @@ pub(crate) struct Scene<'w, 's> {
     modes: Query<'w, 's, &'static mut UnitMoveModes>,
     xp_awarded: Query<'w, 's, (), With<crate::ui_chat::combat::watch::XpAwarded>>,
     riders: Query<'w, 's, &'static mut crate::transport::TransportRider>,
+    /// A transport's clock, which only a new object's create sets (`0x5f7080`).
+    anchors: Query<'w, 's, &'static crate::transport::TransportAnchor>,
     speeds: Query<'w, 's, &'static mut UnitSpeeds>,
     field_changes: MessageWriter<'w, FieldChanged>,
     /// The aura watcher's calls ([`super::AuraFieldsChanged`]), one per block.
@@ -89,14 +92,13 @@ pub(crate) struct Scene<'w, 's> {
     item_lane: ResMut<'w, crate::item_lane::ItemLane>,
     /// The bag cache `0xbdd060` the bag seats' runs rescan and the bag events number from.
     bag_cache: ResMut<'w, crate::item_watch::BagCache>,
-    /// Where the frame's bag view changes: its first write of our player or an item.
-    bag_view: ResMut<'w, crate::ui_items::feed::BagView>,
     /// What each packet changed in the stores, for the views a listener reads
     /// ([`crate::ui_unit::views`]).
     view_log: ResMut<'w, crate::ui_unit::views::ViewLog>,
     field_notices: ResMut<'w, crate::field_watch::NoticeLane>,
-    /// The guid-scoped selection teardowns (`0x493910(guid, 1)`) a watcher raises.
-    deselect: MessageWriter<'w, crate::target::DeselectGuid>,
+    /// The guid-scoped selection teardowns (`0x493910(guid, 1)`) a watcher raises, run at the
+    /// packet's end; absent in a harness without targets.
+    deselect: Option<ResMut<'w, crate::target::OwedSelects>>,
     speed_changes: MessageWriter<'w, SpeedChangeMessage>,
     self_moves: MessageWriter<'w, super::SelfMoveMessage>,
     hard_landings: MessageWriter<'w, crate::creature_anim::HardLanding>,
@@ -108,6 +110,11 @@ pub(crate) struct Scene<'w, 's> {
     death_net: ResMut<'w, crate::death::DeathNet>,
     group: ResMut<'w, crate::ui_party::GroupState>,
     pet_bar: Option<Res<'w, crate::ui_pet::PetBar>>,
+    /// The selection, whose aura state the usable refresh watches (`0x6048a6`), and which a
+    /// unit's release ends and a create or a reactivation holds again ([`crate::target`]).
+    selection: Option<ResMut<'w, crate::target::Selection>>,
+    /// The selection teardowns the packet's releases owe.
+    owed_releases: Option<ResMut<'w, crate::target::OwedReleases>>,
     guilds: Option<ResMut<'w, crate::ui_guild::GuildState>>,
     // The own offer the coinage watcher trims (`0x5ddf30`).
     trade: Option<ResMut<'w, crate::ui_trade::TradeSession>>,
@@ -116,6 +123,14 @@ pub(crate) struct Scene<'w, 's> {
     house: Option<ResMut<'w, crate::ui_auction::HouseLane>>,
     // The loot window's rows and the pushes that wait on an item's record.
     loot: Option<ResMut<'w, crate::ui_loot::LootState>>,
+    // The vendor window's row and buy-back callbacks.
+    merchant: crate::ui_merchant::MerchantRecordAnswers<'w>,
+    // The state pass the trainer's watches and item callbacks run (`0x4d7d40`).
+    trainer: crate::ui_trainer::TrainerPasses<'w>,
+    // The questgiver rows' callbacks' `QUEST_ITEM_UPDATE`.
+    quest_giver: Option<ResMut<'w, crate::ui_quest::QuestGiverLane>>,
+    // The quest log's leaderboard's object waits' `QUEST_LOG_UPDATE`.
+    quest_log: Option<ResMut<'w, crate::ui_quest_log::QuestLog>>,
     pass: ResMut<'w, update::UpdatePass>,
     released: ResMut<'w, Released>,
     nets: Query<'w, 's, &'static NetEntity>,
@@ -128,6 +143,15 @@ pub(crate) struct Scene<'w, 's> {
     pending: Query<'w, 's, (Entity, &'static Guid), With<update::ReleasePending>>,
     creatures: Option<Res<'w, crate::entities::Creatures>>,
     held_displays: Query<'w, 's, &'static mut update::HeldDisplay>,
+    /// What our own `ShowHelm` and `ShowCloak` calls left on the model, which a hide bit's edge
+    /// ends.
+    worn_pins: Query<'w, 's, &'static mut crate::entities::WornPins>,
+    /// The viewer's zone and the objects' positions a party member's snapshot stores (`0x5f0880`).
+    place: crate::ui_party::net::SnapshotPlace<'w, 's>,
+    /// The active mover, which its unit's release and destroy zero.
+    mover: Option<ResMut<'w, super::MoverClaim>>,
+    /// Who we drive and whether we may, which our own arrival gives back.
+    mover_lock: Option<ResMut<'w, crate::player::MoverLock>>,
 }
 
 /// The item watchers' reads of the scene ([`crate::item_watch::Watch`]).
@@ -163,21 +187,11 @@ fn on_item(In(ev): In<SessionEvent>, mut sc: Scene) {
             // The callbacks the lookups that missed registered, in the order they asked
             // (`0x55ba30`, the dedupe flag 0): each item's set-up (`0x5d8390`) and entry change's
             // (`0x5d96b0`), the loot window's rows (`0x4c2ac0`) and pushes (`0x491ee0`), the trade
-            // getters' (`0x4c0340`), the ammo getters' (`0x4c84f0`), and the parked swaps'
-            // (`0x5e1020`) and auto-equips' (`0x5e17a0`).
+            // getters' (`0x4c0340`), the ammo getters' (`0x4c84f0`), the parked swaps'
+            // (`0x5e1020`) and auto-equips' (`0x5e17a0`), the vendor rows' (`0x4fada0`,
+            // `0x4fb570`), the trainer rows' (`0x4d9140`, `0x4d9db0`) and the questgiver rows'
+            // (`0x5018c0`).
             let callbacks = sc.items.take_callbacks(entry);
-            // An answer an item of ours waited on changes what the bag view shows of it.
-            if answered
-                && callbacks.iter().any(|c| {
-                    matches!(
-                        c,
-                        crate::items::RecordCallback::SetUp(_)
-                            | crate::items::RecordCallback::Entry(_)
-                    )
-                })
-            {
-                sc.bag_view.wrote();
-            }
             for callback in callbacks {
                 use crate::items::RecordCallback as Cb;
                 match callback {
@@ -229,6 +243,21 @@ fn on_item(In(ev): In<SessionEvent>, mut sc: Scene) {
                     // The equip callbacks run with the VM, after the feeds push the answer
                     // ([`crate::ui_bind_confirm::replay_equip_records`]).
                     Cb::Swap | Cb::AutoEquip => sc.items.run_with_vm(entry, callback, answered),
+                    // The vendor's run for a record and a refusal alike (`0x4fb0f0`, `0x4fb570`).
+                    Cb::Merchant => sc.merchant.row_answered(),
+                    Cb::Buyback => sc.merchant.buyback_answered(),
+                    // The trainer getters' run the state pass for a ready record only (`0x4d9146`,
+                    // `0x4d9db6`).
+                    Cb::Trainer if answered => sc.trainer.owed(),
+                    Cb::Trainer => {}
+                    // `QUEST_ITEM_UPDATE` for a ready record only (`0x5018d6`, `0x5018f5`,
+                    // `0x501903`), whatever the window shows then.
+                    Cb::Quest if answered => {
+                        if let Some(lane) = sc.quest_giver.as_mut() {
+                            lane.push(crate::ui_quest::QuestGiverEvent::ItemUpdate);
+                        }
+                    }
+                    Cb::Quest => {}
                 }
             }
             // The combat log's callback for its held lines (`0x6294b0`), which writes each one
@@ -412,6 +441,12 @@ fn on_gameobject_info(In(ev): In<SessionEvent>, mut sc: Scene) {
             &data,
             &mut sc.go_templates,
         );
+        // The leaderboard's callback `0x4e0800` signals for a landed record (`0x4e081a`).
+        if sc.go_templates.take_quest_wait(entry) {
+            if let Some(log) = sc.quest_log.as_mut() {
+                log.ready(crate::ui_quest_log::QuestEvent::ObjectNamed);
+            }
+        }
     }
 }
 
@@ -420,6 +455,8 @@ fn on_gameobject_info(In(ev): In<SessionEvent>, mut sc: Scene) {
 fn on_gameobject_unknown(In(ev): In<SessionEvent>, mut sc: Scene) {
     if let SessionEvent::GameObjectUnknown { entry } = ev {
         sc.go_templates.refuse(entry);
+        // A refusal runs the leaderboard's callback with status 0, which only logs (`0x4e080a`).
+        sc.go_templates.take_quest_wait(entry);
     }
 }
 
@@ -486,7 +523,7 @@ pub(super) struct CreateBlock {
     pub(super) scale: f32,
     pub(super) speeds: Option<MoveSpeeds>,
     pub(super) mover: Option<benilla_protocol::MoverState>,
-    pub(super) transport_progress: Option<u32>,
+    pub(super) transport_progress: Option<benilla_protocol::TransportClock>,
     pub(super) transport: Option<benilla_protocol::TransportPose>,
     pub(super) spline: Option<benilla_protocol::CreateSpline>,
 }
@@ -496,10 +533,11 @@ pub(super) enum Landing {
     /// A held object, refreshed in place; the caller writes its store.
     Live(Entity),
     /// A new entity with `store`: an object allocated now, or a released one brought back, which
-    /// keeps `kept_pose` when its type takes no position from the block.
+    /// keeps `kept_pose` when its type takes no position from the block, and its clock.
     New {
         store: ObjectFields,
         kept_pose: Option<Transform>,
+        kept_anchor: Option<crate::transport::TransportAnchor>,
     },
 }
 
@@ -529,17 +567,17 @@ fn object_create(
         display_id,
         scale,
     };
-    // A transport's cycle anchor: the create block's `UPDATE_FLAG_TRANSPORT` u32 and when it
-    // landed; a re-create re-anchors. The reference's per-frame tick (`0x630970`) runs types 15
+    // A transport's cycle anchor: the create block's `UPDATE_FLAG_TRANSPORT` u32 and the instant
+    // its packet arrived (`0x5f7080` subtracts the queue node's stamp); a re-create re-anchors. The reference's per-frame tick (`0x630970`) runs types 15
     // (boats, a path-progress clock) and 11 (lifts, `time-since-create % period`,
     // `GameObject.cpp:246`).
     let go_type = (kind == EntityKind::GameObject).then(|| fields.gameobject_type_id());
     let transport_anchor = matches!(go_type, Some(11 | 15))
         .then_some(transport_progress)
         .flatten()
-        .map(|progress_ms| crate::transport::TransportAnchor {
-            progress_ms,
-            at: std::time::Instant::now(),
+        .map(|clock| crate::transport::TransportAnchor {
+            progress_ms: clock.progress_ms,
+            at: clock.arrived.unwrap_or_else(std::time::Instant::now),
         });
     // The placement, and on a type-11 lift the basis its keyframe offsets rotate through.
     let go_quat = (kind == EntityKind::GameObject)
@@ -603,8 +641,12 @@ fn object_create(
             if let Some(s) = speeds {
                 commands.entity(e).insert(UnitSpeeds(s));
             }
-            if let Some(anchor) = transport_anchor {
-                commands.entity(e).insert(anchor);
+            // `0x466350` constructs nothing, so a held transport keeps its clock; one with none is
+            // the ship kept across a worldport, standing for the new object built there.
+            if !sc.anchors.contains(e) {
+                if let Some(anchor) = transport_anchor {
+                    commands.entity(e).insert(anchor);
+                }
             }
             if let Some(seed) = elevator_seed {
                 commands.entity(e).insert(seed);
@@ -636,9 +678,13 @@ fn object_create(
             }
             e
         }
-        Landing::New { store, kept_pose } => {
+        Landing::New {
+            store,
+            kept_pose,
+            kept_anchor,
+        } => {
             // A transport spawns hidden: its create pose is the spawn point, not where it is in
-            // its cycle; the transport tick unhides it at the first sampled pose.
+            // its cycle; its first tick unhides it, posed unless its leg is on another map.
             let visibility = if transport_anchor.is_some() {
                 Visibility::Hidden
             } else {
@@ -658,7 +704,8 @@ fn object_create(
             if let Some(s) = speeds {
                 entity.insert(UnitSpeeds(s));
             }
-            if let Some(anchor) = transport_anchor {
+            // Reactivation constructs nothing either (`0x464530`): a brought-back clock stands.
+            if let Some(anchor) = kept_anchor.or(transport_anchor) {
                 entity.insert(anchor);
             }
             if let Some(seed) = elevator_seed {
@@ -670,8 +717,14 @@ fn object_create(
             if let Some(s) = walk {
                 entity.insert(s);
             }
+            // Our own player is the active one from its write: the reference finds it by its guid
+            // (`0x468550`), here by the tag, given in the same commands as the entity.
+            if sc.self_guid.0 == Some(guid) {
+                entity.insert(SelfPlayer);
+            }
             let e = entity.id();
             sc.index.0.insert(guid, e);
+            crate::target::object_held(sc.selection.as_mut(), guid, e);
             e
         }
     }
@@ -735,6 +788,7 @@ fn unit_move(
             fall_time: mv.fall_time,
             jump: mv.jump,
             transport: mv.transport,
+            teleport: mv.verb == benilla_protocol::RelayVerb::Teleport,
         });
         return;
     }
@@ -1177,7 +1231,7 @@ mod tests {
             ])
             .into_created(ObjectType::Item),
         };
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
         let world = app.world_mut();
         let me = world
             .spawn((
@@ -1260,7 +1314,7 @@ mod tests {
     #[test]
     fn an_item_answer_runs_each_waiting_trade_getters_callback_once() {
         use crate::item_watch::ItemNotice;
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
         let world = app.world_mut();
         {
             let items = world.resource::<Items>();
@@ -1340,7 +1394,7 @@ mod tests {
             let lo = FIELD_PLAYER_INV_SLOT_HEAD + 2 * n;
             [(lo, guid as u32), (lo + 1, (guid >> 32) as u32)]
         };
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
         let world = app.world_mut();
         let pairs: Vec<(u16, u32)> = seat(0, HELM).into_iter().chain(seat(23, POTIONS)).collect();
         let me = world
@@ -1417,7 +1471,7 @@ mod tests {
     #[test]
     fn an_item_answer_runs_each_waiting_ammo_getters_callback_once() {
         use crate::field_watch::FieldNotice;
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
         let world = app.world_mut();
         {
             let items = world.resource::<Items>();
@@ -1486,7 +1540,7 @@ mod tests {
             guid,
             fields: ObjectFields::from_pairs(pairs),
         };
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
         let world = app.world_mut();
         world.resource_mut::<SelfGuid>().0 = Some(ME);
         let drain = |world: &mut World| -> Vec<FieldNotice> {
@@ -1559,7 +1613,7 @@ mod tests {
             spline: None,
             fields: ObjectFields::from_pairs(pairs).into_created(ObjectType::Player),
         };
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
         let world = app.world_mut();
         world.resource_mut::<SelfGuid>().0 = Some(ME);
         let record = PartyMemberStatsInfo {
@@ -1614,7 +1668,7 @@ mod tests {
     /// as a player), the potion's template cached; the items it lists created, our own.
     fn watch_world(items: &[(u64, u32, bool)]) -> App {
         use benilla_protocol::messages::ObjectType;
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
         let world = app.world_mut();
         let me = world
             .spawn((
@@ -1769,7 +1823,7 @@ mod tests {
     #[test]
     fn a_refused_game_object_entry_is_no_template() {
         const ENTRY: u32 = 1731;
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
         let world = app.world_mut();
         let fields = crate::go_templates::test_fields(ENTRY);
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -1821,7 +1875,7 @@ mod tests {
     #[test]
     fn a_refused_creature_is_asked_again_when_a_new_unit_of_it_is_created() {
         const ENTRY: u32 = 1234;
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
         let (tx, rx) = crossbeam_channel::unbounded();
         app.world_mut().insert_resource(NetCommands(tx));
         let create = |guid: u64| SessionEvent::ObjectCreate {
@@ -1865,7 +1919,7 @@ mod tests {
     fn an_entry_change_asks_the_creature_cache_for_the_new_entry() {
         const OLD: u32 = 299;
         const NEW: u32 = 2_671;
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
         let (tx, rx) = crossbeam_channel::unbounded();
         app.world_mut().insert_resource(NetCommands(tx));
         let mob = (u64::from(OLD) << 24) | (u64::from(guid::HIGH_UNIT) << 48) | 1;
@@ -1952,7 +2006,7 @@ mod tests {
         const GO_ENTRY: u32 = 1000;
         const GO: u64 = 0xF110_0000_0000_0009;
         let mob = (u64::from(ENTRY) << 24) | (u64::from(guid::HIGH_UNIT) << 48) | 1;
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
         let (tx, rx) = crossbeam_channel::unbounded();
         app.world_mut().insert_resource(NetCommands(tx));
 
@@ -1978,7 +2032,7 @@ mod tests {
         const GO_ENTRY: u32 = 1000;
         const GO: u64 = 0xF110_0000_0000_0009;
         let mob = (u64::from(ENTRY) << 24) | (u64::from(guid::HIGH_UNIT) << 48) | 1;
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
         let (tx, rx) = crossbeam_channel::unbounded();
         app.world_mut().insert_resource(NetCommands(tx));
 
@@ -2051,7 +2105,7 @@ mod tests {
         const ENTRY: u32 = 1234;
         let mob = (u64::from(ENTRY) << 24) | (u64::from(guid::HIGH_UNIT) << 48) | 1;
         const PLAYER: u64 = 0x0000_0000_0000_0042;
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
         let (tx, rx) = crossbeam_channel::unbounded();
         app.world_mut().insert_resource(NetCommands(tx));
         app.world_mut().insert_resource(display_tables());
@@ -2099,7 +2153,7 @@ mod tests {
         use benilla_protocol::field::{FIELD_UNIT_DISPLAYID, FIELD_UNIT_HEALTH};
         const ENTRY: u32 = 1234;
         let mob = (u64::from(ENTRY) << 24) | (u64::from(guid::HIGH_UNIT) << 48) | 1;
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
         let (tx, rx) = crossbeam_channel::unbounded();
         app.world_mut().insert_resource(NetCommands(tx));
         app.world_mut().insert_resource(display_tables());
@@ -2243,7 +2297,7 @@ mod tests {
         const ME: u64 = 0x0000_0000_0000_0007;
         const SWORD: u64 = 0x4000_0000_0000_0042;
         const STONE: u64 = 0x4000_0000_0000_0043;
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
         let world = app.world_mut();
         let create = |guid| SessionEvent::ItemCreate {
             guid,
@@ -2351,7 +2405,7 @@ mod tests {
         const THEIRS: u64 = 0x4000_0000_0000_0043;
         const MACE: u64 = 0x4000_0000_0000_0044;
         const ENTRY: u32 = 117;
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
         let world = app.world_mut();
         let me = world
             .spawn((

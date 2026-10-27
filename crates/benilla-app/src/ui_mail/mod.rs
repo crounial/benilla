@@ -11,6 +11,7 @@
 //! re-asks the server.
 
 use benilla_protocol::messages::{mail_error, mail_message_type, MailListEntry};
+use benilla_ui::script::ItemRead;
 use bevy::prelude::*;
 use std::collections::HashMap;
 
@@ -102,7 +103,7 @@ pub(crate) struct MailResult {
 /// The mailbox session: the open mailbox's guid, the inbox rows as the wire sent them, the
 /// letter-body cache and the result queues. A close forgets the guid and the queues and keeps the
 /// rows, as the reference's close does (`0x4acd71`); the world-enter init (`0x4acb10`) and a
-/// disconnect clear everything.
+/// disconnect clear everything but the bodies.
 #[derive(Resource, Default)]
 pub(crate) struct MailOpen {
     pub(crate) mailbox: Option<u64>,
@@ -132,12 +133,6 @@ pub(crate) struct ListedSubject {
     /// The parse rewrote it. Else the cell stays empty until the item's template lands and its
     /// callback rewrites it (`0x4ad010` → `0x4ace40`), with no mask.
     pub(crate) rewritten: bool,
-}
-
-impl crate::query_cache::AskOnce for MailOpen {
-    fn clear_pending(&mut self) {
-        self.bodies.clear_pending();
-    }
 }
 
 impl MailOpen {
@@ -174,15 +169,23 @@ impl MailOpen {
         self.show_requested = false;
     }
 
-    /// The world-enter init (`0x4acb10`) and a disconnect: no mailbox and no rows.
+    /// The world-enter init (`0x4acb10`): no mailbox and no rows. The bodies stay, asks
+    /// included: the item-text store is saved (`0x554eb0`), and neither the init (it touches no
+    /// cache) nor the world entry (`0x555811`) clears it.
     pub(crate) fn clear_session(&mut self) {
         self.clear();
         self.results.clear();
         self.mails.clear();
         self.auction_subjects.clear();
-        self.bodies.clear();
         self.request_resolved = false;
         self.list_results = 0;
+    }
+
+    /// A disconnect: the session's rows as [`Self::clear_session`], and the body asks that died
+    /// with the socket, which the saved store would otherwise wait on for ever.
+    pub(crate) fn clear_disconnected(&mut self) {
+        self.clear_session();
+        self.bodies.clear_pending();
     }
 }
 
@@ -197,10 +200,6 @@ impl LatchedWindow for MailOpen {
 
     fn dispatched(world: &mut World) {
         close_core(world);
-    }
-
-    fn take_close_verb(script: &mut UiScript) -> bool {
-        script.take_mail_close()
     }
 }
 
@@ -259,7 +258,6 @@ pub(crate) struct UiMailPlugin;
 
 impl Plugin for UiMailPlugin {
     fn build(&self, app: &mut App) {
-        crate::query_cache::register::<MailOpen>(app);
         net::register(app);
         app.init_resource::<MailOpen>()
             .init_resource::<MailPending>()
@@ -271,7 +269,6 @@ impl Plugin for UiMailPlugin {
                     // Feed, then drain after input, so each edge lands the same frame; the feed
                     // runs after `UnitFeed` so `SetInboxItem` reads the template.
                     feed_mail.after(crate::ui_unit::UnitFeed).in_set(UiFeed),
-                    drain_mail.in_set(crate::ui_script::UiDrain),
                     // The cascade's order: the time query, this, then the battlefield status.
                     send_query_next_mail_time_on_enter
                         .after(crate::net::send_query_time)
@@ -387,26 +384,36 @@ fn resolve_row(
     let player_mail = entry.message_type == mail_message_type::NORMAL;
     let can_reply = player_mail && !is_gm;
 
-    let (item_id, item_roll, item_count, item_name, item_texture, item_quality) = match &entry.item
-    {
+    let (
+        item_id,
+        item_roll,
+        item_count,
+        item_name,
+        item_texture,
+        item_quality,
+        item_inventory_type,
+    ) = match &entry.item {
         Some(att) => {
-            let template = items.template(att.entry, 0, ask);
-            let name = template.map(|t| rolls.name(&t.name, att.random_prop_id));
-            let quality = template.map(|t| t.quality);
-            let display_id = template.map(|t| t.display_info_id).unwrap_or(0);
-            let texture = icons
-                .and_then(|i| i.catalog.get(display_id))
-                .and_then(|d| d.icon.clone());
+            // The row's lookup, whose miss asks; then what `GetInboxItem` reads of the record as
+            // it runs, read the same way.
+            let _ = items.template(att.entry, 0, ask);
+            let roll = benilla_ui::script::ItemRoll {
+                property: att.random_prop_id,
+                ..Default::default()
+            };
+            let live =
+                crate::ui_items::live::LiveItem::record(att.entry, roll, items, icons, rolls);
             (
                 att.entry,
                 att.random_prop_id,
                 u32::from(att.count),
-                name,
-                texture,
-                quality,
+                live.name(),
+                live.texture(),
+                live.quality(),
+                live.inventory_type(),
             )
         }
-        None => (0, 0, 0, None, None, None),
+        None => (0, 0, 0, None, None, None, 0),
     };
     // The block's charges and `(current, max)` durability (`0x53566f`, `0x535699`, `0x53568d`).
     let (item_charges, item_durability) = entry.item.as_ref().map_or((0, (0, 0)), |att| {
@@ -542,6 +549,7 @@ fn resolve_row(
         item_name,
         item_texture,
         item_quality,
+        item_inventory_type,
     }
 }
 
@@ -896,17 +904,6 @@ fn feed_mail(
     })
 }
 
-/// `CloseMail` into the close core, which sends nothing; every other mail verb applies inside its
-/// call ([`MailVerbs`]).
-fn drain_mail(mut hosted_vm: crate::script_calls::HostedVm, mut world_commands: Commands) {
-    hosted_vm.run(|script| {
-        // With no session a stray close still runs the core, which finds no cell (`0x4acd7c`).
-        if script.is_some_and(|script| script.take_mail_close()) {
-            crate::ui_session::queue(&mut world_commands, close_core);
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1201,7 +1198,7 @@ mod tests {
     }
 
     /// A close forgets the mailbox and keeps the rows (`0x4acd71`); the world-enter init and a
-    /// disconnect clear them (`0x4acb10`).
+    /// disconnect clear them (`0x4acb10`), and keep the saved item-text store.
     #[test]
     fn a_close_keeps_the_rows_and_the_session_end_clears_them() {
         let mut m = MailOpen::default();
@@ -1214,7 +1211,23 @@ mod tests {
         assert!(!m.bodies.is_empty());
         m.clear_session();
         assert!(m.mails.is_empty());
-        assert!(m.bodies.is_empty());
+        assert!(!m.bodies.is_empty());
+    }
+
+    /// The world-enter init (`0x4acb10`) touches no cache: a body ask in flight stands (the
+    /// item-text store is saved), and only a disconnect, whose socket took the ask, drops it.
+    #[test]
+    fn the_world_enter_init_keeps_a_body_ask_and_a_disconnect_drops_it() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let commands = NetCommands(tx);
+        let mut m = MailOpen::default();
+        let ask = |m: &MailOpen| m.bodies.read(7, Ask::Event(&commands), |_| {}).is_none();
+        assert!(ask(&m));
+        assert!(m.bodies.is_pending(7));
+        m.clear_session();
+        assert!(m.bodies.is_pending(7), "the init leaves the ask");
+        m.clear_disconnected();
+        assert!(!m.bodies.is_pending(7), "a disconnect drops it");
     }
 
     /// No GlobalStrings in a unit test: every key misses.

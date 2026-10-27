@@ -18,7 +18,7 @@ use crate::items::Items;
 use crate::net::{NetCommands, NetHandlerApp, ObjectStore, Objects, SelfPlayer};
 use crate::query_cache::Ask;
 use crate::spell::known::{PetReads, PetView};
-use crate::spell::{cast_target, CastCommit, CastLadder};
+use crate::spell::CastCommit;
 use crate::ui_action::{PlayerActions, Spells};
 use crate::ui_items::{count_of, item_icon, InventoryScope};
 use crate::ui_spellbook::SkillLines;
@@ -36,6 +36,26 @@ pub(crate) struct CraftOpen {
     pub(crate) craft_type: u32,
 }
 
+/// The item records the craft getters' lookups missed, one per call, each the callback `0x4f7710`
+/// the item cache keeps, which outlives a VM and rebuilds the list when its record lands
+/// (`0x4f771a`); the lookups ask inside their calls ([`ask_item_record`]).
+#[derive(Resource, Default)]
+pub(crate) struct CraftItemWaits(pub(crate) Vec<u32>);
+
+/// A craft getter's lookup of a record in flight, inside its call
+/// ([`benilla_ui::script::ItemCallback::Craft`]): the item cache asks a miss, a refused entry
+/// again, and keeps one callback per call (`0x4f75dd`, `0x4f79f2`).
+pub(crate) fn ask_item_record(
+    items: &Items,
+    commands: &NetCommands,
+    waits: &mut CraftItemWaits,
+    entry: u32,
+    owner: u64,
+) {
+    let _ = items.template(entry, owner, Ask::Event(commands));
+    waits.0.push(entry);
+}
+
 /// `EffectImplicitTargetA`/`B` 5, the pet (`0x4f632a`).
 const TARGET_PET: u32 = 5;
 
@@ -44,13 +64,9 @@ pub(crate) struct UiCraftPlugin;
 impl Plugin for UiCraftPlugin {
     fn build(&self, app: &mut App) {
         app.net_handler(SessionEventKind::Disconnected, on_session_end);
-        app.init_resource::<CraftOpen>().add_systems(
-            Update,
-            (
-                feed_craft.in_set(UnitFeed),
-                drain_craft.in_set(crate::ui_script::UiDrain),
-            ),
-        );
+        app.init_resource::<CraftOpen>()
+            .init_resource::<CraftItemWaits>()
+            .add_systems(Update, feed_craft.in_set(UnitFeed));
     }
 }
 
@@ -234,8 +250,11 @@ fn craft_tooltip(spell_id: u32, d: &benilla_formats::SpellDisplay) -> CraftToolt
 
 /// Builds the craft snapshot, `None` while the window is closed or the catalogs are not loaded.
 fn feed_craft(
-    mut vm: crate::script_calls::VmWith<PetReads<'static>>,
-    open: Res<CraftOpen>,
+    mut vm: crate::script_calls::VmWith<(
+        PetReads<'static>,
+        Res<'static, CraftOpen>,
+        ResMut<'static, CraftItemWaits>,
+    )>,
     actions: Res<PlayerActions>,
     spells: Option<Res<Spells>>,
     spell_mods: Res<crate::spell::SpellModifiers>,
@@ -245,17 +264,22 @@ fn feed_craft(
     self_store: Query<&ObjectStore, With<SelfPlayer>>,
     objects: Objects,
     items: Res<Items>,
-    commands: Res<NetCommands>,
     mut memo: Local<crate::ui_script::VmMemo<CraftMemo>>,
 ) {
-    vm.feed(|script, pet_reads, fires| {
+    vm.feed(|script, (pet_reads, open, mut waits), fires| {
         let Some(script) = script else {
             return;
         };
         let memo = memo.get(script);
-        // The show stands for the stock frame's getter calls, whose lookups pass the callback
-        // `0x4f7710` (`0x4f75f2`, `0x4f7a0a`); the rebuilds between read.
-        let ask = Ask::at(memo.state.is_none() || open.is_changed(), &commands);
+        // `GetCraftName` reads the player's effect slot of the open type, 0 when closed (`0x4f6c32`).
+        let slot_names = self_store
+            .single()
+            .ok()
+            .and_then(|_| Some(effect_slot_names(&actions, spells.as_deref()?)))
+            .unwrap_or_default();
+        script.set_craft_slot_names(slot_names);
+        // The list only reads the item cache: the build asks nothing (`0x4f60c0`), and a reagent
+        // or a totem is asked by its getter's call, inside it (`0x4f75f2`, `0x4f7a0a`).
         let fresh = (|| -> Option<CraftState> {
             let line = open.line?;
             let craft_type = open.craft_type;
@@ -268,6 +292,10 @@ fn feed_craft(
                 .map(|l| l.name.clone())
                 .unwrap_or_else(|| format!("Skill {line}"));
             let global = |key: &str| benilla_ui::strings::global(script.lua(), key);
+            // The `$z` token: the bind area the items feed pushed for `GetBindLocation`, so the
+            // two agree (`0x507f07`-`0x507f45`, `0x48dae0`).
+            let bind = script.bind_location();
+            let home_area: Option<&str> = bind.as_deref();
             // The player's level for a spell and its cost (`0x6e3130`, `0x6e31b0`, `0x6e3300`).
             let skills = crate::spell::PlayerSkills {
                 lines: Some(&skill_lines.catalog),
@@ -306,7 +334,7 @@ fn feed_craft(
                 },
                 unmodified_points: false,
                 gender: &|| store.0.unit_gender().unwrap_or(0),
-                home_area: &|| None,
+                home_area: &|| home_area,
                 global: &global,
                 printf: &crate::ui_script::token_printf,
             };
@@ -342,7 +370,7 @@ fn feed_craft(
                         let have = count_of(&store.0, &objects, entry, InventoryScope::DEFAULT);
                         // A reagent's icon is the shared item chain (`0x5d88b0`) through its
                         // display.
-                        let (name, icon) = match items.template(entry, 0, ask) {
+                        let (name, icon) = match items.template(entry, 0, Ask::Read) {
                             Some(t) => (
                                 Some(t.name.clone()),
                                 item_icon(icons.as_deref(), t.display_info_id),
@@ -375,7 +403,7 @@ fn feed_craft(
                     let mut tools_pending = Vec::new();
                     for &t in d.totems.iter().filter(|&&t| t != 0) {
                         let have = count_of(&store.0, &objects, t, InventoryScope::DEFAULT) > 0;
-                        match items.template(t, 0, ask) {
+                        match items.template(t, 0, Ask::Read) {
                             Some(info) => tools.push((info.name.clone(), have)),
                             None => tools_pending.push(t),
                         }
@@ -443,10 +471,10 @@ fn feed_craft(
         };
         // `CloseCraft` closes the VM's window and signals `CRAFT_CLOSE` in the verb (`0x4f5fef`).
         let closed_in_place = !script.craft_open();
-        // The getters' item callbacks, kept by their calls; each record that landed rebuilds
-        // (`0x4f7710` → `0x4f771a`), and a refusal runs it with status 0, which does nothing.
-        memo.item_waits.extend(script.take_craft_item_waits());
-        let arrivals = crate::ui_tradeskill::landed(&mut memo.item_waits, &items);
+        // The getters' item callbacks, kept inside their calls ([`ask_item_record`]); each record
+        // that landed rebuilds (`0x4f7710` → `0x4f771a`), and a refusal runs it with status 0,
+        // which does nothing.
+        let arrivals = crate::ui_tradeskill::landed(&mut waits.0, &items);
         let opened = match (&memo.state, &fresh) {
             (None, Some(_)) => true,
             (Some(l), Some(f)) => l.craft_type != f.craft_type || l.name != f.name,
@@ -455,9 +483,10 @@ fn feed_craft(
         // Every push is silent: the rebuilds signal, and the getters read the state at their call.
         if fresh != memo.state {
             script.set_craft(fresh.clone());
-            // Pre-ask the reagent templates `GetCraftReagentItemLink` reads.
+            // The reagent templates `GetCraftReagentItemLink` reads, off the cache: the link
+            // passes no callback (`0x4f780a`).
             if let Some(f) = &fresh {
-                script.ask_item_templates(
+                script.read_item_templates(
                     f.recipes
                         .iter()
                         .flat_map(|r| r.reagents.iter().map(|re| re.item)),
@@ -490,44 +519,49 @@ fn feed_craft(
     })
 }
 
+/// The names of the spells in the player's four effect slots (`CGPlayer_C+0x1d10`, `0x5ea360`),
+/// which `GetCraftName` reads at the open craft type (`0x4f6c32`); a learn writes them
+/// ([`PlayerActions::effect_slots`]), an unlearn leaves them.
+fn effect_slot_names(actions: &PlayerActions, spells: &Spells) -> [Option<String>; 4] {
+    actions.effect_slots.map(|slot| {
+        slot.and_then(|id| spells.catalog.get(id))
+            .map(|d| d.name.clone())
+    })
+}
+
 /// What [`feed_craft`] remembers from its last frame.
 #[derive(Default)]
 struct CraftMemo {
     /// The state it last pushed.
     state: Option<CraftState>,
-    /// The item records the getters' calls wait on, one per call.
-    item_waits: Vec<u32>,
 }
 
-/// Drains the Lua intents. `DoCraft` goes down the cast ladder: an enchant's `Targets = 0x10` arms
-/// the cursor's item half, a rod craft commits at once. `CloseCraft` closes the window, sends no
-/// packet and leaves an armed pick to the ordinary cancels (Escape, right-click, a new cast).
-fn drain_craft(
-    mut vm: crate::script_calls::VmWith<(
-        cast_target::CastTargeting<'static, 'static>,
-        CastLadder<'static, 'static>,
-    )>,
-    mut open: ResMut<CraftOpen>,
-    skill_lines: Option<Res<SkillLines>>,
-) {
-    vm.turn(|script, (targeting, mut ladder)| {
-        let Some(script) = script else {
-            return;
-        };
-        let _ = skill_lines; // the feed resolves lines; the drain just casts what it is handed
-        for spell_id in script.take_craft_dos() {
-            if open.line.is_none() {
-                debug!("ui_craft: DoCraft({spell_id}) with no open window — ignored");
-                continue;
-            }
-            debug!("ui_craft: DoCraft({spell_id})");
-            ladder.send(spell_id, &targeting.context(), CastCommit::Spell);
-        }
-        if script.take_craft_close() {
+/// `DoCraft(index)` past its row (`0x4f7d10`): the row's cast through `CastSpellAsActivePlayer`
+/// (`0x4f7d64` → `0x6e5a90`) inside the call, with no item and no target. The cast ladder takes
+/// it from there: an enchant's `Targets = 0x10` arms the cursor's item half, a rod craft commits
+/// at once. The row test is the VM's, against the list it holds; the reference tests no open
+/// marker.
+pub(crate) fn do_craft(cast: &mut crate::spell::ScriptCast, spell_id: u32) {
+    debug!("ui_craft: DoCraft({spell_id})");
+    let ctx = cast.targeting.context();
+    cast.ladder.send(spell_id, &ctx, CastCommit::Spell);
+}
+
+/// The craft window's close inside its call ([`crate::script_calls::ScriptCallHost`]).
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct CraftSteps<'w> {
+    /// Absent in a world with no craft window, which drops the call.
+    open: Option<ResMut<'w, CraftOpen>>,
+}
+
+impl CraftSteps<'_> {
+    /// `CloseCraft()` (`0x4f6c00` → `0x4f5fe0`): the open marker `[0xbdcfb8]` zeroed, no packet.
+    pub(crate) fn close(&mut self) {
+        if let Some(open) = self.open.as_deref_mut() {
             debug!("ui_craft: client-side close (no packet)");
             open.line = None;
         }
-    })
+    }
 }
 
 #[cfg(test)]
@@ -543,6 +577,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = App::new();
         app.init_resource::<CraftOpen>()
+            .init_resource::<CraftItemWaits>()
             .init_resource::<PlayerActions>()
             .init_resource::<crate::spell::SpellModifiers>()
             .init_resource::<crate::net::GuidIndex>()
@@ -554,7 +589,8 @@ mod tests {
             });
         app.world_mut()
             .spawn((ObjectStore(Default::default()), SelfPlayer));
-        let script = UiScript::new().unwrap();
+        let mut script = UiScript::new().unwrap();
+        script.keep_calls();
         script
             .run(
                 "CLOSES = 0 local f = CreateFrame('Frame') f:RegisterEvent('CRAFT_CLOSE') \
@@ -653,6 +689,7 @@ mod tests {
         items.insert_template(DUST, Some(crate::items::test_template("Strange Dust")));
         items.insert_template(ROD, Some(crate::items::test_template("Runed Rod")));
         app.init_resource::<CraftOpen>()
+            .init_resource::<CraftItemWaits>()
             .insert_resource(actions)
             .init_resource::<crate::spell::SpellModifiers>()
             .init_resource::<crate::net::GuidIndex>()
@@ -749,6 +786,77 @@ mod tests {
         assert_eq!(read(17, 18), (2, true), "worn copies");
         assert_eq!(read(81, 82), (2, true), "the keyring");
         assert_eq!(read(39, 40), (0, false), "the bank is outside mask 0");
+    }
+
+    /// A craft description's `$z` reads the bind area like every spell text (`0x507f07`-
+    /// `0x507f45`): the area's name once the bind point resolves, the `HOME_INN` text before.
+    #[test]
+    fn a_craft_description_names_the_bind_area_or_the_inn() {
+        const SPELL: u32 = 7_001;
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut app = App::new();
+        let mut actions = PlayerActions::default();
+        actions.spells.insert(SPELL);
+        actions.profession_order.push(SPELL);
+        actions.craft_order.push(SPELL);
+        app.init_resource::<CraftOpen>()
+            .init_resource::<CraftItemWaits>()
+            .insert_resource(actions)
+            .init_resource::<crate::spell::SpellModifiers>()
+            .init_resource::<crate::net::GuidIndex>()
+            .init_resource::<Items>()
+            .insert_resource(NetCommands(tx))
+            .insert_resource(crate::ui_action::Spells {
+                catalog: benilla_formats::SpellCatalog::from_displays(
+                    [(
+                        SPELL,
+                        SpellDisplay {
+                            name: "Enchant".into(),
+                            cast_ui: 3,
+                            description: Some("Returns you to $z.".into()),
+                            ..Default::default()
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..crate::ui_action::Spells::empty_for_tests()
+            })
+            .insert_resource(SkillLines {
+                catalog: benilla_formats::SkillLineCatalog::from_abilities([(
+                    SPELL,
+                    benilla_formats::SlaInfo {
+                        skill_id: 333,
+                        req_skill_value: 1,
+                        forward_spell_id: 0,
+                        trivial_low: 1,
+                        trivial_high: 2,
+                    },
+                )]),
+            });
+        app.world_mut()
+            .spawn((SelfPlayer, ObjectStore(Default::default())));
+        let script = UiScript::new().unwrap();
+        script.run("HOME_INN = 'your inn'").unwrap();
+        app.insert_non_send_resource(script);
+        app.add_systems(Update, feed_craft);
+        {
+            let mut open = app.world_mut().resource_mut::<CraftOpen>();
+            open.line = Some(333);
+            open.craft_type = 3;
+        }
+        let described = |app: &mut App| {
+            app.update();
+            app.world()
+                .non_send_resource::<UiScript>()
+                .eval::<String>("return GetCraftDescription(1)")
+                .unwrap()
+        };
+        assert_eq!(described(&mut app), "Returns you to your inn.");
+        app.world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .set_bind_location(Some("Elwynn Forest"));
+        assert_eq!(described(&mut app), "Returns you to Elwynn Forest.");
     }
 
     #[test]
@@ -848,6 +956,7 @@ mod tests {
         actions.profession_order.extend(known.iter().copied());
         actions.craft_order.extend(known.iter().copied());
         app.init_resource::<CraftOpen>()
+            .init_resource::<CraftItemWaits>()
             .insert_resource(actions)
             .init_resource::<crate::spell::SpellModifiers>()
             .init_resource::<crate::net::GuidIndex>()
@@ -874,7 +983,9 @@ mod tests {
             ObjectStore(benilla_protocol::ObjectFields::from_pairs(player)),
             SelfPlayer,
         ));
-        app.insert_non_send_resource(UiScript::new().unwrap());
+        let mut script = UiScript::new().unwrap();
+        script.keep_calls();
+        app.insert_non_send_resource(script);
         app.add_systems(Update, feed_craft);
         let mut open = app.world_mut().resource_mut::<CraftOpen>();
         open.line = Some(if craft_type == 3 {
@@ -1312,6 +1423,58 @@ mod tests {
     /// resent unchanged included; a learn or an unlearn of a craft spell rebuilds it once per packet
     /// (`0x5e9e12`, `0x5ea240`), whether or not the list moved; a record a getter's call waited on
     /// rebuilds it once per call (`0x4f7710`).
+    /// The window's show looks no item up: the reference's list build asks nothing (`0x4f60c0`),
+    /// and a reagent or a totem is asked by its getter's call alone (`0x4f75f2`, `0x4f7a0a`).
+    /// The reagents the link getters read, which pass no callback (`0x4f780a`), are read off the
+    /// cache, never asked.
+    #[test]
+    fn the_show_asks_no_reagent_or_totem() {
+        const DUST: u32 = 10_940;
+        const ROD: u32 = 6218;
+        let displays = vec![(
+            7418,
+            SpellDisplay {
+                name: "Enchant Bracer - Minor Health".into(),
+                cast_ui: 3,
+                reagents: [
+                    (DUST, 1),
+                    (0, 0),
+                    (0, 0),
+                    (0, 0),
+                    (0, 0),
+                    (0, 0),
+                    (0, 0),
+                    (0, 0),
+                ],
+                totems: [ROD, 0],
+                ..Default::default()
+            },
+        )];
+        let catalog =
+            benilla_formats::SkillLineCatalog::from_abilities([(7418, ability(ENCHANTING, 1, 70))]);
+        let mut app = craft_feed(displays, &[7418], catalog, 3, &[]);
+        app.update();
+        app.update();
+        assert_eq!(
+            app.world()
+                .non_send_resource::<UiScript>()
+                .eval::<i64>("return GetNumCrafts()")
+                .unwrap(),
+            1,
+            "the window is up"
+        );
+        let rx = app
+            .world()
+            .non_send_resource::<crossbeam_channel::Receiver<crate::net::ClientCommand>>();
+        let asked: Vec<_> = crate::query_cache::queries(rx)
+            .into_iter()
+            .filter(|c| matches!(c, crate::net::ClientCommand::ItemQuery { .. }))
+            .collect();
+        assert!(asked.is_empty(), "{asked:?}");
+        let mut script = app.world_mut().non_send_resource_mut::<UiScript>();
+        assert!(script.take_item_stat_asks().is_empty(), "no pre-ask");
+    }
+
     #[test]
     fn each_packet_and_each_waited_record_signals_one_update() {
         const DUST: u32 = 10_940;
@@ -1381,10 +1544,25 @@ mod tests {
             vec![SessionEvent::SpellRemoved { spell_id: 7420 }],
         );
         assert!(heard(&mut app).is_empty());
-        app.world()
-            .non_send_resource::<UiScript>()
-            .run("GetCraftReagentInfo(1, 1) GetCraftReagentInfo(1, 1)")
-            .unwrap();
+        let entries = {
+            let mut s = app.world_mut().non_send_resource_mut::<UiScript>();
+            s.run("GetCraftReagentInfo(1, 1) GetCraftReagentInfo(1, 1)")
+                .unwrap();
+            s.take_craft_item_waits()
+        };
+        // The host's lookups inside the calls ([`super::ask_item_record`]).
+        app.world_mut()
+            .resource_scope(|world, mut waits: Mut<CraftItemWaits>| {
+                for entry in entries {
+                    super::ask_item_record(
+                        world.resource::<Items>(),
+                        world.resource::<NetCommands>(),
+                        &mut waits,
+                        entry,
+                        0,
+                    );
+                }
+            });
         assert!(heard(&mut app).is_empty());
         app.world_mut()
             .resource_mut::<Items>()
@@ -1401,6 +1579,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = App::new();
         app.init_resource::<CraftOpen>()
+            .init_resource::<CraftItemWaits>()
             .init_resource::<PlayerActions>()
             .init_resource::<crate::spell::SpellModifiers>()
             .init_resource::<crate::net::GuidIndex>()

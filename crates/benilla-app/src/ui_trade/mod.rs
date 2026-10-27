@@ -1,14 +1,16 @@
 //! The trade window: [`net`] folds the two status packets into [`TradeSession`], [`feed_trade`]
 //! pushes it into the VM and fires the trade events, the trade verbs act inside their calls
-//! ([`TradeSteps`]), [`drain_trade`] runs `CloseTrade`'s close core,
-//! [`register_record_callbacks`] registers the getters' record asks, whose answers signal
-//! `TRADE_UPDATE` on the item lane ([`crate::item_lane`]), and
-//! [`answer_trade_request`] answers an incoming request.
+//! ([`TradeSteps`]), `CloseTrade`'s close core among them, the getters' record asks register
+//! their callbacks inside their calls ([`ask_trade_record`]), whose answers signal
+//! `TRADE_UPDATE` on the item lane ([`crate::item_lane`]), and [`answer_trade_request`] answers
+//! an incoming request.
 
 use benilla_protocol::messages::{TradeItem, TradeStatusExtended, TRADE_SLOT_COUNT};
 use bevy::prelude::*;
 
-use benilla_ui::script::{ScriptValue, TradeSideState, TradeSlotItem, TradeState, UiScript};
+use benilla_ui::script::{
+    ItemRead, ScriptValue, TradeSideState, TradeSlotItem, TradeState, UiScript,
+};
 
 use crate::entities::ItemDisplays;
 use crate::items::Items;
@@ -507,7 +509,7 @@ impl TradeSession {
 }
 
 /// The partner's cell `[0xb71728]`, set only while the window is open; `CloseTrade` (`0x4bfdc0`)
-/// enters the core.
+/// enters the core inside its call ([`crate::script_calls::ScriptCallHost`]).
 impl LatchedWindow for TradeSession {
     const WINDOW: NpcWindow = NpcWindow::Trade;
 
@@ -517,10 +519,6 @@ impl LatchedWindow for TradeSession {
 
     fn dispatched(world: &mut World) {
         close_core(world);
-    }
-
-    fn take_close_verb(script: &mut UiScript) -> bool {
-        script.take_trade_close()
     }
 }
 
@@ -629,7 +627,6 @@ impl Plugin for UiTradePlugin {
                     answer_trade_request
                         .after(crate::player::ControlRestore)
                         .before(feed_trade),
-                    drain_trade.in_set(crate::ui_script::UiDrain),
                 ),
             );
     }
@@ -741,7 +738,7 @@ fn answer_trade_request(
 /// A wire [`TradeItem`] as the Lua row: name and quality from the item-template cache once it
 /// answers, the icon from `display_id` via `ItemDisplayInfo.dbc`; [`resolve_side`] names slot 7's
 /// `enchantment`. The template is only read: the getters' lookups ask for it
-/// ([`register_record_callbacks`]). The name joins the random property's suffix (`0x5d8b00`, at
+/// ([`ask_trade_record`]). The name joins the random property's suffix (`0x5d8b00`, at
 /// `0x4c01b8` and `0x4c0405` for the partner's slots) and the link prints the record's permanent
 /// enchant, random property id and suffix factor (`0x4c040a`-`0x4c0431`); our own slots' records
 /// carry what `0x52ae00` reads off the object ([`own_item`]).
@@ -752,33 +749,26 @@ fn resolve_slot(
     names: &NameCache,
     rolls: crate::items::RollCatalogs,
 ) -> TradeSlotItem {
-    let template = items.template(item.entry, 0, Ask::Read);
-    let name = template.map(|t| rolls.name(&t.name, item.random_prop_id));
-    let quality = template.map(|t| t.quality);
-    let inventory_type = template.map_or(0, |t| t.inventory_type);
-    // The icon comes from the template's display, not the wire's (`0x5d88b0([rec+0x18])`,
-    // `0x4c01f0`; `0x5d8af0` on our side, `0x4c0529`); a cached template whose display has no
-    // icon falls to the question mark, and an unanswered one leaves it to the getter.
-    let texture = template.map(|t| {
-        icons
-            .and_then(|i| i.catalog.get(t.display_info_id))
-            .and_then(|d| d.icon.clone())
+    // What the getters read of it as they run, read here the same way.
+    let roll = benilla_ui::script::ItemRoll {
+        enchant: item.perm_enchant,
+        property: item.random_prop_id,
+        suffix_factor: item.suffix_factor,
+    };
+    let live = crate::ui_items::live::LiveItem::record(item.entry, roll, items, icons, rolls);
+    let name = live.name();
+    let quality = live.quality();
+    let inventory_type = live.inventory_type();
+    // A cached template whose display has no icon falls to the question mark, and an unanswered
+    // one leaves it to the getter.
+    let texture = live.cached().then(|| {
+        live.texture()
             .unwrap_or_else(|| crate::ui_action::MISSING_ITEM_ICON.to_string())
     });
     // Nil until the template answers: the link embeds the name and the quality colour.
-    let link = match (name.as_deref(), quality) {
-        (Some(n), Some(q)) => Some(crate::ui_items::item_link_full(
-            item.entry,
-            item.perm_enchant,
-            item.random_prop_id,
-            item.suffix_factor,
-            n,
-            q,
-        )),
-        _ => None,
-    };
+    let link = live.link();
     // Only a wrapped gift names its giver (`0x52e288`, `0x52e29d`). Only read: the slot tooltip's
-    // build asks it (`crate::ui_items::feed::ask_item_build_lookups`).
+    // build asks it in its call ([`benilla_ui::script::RecordAsk::ItemBuildName`]).
     let gift_creator = (item.wrapped && item.gift_creator != 0)
         .then(|| names.resolve_player(item.gift_creator, Ask::Read))
         .flatten()
@@ -808,6 +798,7 @@ fn resolve_slot(
         charges: item.charges,
         durability: (item.durability, item.max_durability),
         link,
+        roll,
     }
 }
 
@@ -1106,9 +1097,14 @@ fn feed_trade(
     // Our slots an extended status emptied go first, as the handler runs `InvalidateTradeSlot`
     // (`0x4bfbd0`: the unlock and its own `TRADE_PLAYER_ITEM_CHANGED`) as it stores the records
     // (`0x5d4ad3`, `0x5d4b33`), before `0x4bf2b0` (`0x5d4b67`); the diff below then skips them.
+    // Taken only when queued, so a quiet frame leaves the session unchanged.
     let (invalidated, steps) = {
         let mut trade = vm.own();
-        (trade.take_invalidated(), trade.take_accept_steps())
+        if trade.invalidated.is_empty() && trade.accept_steps.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            (trade.take_invalidated(), trade.take_accept_steps())
+        }
     };
     if !invalidated.is_empty() || !steps.is_empty() {
         vm.run(|mut script| {
@@ -1137,10 +1133,8 @@ fn feed_trade(
             }
         });
     }
-    vm.turn(|script, mut trade| {
-        let Some(script) = script else {
-            return;
-        };
+    let open_leg = vm.turn(|script, mut trade| {
+        let script = script?;
         let last = last.get(script);
         let last_open = last_open.get(script);
         if closes.since_last(script, NpcWindow::Trade) {
@@ -1155,7 +1149,7 @@ fn feed_trade(
         if opened {
             // The open clears both offers and our item table before anything is placed
             // (`0x4bf549`).
-            script.open_trade_window();
+            script.open_trade_window(trade.cell().unwrap_or(0));
             *last = None;
         }
         let changed = fresh != *last;
@@ -1184,7 +1178,7 @@ fn feed_trade(
         // The per-slot events the stock `TradeFrame.lua` repaints one slot on, arg1 the 1-based
         // slot (`0x4bf414`/`0x4bf452` target, `0x4bf487`/`0x4bfaef` player). An offer change
         // signals nothing else: `TRADE_UPDATE` has one producer, the getters' record callback
-        // ([`register_record_callbacks`]). Our invalidated slots signalled ahead of this turn.
+        // ([`ask_trade_record`]). Our invalidated slots signalled ahead of this turn.
         if changed && trade.is_open() && !opened {
             let empty = TradeState::default();
             let old = last.as_ref().unwrap_or(&empty);
@@ -1231,7 +1225,12 @@ fn feed_trade(
         }
         // The enchant slot's spell, after the partner's slots (`0x4bf429` on): the spell we cast
         // repaints their slot 7, the one they cast repaints ours.
-        for partner_window in trade.take_enchant_changed() {
+        let enchant_changed = if trade.enchant_changed.is_empty() {
+            Vec::new()
+        } else {
+            trade.take_enchant_changed()
+        };
+        for partner_window in enchant_changed {
             let event = if partner_window {
                 "TRADE_PLAYER_ITEM_CHANGED"
             } else {
@@ -1244,7 +1243,12 @@ fn feed_trade(
         // `PLAYER_TRADE_MONEY` alone (`TradeFrame.xml:565`), so a repaint never overwrites what
         // the player is typing; the partner's is the `TARGET_TRADE` money frame's
         // `TRADE_MONEY_CHANGED` (`MoneyFrame.lua:133`).
-        for partner in trade.take_money_changed() {
+        let money_changed = if trade.money_changed.is_empty() {
+            Vec::new()
+        } else {
+            trade.take_money_changed()
+        };
+        for partner in money_changed {
             if partner {
                 script.fire_event("TRADE_MONEY_CHANGED", vec![]);
             } else {
@@ -1256,8 +1260,13 @@ fn feed_trade(
         // started. The catalog row, read by `ui_action::feed_actions`, decides where each lands.
         // Taken in the frame before the interface is up too, deliberately: it marks only the ask,
         // which goes to the server, not the VM.
-        let asked = std::mem::take(&mut trade.named_lines_asked);
-        for (i, line) in trade.take_named_lines().into_iter().enumerate() {
+        let asked = trade.named_lines_asked;
+        let named_lines = if trade.named_lines.is_empty() {
+            Vec::new()
+        } else {
+            trade.take_named_lines()
+        };
+        for (i, line) in named_lines.into_iter().enumerate() {
             // The status arms print nothing once the player is no longer an object.
             if line.needs_live_object && streamed_player(&index, &stores, line.who).is_none() {
                 continue;
@@ -1271,80 +1280,97 @@ fn feed_trade(
                 None => trade.owe_named_line(line),
             }
         }
-        trade.named_lines_asked = trade.named_lines.len();
-        if opened {
-            // `SetTradePartner`'s open leg (`0x4bf5f1`): only a trade we started by dropping
-            // something on the partner moves what the cursor holds into the offer (`0x5d3f80`).
-            if trade.opens_with_held() {
-                if let Some(offer) = script.trade_open_money() {
-                    // Coins (`0x4bf5fe`-`0x4bf644`): `0x5d4500` sends the new offer, then the
-                    // cursor clears (`0x4bf61c`), the cache of our money `[0xb71740]` takes it
-                    // (`0x4bf62b`), and `PLAYER_TRADE_MONEY`, `PLAYER_MONEY` and `TRADE_SHOW` fire
-                    // once each, then the leg returns.
-                    trade.send_edit(&commands, ClientCommand::SetTradeGold { copper: offer });
-                    script.trade_open_money_clear();
-                    trade.fold_held_coins(offer);
-                    script.fire_event("PLAYER_TRADE_MONEY", vec![]);
-                    script.fire_event("PLAYER_MONEY", vec![]);
-                } else if let Some(held) = script.trade_open_item() {
-                    // An item (`0x4bf652`-`0x4bf6fa`): its send's answer is not read (`0x4bf6be`),
-                    // then the cursor clears and the slot is stored (`0x4bf6ca`-`0x4bf6fa`).
-                    let _ = trade.send_placement(
-                        &commands,
-                        &objects,
-                        &rows.items,
-                        held.slot,
-                        held.guid,
-                        held.bag,
-                        held.bag_slot,
-                    );
-                    script.trade_open_item_store(&held);
-                }
-            }
-            script.fire_event("TRADE_SHOW", vec![]);
+        if trade.named_lines_asked != trade.named_lines.len() {
+            trade.named_lines_asked = trade.named_lines.len();
         }
-
         *last = fresh;
         *last_open = trade.is_open();
-    })
-}
-
-/// The callbacks behind `TRADE_UPDATE`, whose one producer is `0x4c0340` (`0x4c034f`), which the
-/// item getters register when they find a filled slot whose template the cache lacks (`0x4c017f`,
-/// `0x4c0582` into `0x55ba30`). A hit never calls it. Each such getter call registers one
-/// callback, with no dedupe (`0x55bbb3`), and each runs when the record lands, for a ready record
-/// only; a refusal frees them silent. The asks the script queued are registered here, after its
-/// tick; the landed records signal on the item lane, at the answer's packet
-/// ([`crate::item_watch::ItemNotice::TradeRecord`]). The waiters are the getters' own asks, which
-/// a frameless VM never makes.
-fn register_record_callbacks(script: &mut UiScript, items: &Items, commands: &NetCommands) {
-    for entry in script.take_trade_record_asks() {
-        // The getter's lookup with the callback: a miss asks, a refused entry again.
-        if items.template(entry, 0, Ask::Event(commands)).is_none() {
-            items.wait_for_trade_record(entry);
+        // `SetTradePartner`'s open leg (`0x4bf5f1`): only a trade we started by dropping
+        // something on the partner moves what the cursor holds into the offer (`0x5d3f80`), with
+        // the coinage `0x5d4570` tests the total against, as the handler finds it.
+        opened.then(|| {
+            trade.opens_with_held().then(|| {
+                objects
+                    .player_fields()
+                    .and_then(|p| p.player_money())
+                    .map_or(0, u64::from)
+            })
+        })
+    });
+    let Some(purse) = open_leg else {
+        return;
+    };
+    // What the cursor holds, read with the host lent, as the leg reads the bags at the call.
+    let held = purse.and_then(|purse| {
+        vm.run(|script| {
+            let script = script?;
+            Some(match script.trade_open_money(purse) {
+                Some(offer) => OpenHeld::Coins(offer),
+                None => OpenHeld::Item(script.trade_open_item()?),
+            })
+        })
+    });
+    let item = vm.turn(|script, mut trade| {
+        let script = script?;
+        match held? {
+            // Coins (`0x4bf5fe`-`0x4bf644`): `0x5d4500` sends the new offer, then the cursor
+            // clears (`0x4bf61c`), the cache of our money `[0xb71740]` takes it (`0x4bf62b`), and
+            // `PLAYER_TRADE_MONEY`, `PLAYER_MONEY` and `TRADE_SHOW` fire once each, then the leg
+            // returns.
+            OpenHeld::Coins(offer) => {
+                trade.send_edit(&commands, ClientCommand::SetTradeGold { copper: offer });
+                script.trade_open_money_clear();
+                trade.fold_held_coins(offer);
+                script.fire_event("PLAYER_TRADE_MONEY", vec![]);
+                script.fire_event("PLAYER_MONEY", vec![]);
+                None
+            }
+            // An item (`0x4bf652`-`0x4bf6fa`): its send's answer is not read (`0x4bf6be`), then
+            // the cursor clears and the slot is stored (`0x4bf6ca`-`0x4bf6fa`).
+            OpenHeld::Item(held) => {
+                let _ = trade.send_placement(
+                    &commands,
+                    &objects,
+                    &rows.items,
+                    held.slot,
+                    held.guid,
+                    held.bag,
+                    held.bag_slot,
+                );
+                Some(held)
+            }
         }
-    }
-}
-
-/// After the tick: `CloseTrade`'s close core, which the interaction latch runs (`0x4bfdd9` →
-/// `0x4bf4e0(0, 0)`), and the item getters' record callbacks ([`register_record_callbacks`]).
-/// Every other trade verb acts inside its call ([`TradeSteps`]).
-fn drain_trade(
-    mut hosted: crate::script_calls::HostedVm,
-    mut world_commands: Commands,
-    commands: Res<NetCommands>,
-    items: Res<Items>,
-) {
-    hosted.run(|script| {
+    });
+    vm.run(|script| {
         let Some(script) = script else {
             return;
         };
-        register_record_callbacks(script, &items, &commands);
-        // The core's cancel goes out open or not (`0x4bf527`).
-        if script.take_trade_close() {
-            crate::ui_session::queue(&mut world_commands, close_core);
+        if let Some(held) = item {
+            script.trade_open_item_store(&held);
         }
-    })
+        script.fire_event("TRADE_SHOW", vec![]);
+    });
+}
+
+/// What the open leg moves into the offer.
+enum OpenHeld {
+    Coins(u32),
+    Item(benilla_ui::script::TradeOpenItem),
+}
+
+/// The callback behind `TRADE_UPDATE`, whose one producer is `0x4c0340` (`0x4c034f`), which an
+/// item getter registers when it finds a filled slot whose template the cache lacks (`0x4c017f`,
+/// `0x4c0582` into `0x55ba30`), inside its call ([`benilla_ui::script::RecordAsk::TradeItem`]).
+/// A hit never calls it. Each such getter call registers one callback, with no dedupe
+/// (`0x55bbb3`), and each runs when the record lands, for a ready record only; a refusal frees
+/// them silent. The landed records signal on the item lane, at the answer's packet
+/// ([`crate::item_watch::ItemNotice::TradeRecord`]).
+pub(crate) fn ask_trade_record(items: &Items, commands: &NetCommands, entry: u32, owner: u64) {
+    // The getter's lookup with the callback: a miss asks, a refused entry again, the slot's side
+    // as the owner id.
+    if items.template(entry, owner, Ask::Event(commands)).is_none() {
+        items.wait_for_trade_record(entry);
+    }
 }
 
 /// The trade half of `OnMoneyChanged` (`0x5ddf30`), the active player's coinage watcher, run inside

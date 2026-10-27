@@ -14,6 +14,8 @@ mod bind_gates;
 mod cast_send;
 pub(crate) mod cast_target;
 pub(crate) mod cooldowns;
+#[cfg(test)]
+mod drop_hold_tests;
 pub(crate) mod group_relation;
 mod inflight;
 pub(crate) mod known;
@@ -34,11 +36,14 @@ pub(crate) use cast_send::{
     UnitAttackOwed, UnitPress,
 };
 pub(crate) use cast_target::AutoSelfCast;
-pub(crate) use cooldowns::Cooldowns;
+pub(crate) use cooldowns::{CooldownLive, Cooldowns, Signal};
 pub(crate) use inflight::{
-    ActiveChannel, AutoRepeatActive, CastState, LocalMoveStart, PendingCast, QueuedMeleeSpell,
-    SelfCancel, SPELL_INTERRUPT_MOVEMENT,
+    drop_hold, ActiveChannel, AutoRepeatActive, CastState, LocalMoveStart, PendingCast,
+    QueuedMeleeSpell, SelfCancel, SPELL_INTERRUPT_MOVEMENT,
 };
+// The command press's harness runs the self-cancel between its two systems.
+#[cfg(test)]
+pub(crate) use inflight::local_self_cancel;
 pub(crate) use mods::{
     CategoryPad, ModsDiff, SpellModifiers, OP_CAST_TIME, OP_COST, OP_GCD, OP_RADIUS,
 };
@@ -90,20 +95,24 @@ impl Plugin for SpellPlugin {
             .init_resource::<targeting::PicksSelf>()
             .init_resource::<targeting::CorpsePick>()
             .init_resource::<targeting::UnitPick>()
+            .init_resource::<targeting::GoPick>()
             .init_resource::<group_relation::GroupRoster>()
             .add_observer(cast_target::on_cvar)
             .add_systems(
                 Update,
                 (
+                    // Inside the command press, among the input records (`player::press`).
                     inflight::local_self_cancel
-                        .in_set(UnitFeed)
-                        .in_set(LocalCancel),
-                    mods::track_class_family
-                        .in_set(crate::ui_script::UiFeed)
-                        .before(UnitFeed),
-                    // The state push runs before the input pass's `ToggleGameMenu`, whose
-                    // `SpellStopTargeting` applies inside its call. After the aura feed, whose
-                    // resolver inputs list the units the hover verdict is asked for.
+                        .in_set(LocalCancel)
+                        .run_if(crate::ui_script::ingame_ui_up),
+                    // The state push ahead of the input records, whose `ToggleGameMenu` reads
+                    // the word and whose `SpellStopTargeting` applies inside its call.
+                    targeting::feed_targeting_to_input
+                        .in_set(crate::ui_script::UiInputViews)
+                        .run_if(crate::ui_script::ingame_ui_up),
+                    // And after the packets and the clicks, for the handlers and the tick. After
+                    // the aura feed, whose resolver inputs list the units the hover verdict is
+                    // asked for.
                     targeting::feed_targeting_to_vm
                         .in_set(UnitFeed)
                         .after(LocalCancel)
@@ -113,6 +122,7 @@ impl Plugin for SpellPlugin {
                         targeting::publish_picks_self,
                         targeting::publish_corpse_pick,
                         targeting::publish_unit_pick,
+                        targeting::publish_go_pick,
                     )
                         .in_set(UiFeed)
                         .after(LocalCancel),

@@ -11,11 +11,11 @@ use crate::net::{ClientCommand, NetCommands};
 use crate::script_calls::with_hosted_vm;
 
 /// The registrar and the tabard vendor, a guild master: a unit's guid.
-const NPC: u64 = 0xF130_0000_0000_0042;
+pub(super) const NPC: u64 = 0xF130_0000_0000_0042;
 
 /// The whole client, headless, with a VM and the write channel captured.
-fn client() -> (App, Receiver<ClientCommand>) {
-    let mut app = crate::game_plugins::schedule_tests::headless_client();
+pub(super) fn client() -> (App, Receiver<ClientCommand>) {
+    let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
     let (tx, rx) = crossbeam_channel::unbounded();
     app.insert_resource(NetCommands(tx));
     app.insert_non_send_resource(UiScript::new().expect("a VM"));
@@ -23,7 +23,7 @@ fn client() -> (App, Receiver<ClientCommand>) {
 }
 
 /// Run `chunk` with the host lent, as a key's body runs.
-fn eval<T: FromLuaMulti>(app: &mut App, chunk: &str) -> T {
+pub(super) fn eval<T: FromLuaMulti>(app: &mut App, chunk: &str) -> T {
     with_hosted_vm(app.world_mut(), |vm| vm.expect("a VM").eval::<T>(chunk))
         .unwrap_or_else(|e| panic!("{chunk}: {e}"))
 }
@@ -107,7 +107,7 @@ fn add_friend_flags_the_friends_tutorial_before_its_packet() {
 
 /// A frame counting `event`'s fires in `N` and recording each in `SEQ`, whose handler also calls
 /// `close`, as a stock window's `OnHide` does.
-fn listen(app: &mut App, events: &[&str], close: &str) {
+pub(super) fn listen(app: &mut App, events: &[&str], close: &str) {
     let registers: String = events
         .iter()
         .map(|e| format!("f:RegisterEvent('{e}') "))
@@ -175,25 +175,18 @@ fn get_tabard_info_closes_the_registrar_inside_its_call() {
 }
 
 /// `CloseTabardCreation()` (`0x4f5900` → `0x4f58a0`) releases the latch and signals
-/// `CLOSE_TABARD_FRAME` (`0x4f58f8`) inside its call, twice while the designer holds the latch,
-/// behind the open not yet told; the handler's own close finds the cell clear.
+/// `CLOSE_TABARD_FRAME` (`0x4f58f8`) inside its call, twice while the designer holds the latch;
+/// the handler's own close finds the cell clear.
 #[test]
 fn close_tabard_creation_signals_inside_its_call() {
     let (mut app, rx) = client();
     crate::ui_tabard::open_tabard(app.world_mut(), NPC);
-    listen(
-        &mut app,
-        &["OPEN_TABARD_FRAME", "CLOSE_TABARD_FRAME"],
-        "if event == 'CLOSE_TABARD_FRAME' then CloseTabardCreation() end",
-    );
+    listen(&mut app, &["CLOSE_TABARD_FRAME"], "CloseTabardCreation()");
     let seq: String = eval(
         &mut app,
         "CloseTabardCreation() local s = SEQ RandomRoll(1, 2) return s",
     );
-    assert_eq!(
-        seq,
-        "OPEN_TABARD_FRAME CLOSE_TABARD_FRAME CLOSE_TABARD_FRAME "
-    );
+    assert_eq!(seq, "CLOSE_TABARD_FRAME CLOSE_TABARD_FRAME ");
     assert_eq!(sent(&rx), ["roll 1-2"]);
     assert_eq!(
         app.world()

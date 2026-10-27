@@ -66,12 +66,6 @@ impl ItemLane {
         self.1
     }
 
-    /// The notices queued, in stamp order: what the readers that push ahead of the lane read to
-    /// know the bags moved.
-    pub(crate) fn notices(&self) -> impl Iterator<Item = &ItemNotice> {
-        self.0.iter().filter_map(|(_, r, _)| r.notice.as_ref())
-    }
-
     /// Take every run waiting with its stamp, in order, unfired.
     #[cfg(test)]
     pub(crate) fn drain_stamped(&mut self) -> Vec<(Stamp, Run)> {
@@ -126,20 +120,22 @@ pub(crate) struct RunReads<'w, 's> {
     sink: crate::ui_action::MessageSink<'w>,
 }
 
-/// The VM and the trade session a run's trade half writes.
-type RunVm<'w, 's> =
-    crate::script_calls::VmWith<'w, 's, Option<ResMut<'static, crate::ui_trade::TradeSession>>>;
+/// The VM, the trade session a run's trade half writes, and the lane, whose trade halves a close
+/// inside a run's Lua takes.
+type RunVm<'w, 's> = crate::script_calls::VmWith<
+    'w,
+    's,
+    (
+        Option<ResMut<'static, crate::ui_trade::TradeSession>>,
+        ResMut<'static, ItemLane>,
+    ),
+>;
 
 /// The lane's `fire_until` ([`crate::lanes`]): each run `until` admits, whole, its Lua run with the
 /// host lent; the lane stops after a run whose firing stamped anything, so what it pushed fires
 /// next. With no VM the runs are dropped.
-fn fire_item_runs(
-    In(until): In<Until>,
-    mut vm: RunVm,
-    mut lane: ResMut<ItemLane>,
-    mut reads: RunReads,
-) {
-    while let Some((stamp, run, touch)) = lane.pop(until) {
+fn fire_item_runs(In(until): In<Until>, mut vm: RunVm, mut reads: RunReads) {
+    while let Some((stamp, run, touch)) = vm.own().1.pop(until) {
         let ((), moved) = crate::lanes::firing(stamp, || fire_run(&mut vm, &mut reads, run, touch));
         if moved {
             return;
@@ -195,9 +191,9 @@ fn fire_run(vm: &mut RunVm, reads: &mut RunReads, run: Run, touch: Option<TradeT
         return;
     };
     let rebuild = rebuild_at(&notice);
-    vm.run(|script| {
+    let held = vm.run(|script| {
         let Some(script) = script else {
-            return;
+            return false;
         };
         fire_unlocks(script, unlocks);
         if rebuild == Some(Rebuild::BeforeRecount) {
@@ -205,6 +201,9 @@ fn fire_run(vm: &mut RunVm, reads: &mut RunReads, run: Run, touch: Option<TradeT
                 carried(&reads.me, &reads.trade.objects, entry)
             });
         }
+        true
+    });
+    if held {
         let counter = crate::ui_action::recount::Counter {
             store: reads.me.iter().next(),
             objects: &reads.trade.objects,
@@ -212,11 +211,11 @@ fn fire_run(vm: &mut RunVm, reads: &mut RunReads, run: Run, touch: Option<TradeT
             commands: &reads.trade.commands,
         };
         for entry in notice.recounts() {
-            crate::ui_action::recount::recount(script, &counter, entry);
+            crate::ui_action::recount::recount(vm, &counter, entry);
         }
-    });
+    }
     if let Some(touch) = touch {
-        vm.turn(|script, trade| {
+        vm.turn(|script, (trade, _)| {
             if let (Some(script), Some(mut trade)) = (script, trade) {
                 crate::ui_trade::touch_trade(script, &mut trade, touch, &reads.trade);
             }
@@ -459,6 +458,8 @@ mod tests {
                 tools_pending: Vec::new(),
             }],
         }));
+        // No engine: the closes' calls are kept, their VM halves run.
+        script.keep_calls();
         script
             .run(
                 "HEARD = {} local f = CreateFrame('Frame') \

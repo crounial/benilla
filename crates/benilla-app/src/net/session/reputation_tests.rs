@@ -518,7 +518,7 @@ fn the_initialize_message_signals_both_rebuild_sorts_and_its_own() {
 
 /// Each message hands the pane's list what its handler does to it: a visible message the slot it
 /// lists (`0x4d5738`), a standing message the slots its entries made visible and whether a flag
-/// byte moved (`0x4d5826`, `0x4d58c8`), an at-war message nothing, as it sorts nothing
+/// byte moved (`0x4d5826`, `0x4d58c8`), an at-war message an edit of nothing, as it sorts nothing
 /// (`0x4d56b0`).
 #[test]
 fn each_message_hands_the_list_its_own_ops() {
@@ -526,12 +526,24 @@ fn each_message_hands_the_list_its_own_ops() {
     use benilla_ui::script::ReputationListOp as Op;
     let mut app = synthetic_app();
     seat(&mut app, VISIBLE, 0);
-    let ops =
-        |app: &mut App| std::mem::take(&mut app.world_mut().resource_mut::<Reputations>().list_ops);
+    let ops = |app: &mut App| app.world_mut().resource_mut::<Reputations>().take_ops();
     let _ = ops(&mut app);
     visible(&mut app, 40);
     visible(&mut app, 40);
-    assert_eq!(ops(&mut app), [Op::Visible(40)]);
+    assert_eq!(
+        ops(&mut app),
+        [
+            Op::Edit {
+                listed: vec![40],
+                sort: false
+            },
+            Op::Edit {
+                listed: vec![],
+                sort: true
+            }
+        ],
+        "the adder ahead of the flag write, the sort after it"
+    );
     send(
         &mut app,
         SessionEvent::ReputationAtWar {
@@ -539,14 +551,28 @@ fn each_message_hands_the_list_its_own_ops() {
             flags: AT_WAR,
         },
     );
-    assert!(ops(&mut app).is_empty());
+    assert_eq!(
+        ops(&mut app),
+        [Op::Edit {
+            listed: vec![],
+            sort: false
+        }],
+        "no row listed, no sort"
+    );
     delta(&mut app, 30, 5);
     assert_eq!(
         ops(&mut app),
-        [Op::Standing {
-            listed: vec![30],
-            flags_moved: true
-        }]
+        [
+            Op::Edit {
+                listed: vec![30],
+                sort: false
+            },
+            Op::Edit {
+                listed: vec![],
+                sort: true
+            }
+        ],
+        "the adder at the listing, then the sort once the entries are in"
     );
 }
 
@@ -581,4 +607,64 @@ fn the_at_war_message_copies_bit_1_alone() {
         VISIBLE | PEACE_FORCED | AT_WAR,
         "the message tests no peace-forced bit"
     );
+}
+
+/// `SMSG_SET_FACTION_STANDING` triggers Reputation (`0x4d5973`-`0x4d597a`) with the active
+/// player held at level 10 or more (`0x4d596d cmp [ecx+0x70],0xa`), after its entries and
+/// before its `UPDATE_FACTION`; below 10 nothing.
+#[test]
+fn a_standing_change_at_level_ten_triggers_the_reputation_tutorial() {
+    for (level, fired) in [(9, vec![]), (10, vec![0x10])] {
+        let mut app = App::new();
+        app.init_resource::<crate::net::GuidIndex>()
+            .insert_resource(SelfGuid(Some(ME)))
+            .init_resource::<crate::net::NetStatus>()
+            .init_resource::<crate::names::NameCache>()
+            .init_resource::<crate::items::Items>()
+            .init_resource::<crate::spell::Cooldowns>()
+            .init_resource::<Reputations>()
+            .init_resource::<crate::net::ServerTime>()
+            .init_resource::<crate::net::ServerWallClock>()
+            .init_resource::<crate::net::HomeBind>()
+            .init_resource::<crate::net::Proficiencies>()
+            .init_resource::<crate::net::DroppedOpcodes>()
+            .init_resource::<crate::ui_quest::QuestGiver>()
+            .init_resource::<crate::ui_chat::ChatLog>()
+            .init_resource::<crate::tutorial::Tutorials>()
+            .insert_resource(crate::net::NetCommands(crossbeam_channel::unbounded().0));
+        app.world()
+            .resource::<crate::tutorial::Tutorials>()
+            .lock()
+            .apply_flags(&[0u8; 32]);
+        // `UNIT_FIELD_LEVEL`.
+        let me = app
+            .world_mut()
+            .spawn((
+                SelfPlayer,
+                ObjectStore(ObjectFields::from_pairs(&[
+                    (36, HUMAN_WARRIOR),
+                    (34, level),
+                ])),
+            ))
+            .id();
+        app.world_mut()
+            .resource_mut::<crate::net::GuidIndex>()
+            .0
+            .insert(ME, me);
+        app.world_mut()
+            .run_system_cached_with(
+                on_reputation_delta,
+                SessionEvent::ReputationDelta {
+                    standings: vec![(0, 100)],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            app.world()
+                .resource::<crate::tutorial::Tutorials>()
+                .take_fired(),
+            fired,
+            "level {level}"
+        );
+    }
 }

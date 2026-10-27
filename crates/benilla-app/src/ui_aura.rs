@@ -4,6 +4,9 @@
 //! keeps the reference cache's insertion order (`0xbc6040`, repacked by `PlayerAuras_Update
 //! 0x4e4170`); any other unit's reads its descriptor by ascending slot, or, for a group member or
 //! pet with no live object, its roster record.
+//!
+//! A unit's list is one derivation off its slots ([`UnitAuraSource`]), which the lent host's walk
+//! reads as each getter runs ([`AuraLive`]) and each pushed list's build reads whole.
 
 mod units;
 
@@ -12,8 +15,10 @@ use std::collections::HashMap;
 use bevy::prelude::*;
 
 use benilla_formats::SpellCatalog;
-use benilla_protocol::messages::{UnitAuraSlot, AURA_FLAG_CANCELABLE, UNIT_AURA_POSITIVE_SLOTS};
-use benilla_ui::script::{AuraState, TrackingState, UiScript};
+use benilla_protocol::messages::{
+    PartyMemberStatsInfo, UnitAuraSlot, AURA_FLAG_CANCELABLE, UNIT_AURA_POSITIVE_SLOTS,
+};
+use benilla_ui::script::{AuraListRead, AuraRead, AuraState, TrackingState, UiScript};
 
 use crate::client_state::ClientState;
 use crate::net::{ClientCommand, Guid, GuidIndex, NetCommands, ObjectStore, SelfPlayer};
@@ -30,13 +35,12 @@ pub(crate) struct AuraDurations {
 }
 
 struct DurationStamp {
-    /// Seconds: the full duration on an apply or refresh, only the remainder on a relog
-    /// (`Map::ExistingPlayerLogin`) or a cast pushback (`Unit::DelaySpellAuraHolder`).
+    /// Seconds: the full duration on an apply or refresh, only the remainder at a login (the
+    /// character's load, `Player::_LoadAuras`), a relog (`Map::ExistingPlayerLogin`) or a cast
+    /// pushback (`Unit::DelaySpellAuraHolder`).
     total: f64,
     /// The real-clock instant it runs out: a server-sent span counts down in real seconds.
     expires_at: f64,
-    /// The real-clock arrival, the freshness gate against a recycled slot.
-    received_at: f64,
 }
 
 impl AuraDurations {
@@ -63,9 +67,14 @@ impl AuraDurations {
             DurationStamp {
                 total,
                 expires_at: now + total,
-                received_at: now,
             },
         );
+    }
+
+    /// When `slot`'s stamp runs out on the script clock, 0 for none: `script_now` is where
+    /// `GetTime` stands at the instant `stamp_now` is on the stamps' clock.
+    pub(crate) fn expiry(&self, slot: u8, stamp_now: f64, script_now: f64) -> f64 {
+        join_duration(self.by_slot.get(&slot), stamp_now, script_now).1
     }
 }
 
@@ -74,8 +83,6 @@ impl AuraDurations {
 struct CachedAura {
     slot: u8,
     spell_id: u32,
-    /// When the aura entered the cache, for the duration freshness gate.
-    appeared_at: f64,
     /// The `AURAFLAGS` nibble and the `AURALEVELS` byte as the record was made (`+0xa`, `+0x8`).
     flags: u8,
     level: u8,
@@ -103,7 +110,7 @@ impl Plugin for UiAuraPlugin {
             .init_resource::<PlayerAuraCache>()
             .init_resource::<AuraFeedMemory>()
             .init_resource::<benilla_world::frame_pace::FrameStep>()
-            // Feed before the VM dispatch, drain after it.
+            // Fed before the VM dispatch.
             // After this frame's world publish, so the gain names the unit in the same frame.
             .add_systems(
                 Update,
@@ -112,12 +119,12 @@ impl Plugin for UiAuraPlugin {
                     .in_set(AuraEvents)
                     .after(crate::ui_tooltip::MouseoverPublish),
             )
-            .add_systems(Update, drain_aura_cancels.in_set(crate::ui_script::UiDrain))
             // Torn down only at the session's end, not with the avatar, which a worldport drops.
             // After the shutdown's `PLAYER_LOGOUT` and before the glue VM goes in.
             .add_systems(
                 OnExit(ClientState::InWorld),
-                end_session_aura_state.in_set(crate::ui_script::SessionEnd::Clears),
+                (end_session_aura_state, end_session_aura_stamps)
+                    .in_set(crate::ui_script::SessionEnd::Clears),
             );
     }
 }
@@ -143,7 +150,6 @@ fn reconcile(cache: &mut Vec<CachedAura>, live: &[UnitAuraSlot], now: f64) {
             cache.push(CachedAura {
                 slot: a.slot,
                 spell_id: a.spell_id,
-                appeared_at: now,
                 flags: a.flags,
                 level: a.level,
                 stacks: a.stacks,
@@ -165,6 +171,9 @@ struct AuraFeedMemory {
     raid: RaidFilter,
     /// When [`trace_timers`] last printed: host state, outliving any one VM.
     traced_at: f64,
+    /// The frame's clock pair, `(GetTime, the stamps' clock)` at the same instant, which the lent
+    /// host maps each stamp onto `GetTime` through ([`AuraDurations::expiry`]).
+    clock: Option<(f64, f64)>,
 }
 
 /// One VM's: the player object its cache was last set up over, and every other list.
@@ -212,11 +221,6 @@ fn trace_timers(script: &UiScript, cache: &[CachedAura], list: &[AuraState], bev
             harmful_n += 1;
             15 + harmful_n
         };
-        let app_left = if a.expiration_time > 0.0 {
-            format!("{:.1}s", a.expiration_time - script_now)
-        } else {
-            "permanent".to_string()
-        };
         // The rendered duration text: the button keeps no expiry, so its text is the readback.
         let lua = script
             .eval::<String>(&format!(
@@ -228,7 +232,7 @@ fn trace_timers(script: &UiScript, cache: &[CachedAura], list: &[AuraState], bev
             ))
             .unwrap_or_else(|e| format!("<lua error: {e}>"));
         info!(
-            "  slot {:>2}  spell {:>5}  {:<26}  BuffButton{button:<2}  app left {app_left:<10}  lua {lua}",
+            "  slot {:>2}  spell {:>5}  {:<26}  BuffButton{button:<2}  lua {lua}",
             c.slot,
             a.spell_id,
             a.name.as_deref().unwrap_or("<unknown spell>"),
@@ -257,6 +261,7 @@ fn unit_aura_state(catalog: Option<&SpellCatalog>, input: &AuraInput) -> AuraSta
     let display = catalog.and_then(|cat| cat.get(spell_id));
     AuraState {
         spell_id,
+        slot,
         name: display.map(|d| d.name.clone()),
         icon: display.and_then(|d| d.icon.clone()),
         count,
@@ -271,6 +276,7 @@ fn unit_aura_state(catalog: Option<&SpellCatalog>, input: &AuraInput) -> AuraSta
         cancelable: flags & AURA_FLAG_CANCELABLE != 0,
         // `untilCancelled` is the player cache record's alone (`0xbc6040` `+0xc`).
         until_cancelled: false,
+        until_cancelled_unknown: false,
         channeled: display.is_some_and(|d| d.attributes_ex & SPELL_ATTR_EX_IS_CHANNELED != 0),
         raid_listed,
         vision_hidden,
@@ -315,29 +321,80 @@ fn aura_list(catalog: Option<&SpellCatalog>, inputs: &[AuraInput]) -> Vec<AuraSt
         .collect()
 }
 
-/// A unit's auras as `UnitBuff 0x519500`, `UnitDebuff 0x5198f0` and the tooltip's
-/// `SetUnitBuff 0x534ac0` read them: ascending slot within each half, no durations, through the
-/// display filter, every one whatever the unit gate says ([`buffs_visible_on`]), which the list
-/// carries beside them, each with its `raidFilter` verdict and, against the active player's
-/// `vision`, the bindings' vision verdict ([`vision_hides`]).
-fn other_unit_inputs<'a>(
-    store: &'a ObjectStore,
+/// What a unit's auras are read against: the spell catalog, the `raidFilter` books
+/// ([`RaidFilter`]) and the active player's `PLAYER_FIELD_BYTES2` byte 1 ([`vision_hides`]),
+/// `None` with no active player.
+#[derive(Clone, Copy)]
+struct AuraReadCtx<'a> {
     catalog: Option<&'a SpellCatalog>,
     raid: &'a RaidFilter,
     vision: Option<u8>,
-) -> impl Iterator<Item = AuraInput> + 'a {
+}
+
+/// One slot's aura of a unit's list as the walks read it, each fact derived as it is asked for:
+/// its slot, spell, stack count, `AURAFLAGS` nibble and `AURALEVELS` byte, read against `ctx`. A
+/// snapshot's [`AuraInput`] is every fact of one ([`AuraInput::of`]), so the live walk and the
+/// pushed list are one derivation.
+struct SlotAura<'a> {
+    slot: u8,
+    spell_id: u32,
+    count: u8,
+    flags: u8,
+    level: u8,
+    ctx: AuraReadCtx<'a>,
+}
+
+impl AuraRead for SlotAura<'_> {
+    fn helpful(&self) -> bool {
+        self.slot < UNIT_AURA_POSITIVE_SLOTS
+    }
+    fn vision_hidden(&self) -> bool {
+        vision_hides(self.ctx.catalog, self.spell_id, self.ctx.vision)
+    }
+    fn raid_listed(&self) -> bool {
+        self.ctx
+            .raid
+            .keeps(self.ctx.catalog, self.slot, self.spell_id)
+    }
+    fn state(&self) -> AuraState {
+        unit_aura_state(self.ctx.catalog, &AuraInput::of(self))
+    }
+}
+
+impl AuraInput {
+    /// Every fact `a` answers.
+    fn of(a: &SlotAura) -> Self {
+        AuraInput {
+            slot: a.slot,
+            spell_id: a.spell_id,
+            count: a.count,
+            flags: a.flags,
+            level: a.level,
+            raid_listed: a.raid_listed(),
+            vision_hidden: a.vision_hidden(),
+        }
+    }
+}
+
+/// A unit's auras as `UnitBuff 0x519500`, `UnitDebuff 0x5198f0` and the tooltip's
+/// `SetUnitBuff 0x534ac0` read them: ascending slot within each half, no durations, through the
+/// display filter, every one whatever the unit gate says ([`buffs_visible_on`]), which the list
+/// carries beside them.
+fn store_slots<'a>(
+    store: &'a ObjectStore,
+    ctx: AuraReadCtx<'a>,
+) -> impl Iterator<Item = SlotAura<'a>> + 'a {
     store
         .0
         .unit_auras()
-        .filter(move |a| shown_in_aura_ui(catalog, a.spell_id))
-        .map(move |a| AuraInput {
+        .filter(move |a| shown_in_aura_ui(ctx.catalog, a.spell_id))
+        .map(move |a| SlotAura {
             slot: a.slot,
             spell_id: a.spell_id,
             count: a.stacks,
             flags: a.flags,
             level: a.level,
-            raid_listed: raid.keeps(catalog, a.slot, a.spell_id),
-            vision_hidden: vision_hides(catalog, a.spell_id, vision),
+            ctx,
         })
 }
 
@@ -346,24 +403,144 @@ fn other_unit_inputs<'a>(
 /// `0x519b8f`), no unit gate and no `AURAFLAGS`, which the record does not hold. The stack count is always 1
 /// (`0x51980f`, `0x519c2d`), nothing is cancelable, and the level is 0, what `SetUnitBuff` passes
 /// for a record (`0x534da8`).
-fn record_inputs<'a>(
+fn record_slots<'a>(
     slots: impl Iterator<Item = (u8, u16)> + 'a,
-    catalog: Option<&'a SpellCatalog>,
-    raid: &'a RaidFilter,
-    vision: Option<u8>,
-) -> impl Iterator<Item = AuraInput> + 'a {
+    ctx: AuraReadCtx<'a>,
+) -> impl Iterator<Item = SlotAura<'a>> + 'a {
     slots
         .map(|(slot, spell)| (slot, u32::from(spell)))
-        .filter(move |&(_, spell)| spell != 0 && shown_in_aura_ui(catalog, spell))
-        .map(move |(slot, spell_id)| AuraInput {
+        .filter(move |&(_, spell)| spell != 0 && shown_in_aura_ui(ctx.catalog, spell))
+        .map(move |(slot, spell_id)| SlotAura {
             slot,
             spell_id,
             count: 1,
             flags: 0,
             level: 0,
-            raid_listed: raid.keeps(catalog, slot, spell_id),
-            vision_hidden: vision_hides(catalog, spell_id, vision),
+            ctx,
         })
+}
+
+/// [`store_slots`] as a list's inputs, each with its `raidFilter` verdict and, against the
+/// active player's `vision`, the bindings' vision verdict.
+#[cfg(test)]
+fn other_unit_inputs<'a>(
+    store: &'a ObjectStore,
+    catalog: Option<&'a SpellCatalog>,
+    raid: &'a RaidFilter,
+    vision: Option<u8>,
+) -> impl Iterator<Item = AuraInput> + 'a {
+    let ctx = AuraReadCtx {
+        catalog,
+        raid,
+        vision,
+    };
+    store_slots(store, ctx).map(|a| AuraInput::of(&a))
+}
+
+/// Where one unit's list is read from, as `UnitBuff 0x519500` finds it: the object its token
+/// resolves (`0x51955e`), else a roster record (`0x519595` → `0x519735`). Both paths read it: the
+/// lent host's walk as the call runs ([`AuraLive`]), and each pushed list's build
+/// ([`UnitAuraSource::list`]).
+pub(crate) struct UnitAuraSource<'a> {
+    from: AuraFrom<'a>,
+    ctx: AuraReadCtx<'a>,
+}
+
+enum AuraFrom<'a> {
+    /// The live unit's slots, and `UnitBuff`'s unit gate on it.
+    Object {
+        guid: u64,
+        store: &'a ObjectStore,
+        gate: &'a dyn Fn(u64, &ObjectStore) -> bool,
+    },
+    /// A roster record's block in `records`, which has no gate (`0x519735`); none without a
+    /// roster.
+    Record {
+        guid: u64,
+        records: Option<&'a HashMap<u64, PartyMemberStatsInfo>>,
+    },
+}
+
+impl<'a> UnitAuraSource<'a> {
+    /// `guid`'s list: off `store`, its object, gated through `gate`; else, when its roster record
+    /// may stand in (`record_ok`), off its record in `records`; `None` for neither, as
+    /// `UnitBuff`'s roster walk finds nothing for a guid with no record.
+    fn of(
+        guid: u64,
+        store: Option<&'a ObjectStore>,
+        record_ok: bool,
+        records: Option<&'a HashMap<u64, PartyMemberStatsInfo>>,
+        gate: &'a dyn Fn(u64, &ObjectStore) -> bool,
+        ctx: AuraReadCtx<'a>,
+    ) -> Option<Self> {
+        let from = match store {
+            Some(store) => AuraFrom::Object { guid, store, gate },
+            None if record_ok => AuraFrom::Record { guid, records },
+            None => return None,
+        };
+        Some(Self { from, ctx })
+    }
+
+    /// Each aura in ascending slot, until `visit` answers `true`.
+    fn each(&self, mut visit: impl FnMut(&SlotAura<'a>) -> bool) {
+        match self.from {
+            AuraFrom::Object { store, .. } => {
+                for a in store_slots(store, self.ctx) {
+                    if visit(&a) {
+                        return;
+                    }
+                }
+            }
+            AuraFrom::Record {
+                guid,
+                records: Some(records),
+            } => {
+                let slots = crate::ui_party::roster_aura_slots_in(records, guid);
+                for a in record_slots(slots, self.ctx) {
+                    if visit(&a) {
+                        return;
+                    }
+                }
+            }
+            AuraFrom::Record { records: None, .. } => {}
+        }
+    }
+
+    /// `UnitBuff`'s unit gate: the object's ([`buffs_visible_on`]); a record's is open.
+    fn gate(&self) -> bool {
+        match self.from {
+            AuraFrom::Object { guid, store, gate } => gate(guid, store),
+            AuraFrom::Record { .. } => true,
+        }
+    }
+
+    /// Every aura's inputs, into `inputs`, with the unit gate.
+    fn inputs(&self, inputs: &mut Vec<AuraInput>) -> bool {
+        self.each(|a| {
+            inputs.push(AuraInput::of(a));
+            false
+        });
+        self.gate()
+    }
+
+    /// The list whole, as a feed pushes it.
+    fn list(&self) -> benilla_ui::script::UnitAuraList {
+        let mut inputs = Vec::new();
+        let buffs_visible = self.inputs(&mut inputs);
+        benilla_ui::script::UnitAuraList {
+            auras: aura_list(self.ctx.catalog, &inputs),
+            buffs_visible,
+        }
+    }
+}
+
+impl AuraListRead for UnitAuraSource<'_> {
+    fn buffs_visible(&self) -> bool {
+        self.gate()
+    }
+    fn find(&self, visit: &mut dyn FnMut(&dyn AuraRead) -> bool) {
+        self.each(|a| visit(a));
+    }
 }
 
 /// What a set `raidFilter` keeps, the same test on the live walk and the record's (`UnitBuff`
@@ -476,26 +653,26 @@ const SPELL_ATTR_EX_IS_CHANNELED: u32 = 0x4;
 /// effect is an area aura, `0x23`, `0x77`, `0x80` or `0x81` (`0x4e4588`-`0x4e45be`).
 /// `BuffFrame.lua:124` then shows no countdown. Deviation: on a catalog miss the reference keeps
 /// the record's stale value (`0x4e4533`, `0x4e4550` skip the write); this answers from the joined
-/// expiry, because a stale value is no mechanism to reproduce.
+/// expiry, because a stale value is no mechanism to reproduce. `None` is that miss: the call reads
+/// the expiry ([`AuraState::until_cancelled_unknown`]).
 fn until_cancelled(
     display: Option<&benilla_formats::SpellDisplay>,
     duration_row: Option<&benilla_formats::SpellDuration>,
     cancelable: bool,
-    expiration_time: f64,
-) -> bool {
-    let Some(d) = display else {
-        return expiration_time == 0.0;
-    };
+) -> Option<bool> {
+    let d = display?;
     let permanent = match duration_row {
         Some(row) => row.base_ms < 0 && row.per_level_ms <= 0,
         // A negative, out-of-range or empty `DurationIndex`: all three reach `0x4e4580`.
         None => true,
     };
-    permanent
-        || (!cancelable
-            && d.effects
-                .iter()
-                .any(|e| matches!(e, 0x23 | 0x77 | 0x80 | 0x81)))
+    Some(
+        permanent
+            || (!cancelable
+                && d.effects
+                    .iter()
+                    .any(|e| matches!(e, 0x23 | 0x77 | 0x80 | 0x81))),
+    )
 }
 
 /// The filter of every aura display, the player's bar and other units' rows alike: never-display
@@ -543,16 +720,16 @@ struct AuraUnits<'w> {
 }
 
 fn feed_auras(
+    // The feed's memory beside the VM: the host's aura walk reads its `raidFilter` books.
     mut vm: crate::script_calls::VmWith<(
         AuraUnits<'static>,
         crate::target::RelationWorld<'static, 'static>,
+        ResMut<'static, AuraFeedMemory>,
     )>,
     self_q: Query<(Entity, &ObjectStore, &Guid), With<SelfPlayer>>,
     stores: Query<&ObjectStore>,
     spells: Option<Res<Spells>>,
     index: Res<GuidIndex>,
-    // Read-only: the net path writes the stamps and only the session's end drops them.
-    durations: Res<AuraDurations>,
     mut cache: ResMut<PlayerAuraCache>,
     time: Res<Time<Real>>,
     // The stamps' clock where `GetTime` stands: this feed runs in `UiFeed`, before the tick, so
@@ -560,23 +737,27 @@ fn feed_auras(
     step: Res<benilla_world::frame_pace::FrameStep>,
     // `Option`: a UI-only harness has no action store, and so no known spell.
     actions: Option<Res<crate::ui_action::PlayerActions>>,
-    mut mem: ResMut<AuraFeedMemory>,
 ) {
     // The `UnitBuff` gate's inputs are the relation model the selection ring and nameplates use.
-    vm.feed(|script, (units, relations), fires| {
+    vm.feed(|script, (units, relations, mut mem), fires| {
         let Some(script) = script else {
             return;
         };
+        let mem = &mut *mem;
+        // The clock the lent host maps the duration stamps through, kept through an avatar-less
+        // frame: the stamps outlive it.
+        mem.clock = Some((script.now(), step.before_step().1));
         let Ok((me_entity, store, self_guid)) = self_q.single() else {
             // No avatar does not end the aura state: a worldport re-streams the avatar mid-session,
-            // and vmangos re-sends durations only on apply, refresh and `Map::ExistingPlayerLogin`.
+            // and vmangos sends a duration where one is set (an apply, a refresh, a pushback), at
+            // the character's load (`Player::_LoadAuras`) and at a relog
+            // (`Map::ExistingPlayerLogin`), none of which a worldport runs.
             // The reference's `0xbc5f68` is zeroed once, by the startup init (`0x4e40c0` from
             // `0x48f5a9`), and touched otherwise only by its setter `0x4e43a6` and reader
             // `0x4e4467`.
             return;
         };
 
-        let mem = &mut *mem;
         let bevy_now = time.elapsed_secs_f64();
         let catalog = spells.as_ref().map(|s| &s.catalog);
         let spell_durations = spells.as_ref().map(|s| &s.durations);
@@ -596,15 +777,7 @@ fn feed_auras(
             script.set_tracking(tracking);
         }
 
-        // No stamp is pruned for an empty slot: the packet arrives before its slot fills.
-        let list = player_list(
-            &cache.auras,
-            catalog,
-            spell_durations,
-            &durations,
-            step.before_step().1,
-            script.now(),
-        );
+        let list = player_list(&cache.auras, catalog, spell_durations);
 
         if let Some(period) = trace_period() {
             if bevy_now - mem.traced_at >= period {
@@ -744,28 +917,26 @@ fn rebuild(
     tracking_state_of(catalog, &occupied)
 }
 
-/// The cache as `GetPlayerBuff` and its family read it, each record joined to its slot's duration
-/// on the script clock `script_now`, which `stamp_now` is on the stamps' clock.
+/// The cache as `GetPlayerBuff` and its family read it. It carries no duration: the timers read
+/// the expiry array through the lent host ([`AuraLive`]), as the reference's reader does at the
+/// call (`0x4e4450`).
 fn player_list(
     cache: &[CachedAura],
     catalog: Option<&SpellCatalog>,
     spell_durations: Option<&benilla_formats::SpellDurationCatalog>,
-    durations: &AuraDurations,
-    stamp_now: f64,
-    script_now: f64,
 ) -> Vec<AuraState> {
     cache
         .iter()
         .map(|c| {
             let display = catalog.and_then(|cat| cat.get(c.spell_id));
-            let (duration, expiration_time) = join_duration(
-                durations.by_slot.get(&c.slot),
-                c.appeared_at,
-                stamp_now,
-                script_now,
+            let flag = until_cancelled(
+                display,
+                display.and_then(|d| spell_durations.and_then(|c| c.get(d.duration_index))),
+                c.flags & AURA_FLAG_CANCELABLE != 0,
             );
             AuraState {
                 spell_id: c.spell_id,
+                slot: c.slot,
                 name: display.map(|d| d.name.clone()),
                 icon: display.and_then(|d| d.icon.clone()),
                 count: c.stacks,
@@ -774,16 +945,12 @@ fn player_list(
                     .zip(catalog)
                     .and_then(|(d, cat)| cat.dispel_name(d))
                     .map(str::to_string),
-                duration,
-                expiration_time,
+                duration: 0.0,
+                expiration_time: 0.0,
                 helpful: c.slot < UNIT_AURA_POSITIVE_SLOTS,
                 cancelable: c.flags & AURA_FLAG_CANCELABLE != 0,
-                until_cancelled: until_cancelled(
-                    display,
-                    display.and_then(|d| spell_durations.and_then(|c| c.get(d.duration_index))),
-                    c.flags & AURA_FLAG_CANCELABLE != 0,
-                    expiration_time,
-                ),
+                until_cancelled: flag.unwrap_or(false),
+                until_cancelled_unknown: flag.is_none(),
                 channeled: display
                     .is_some_and(|d| d.attributes_ex & SPELL_ATTR_EX_IS_CHANNELED != 0),
                 // No reader of the buff cache takes a `raidFilter`, nor runs the vision test
@@ -804,10 +971,8 @@ fn player_list(
 pub(crate) struct PlayerAuraWatch<'w, 's> {
     // `Option`: a UI-only harness has no aura plugin, and so no cache to rebuild.
     cache: Option<ResMut<'w, PlayerAuraCache>>,
-    durations: Option<Res<'w, AuraDurations>>,
     spells: Option<Res<'w, Spells>>,
     time: Option<Res<'w, Time<Real>>>,
-    step: Option<Res<'w, benilla_world::frame_pace::FrameStep>>,
     stores: crate::ui_unit::views::ViewStores<'w, 's>,
     me: Query<'w, 's, Entity, With<SelfPlayer>>,
 }
@@ -815,8 +980,7 @@ pub(crate) struct PlayerAuraWatch<'w, 's> {
 impl PlayerAuraWatch<'_, '_> {
     /// The watcher's run.
     pub(crate) fn run(&mut self, script: &mut UiScript) {
-        let (Some(cache), Some(durations)) = (self.cache.as_deref_mut(), self.durations.as_deref())
-        else {
+        let Some(cache) = self.cache.as_deref_mut() else {
             return;
         };
         let Some(store) = self.me.iter().next().and_then(|e| self.stores.get(e).ok()) else {
@@ -825,14 +989,10 @@ impl PlayerAuraWatch<'_, '_> {
         let catalog = self.spells.as_ref().map(|s| &s.catalog);
         let now = self.time.as_ref().map_or(0.0, |t| t.elapsed_secs_f64());
         let tracking = rebuild(&mut cache.auras, store, catalog, now);
-        let stamp_now = self.step.as_ref().map_or(0.0, |s| s.before_step().1);
         let list = player_list(
             &cache.auras,
             catalog,
             self.spells.as_ref().map(|s| &s.durations),
-            durations,
-            stamp_now,
-            script.now(),
         );
         script.set_player_auras(list);
         script.set_tracking(tracking);
@@ -841,7 +1001,8 @@ impl PlayerAuraWatch<'_, '_> {
 }
 
 /// What the views lane reads to build a unit's aura list as a packet left it
-/// ([`crate::ui_unit::views`]), as [`feed_auras`] builds it.
+/// ([`crate::ui_unit::views`]), as [`feed_auras`] builds it, and the lent host's walk reads it
+/// ([`AuraLive`]).
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct AuraViews<'w> {
     spells: Option<Res<'w, Spells>>,
@@ -849,9 +1010,42 @@ pub(crate) struct AuraViews<'w> {
 }
 
 impl AuraViews<'_> {
-    /// `guid`'s list off `store`, its descriptor, else, when a group token names it
-    /// (`record_ok`), its roster record in `group`; `None` for a guid with neither. `me` is our
-    /// own descriptor as of the same place, whose vision the list is read against.
+    /// `f` over `guid`'s [`UnitAuraSource`]: off `store`, its descriptor, else, when its roster
+    /// record may stand in (`record_ok`), off its record in `records`; `None` for neither. `me`
+    /// is our own descriptor as of the same place, whose vision the list is read against and
+    /// whose standing `UnitBuff`'s gate reads (`0x5195be`-`0x5195f7`). `None` without the feed's
+    /// memory, which holds the `raidFilter` books.
+    #[allow(clippy::too_many_arguments)] // the list's inputs, each as of the place it is read for
+    pub(crate) fn read<T>(
+        &self,
+        guid: u64,
+        store: Option<&ObjectStore>,
+        record_ok: bool,
+        records: Option<&HashMap<u64, PartyMemberStatsInfo>>,
+        relations: &crate::target::RelationWorld,
+        me: Option<&ObjectStore>,
+        f: impl FnOnce(Option<&UnitAuraSource>) -> T,
+    ) -> Option<T> {
+        let raid = &self.mem.as_deref()?.raid;
+        let ctx = AuraReadCtx {
+            catalog: self.spells.as_ref().map(|s| &s.catalog),
+            raid,
+            vision: me.map(|s| s.0.player_aura_vision()),
+        };
+        let rel = relations.get();
+        let viewer = relations
+            .me_guid()
+            .zip(me)
+            .map(|(g, s)| relations.unit_of(g, s));
+        let gate = |guid: u64, unit: &ObjectStore| {
+            buffs_visible_on(&rel, &relations.unit_of(guid, unit), viewer.as_ref())
+        };
+        let source = UnitAuraSource::of(guid, store, record_ok, records, &gate, ctx);
+        Some(f(source.as_ref()))
+    }
+
+    /// `guid`'s list as [`Self::read`] reads it, whole, a group token's off the roster in
+    /// `group`.
     pub(crate) fn list(
         &self,
         guid: u64,
@@ -861,23 +1055,59 @@ impl AuraViews<'_> {
         relations: &crate::target::RelationWorld,
         me: Option<&ObjectStore>,
     ) -> Option<benilla_ui::script::UnitAuraList> {
-        let raid = &self.mem.as_deref()?.raid;
-        let catalog = self.spells.as_ref().map(|s| &s.catalog);
-        let (rel, viewer) = (relations.get(), relations.me());
-        let buffs_visible = |guid: u64, unit: &ObjectStore| {
-            buffs_visible_on(&rel, &relations.unit_of(guid, unit), viewer.as_ref())
-        };
-        let vision = me.map(|s| s.0.player_aura_vision());
-        units::list_of(
-            guid,
-            store,
-            record_ok,
-            group,
-            &buffs_visible,
-            catalog,
-            raid,
-            vision,
-        )
+        let records = group.map(|g| &g.stats);
+        self.read(guid, store, record_ok, records, relations, me, |source| {
+            source.map(UnitAuraSource::list)
+        })
+        .flatten()
+    }
+}
+
+/// The aura slots the unit aura getters read off as they run, as the reference's walk the object
+/// their token resolves (`UnitBuff` `0x519500`, `0x51955e`): each store and record as of the
+/// drain's place, so a listener reads its own packet's, and the active player as of there, whose
+/// vision and standing the walk reads.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct AuraLive<'w, 's> {
+    objects: crate::net::Objects<'w, 's>,
+    stores: crate::ui_unit::views::ViewStores<'w, 's>,
+    views: AuraViews<'w>,
+    relations: crate::target::RelationWorld<'w, 's>,
+    // `Option`: a harness without the party's has no roster, and so no record to read.
+    group: Option<Res<'w, crate::ui_party::GroupState>>,
+    /// The player's duration stamps, read as they stand.
+    durations: Option<Res<'w, AuraDurations>>,
+}
+
+/// The expiry array's read at the call (`0x4e4450`): the slot's stamp on the script clock, mapped
+/// through the frame's clock pair ([`AuraFeedMemory`]); declined while no pair is known.
+impl crate::script_calls::live::LiveFamily for AuraLive<'_, '_> {
+    fn answer(&mut self, ask: &mut benilla_ui::script::live::LiveAsk<'_>) -> bool {
+        ask.answer(|q: &benilla_ui::script::PlayerBuffExpiry| {
+            let (script_now, stamp_now) = self.views.mem.as_deref()?.clock?;
+            Some(
+                self.durations
+                    .as_deref()?
+                    .expiry(q.slot, stamp_now, script_now),
+            )
+        })
+    }
+}
+
+impl AuraLive<'_, '_> {
+    /// Hand `read` `guid`'s aura list as of here: its object's slots, else its roster record's,
+    /// which `0x496400` and `0x496420` look up by guid whatever token named it (`0x519735`);
+    /// `None` for neither. Whether it read: not without the aura feed's memory, whose `raidFilter`
+    /// books the walk reads, where the pushed lists answer.
+    pub(crate) fn read(&self, guid: u64, read: &mut dyn FnMut(Option<&dyn AuraListRead>)) -> bool {
+        let me = self.objects.player().and_then(|e| self.stores.get(e).ok());
+        let store = self.stores.by_guid(guid, self.objects.store(guid));
+        let records = self.group.as_deref().map(|g| self.stores.records(&g.stats));
+        self.views
+            .read(guid, store, true, records, &self.relations, me, |source| {
+                read(source.map(|s| s as &dyn AuraListRead))
+            })
+            .is_some()
     }
 }
 
@@ -889,34 +1119,22 @@ pub(crate) fn run_feed_auras_once(world: &mut World) {
         .expect("the aura feed runs as a one-shot system");
 }
 
-/// How long before its aura a duration packet may arrive and still join it. The measured lead is
-/// one frame, about 50 ms, on a fresh apply; a recycled slot's stale stamp is seconds older.
-const DURATION_SLACK: f64 = 1.0;
-
 /// Joins a slot's stamp to the aura in that slot as `(duration, expirationTime)` on the script
-/// clock, `(0, 0)` for none; only this rejects a stamp. A stamp older than the aura by more than
-/// [`DURATION_SLACK`] is dropped as an earlier occupant's, where the reference's reader
-/// (`0x4e4450`) has no freshness test. `stamp_now` is the stamps' clock at the instant
-/// `script_now` stands at, so the expiry holds still frame to frame.
-fn join_duration(
-    stamp: Option<&DurationStamp>,
-    appeared_at: f64,
-    stamp_now: f64,
-    script_now: f64,
-) -> (f64, f64) {
+/// clock, `(0, 0)` for none. The reference's reader (`0x4e4450`) returns `expiry - now` for the
+/// slot with no freshness test, so a stamp from before its aura joins it: a login's durations go
+/// out while the server loads the character, seconds ahead of the auras. `stamp_now` is the
+/// stamps' clock at the instant `script_now` stands at, so the expiry holds still frame to frame.
+fn join_duration(stamp: Option<&DurationStamp>, stamp_now: f64, script_now: f64) -> (f64, f64) {
     stamp
-        .filter(|d| d.received_at >= appeared_at - DURATION_SLACK)
         .map(|d| (d.total, script_now + (d.expires_at - stamp_now)))
         .unwrap_or((0.0, 0.0))
 }
 
 /// The session's end: drops the lists and stamps, so nothing reaches the next character's bar.
-/// Deviation: the reference never clears its expiry array (`0xbc5f68`); this does, because vmangos
-/// sends no durations at login to overwrite a kept stamp (`SMSG_UPDATE_AURA_DURATION` is an empty
-/// placeholder in `Player::SendInitialPacketsBeforeAddToMap`, `Player.cpp:19248`).
+/// Deviation: the reference clears its expiry array (`0xbc5f68`) at every game entry, in
+/// `ResetBuffCache` (`0x4e40c0`, called from `0x48f5a9`); benilla clears it at exit instead.
 fn end_session_aura_state(
     mut hosted_vm: crate::script_calls::HostedVm,
-    mut durations: ResMut<AuraDurations>,
     mut cache: ResMut<PlayerAuraCache>,
 ) {
     hosted_vm.run(|script| {
@@ -926,22 +1144,119 @@ fn end_session_aura_state(
             script.set_tracking(None);
         }
         cache.auras.clear();
-        durations.by_slot.clear();
         // No `AuraFeedMemory` reset: its edge keys die with the VM.
     })
 }
 
-/// A `CMSG_CANCEL_AURA` per queued `CancelPlayerBuff` or `CancelTrackingBuff`, naming the spell,
-/// not the slot (`0x6e7040`).
-fn drain_aura_cancels(mut hosted_vm: crate::script_calls::HostedVm, net: Res<NetCommands>) {
-    hosted_vm.run(|script| {
-        let Some(script) = script else {
+/// The stamps' half of [`end_session_aura_state`], in a system of its own: the system that lends
+/// the host cannot write what the host's reads read ([`AuraLive`]).
+fn end_session_aura_stamps(mut durations: ResMut<AuraDurations>) {
+    durations.by_slot.clear();
+}
+
+/// The aura cancel `0x6e7040` (`CancelPlayerBuff`, `CancelTrackingBuff`, `CancelAreaSpiritHeal`
+/// inside their calls, and the healer scan's wave cancel): the active player's halves, the
+/// far-sight gate, then the packet, which names the spell, not the slot. The host signals the area
+/// spirit healer aura's event between the gate and the packet
+/// ([`benilla_ui::script::AuraCall`]).
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct AuraSteps<'w, 's> {
+    me: Query<'w, 's, (Entity, &'static ObjectStore), With<SelfPlayer>>,
+    /// Absent in a harness without the unit changes' queue.
+    edits: Option<Res<'w, crate::creature_anim::UnitEdits>>,
+    /// The record the gate reads; absent without client data, which gates nothing.
+    spells: Option<Res<'w, Spells>>,
+    index: Option<Res<'w, GuidIndex>>,
+    net: Res<'w, NetCommands>,
+    /// The machine `UpdateFarSight` runs; absent in a harness without the player's plugin.
+    far_sight: Option<Res<'w, crate::player::FarSight>>,
+}
+
+/// `AttributesEx` 0x2000, the far-sight spells, which the cancel hands to `UpdateFarSight`.
+const ATTR_EX_FAR_SIGHT: u32 = 0x2000;
+/// `AttributesEx` 0x4, the channelled spells, which the cancel's far-sight gate passes.
+const ATTR_EX_CHANNELED: u32 = 0x4;
+
+impl AuraSteps<'_, '_> {
+    /// For an active player: the precast of `spell_id` ended with its tail
+    /// (`0x60d040(player, spell, 1, 1)` at `0x6e7075`), then the spell's kits stopped
+    /// (`0x614150(player, spell, 0)` at `0x6e707e`). Both are unit edits, applied at the pass's
+    /// end with the rest of the frame's: the components they write are read beside the call host.
+    pub(crate) fn end_on_player(&self, spell_id: u32) {
+        let (Ok((entity, _)), Some(edits)) = (self.me.single(), self.edits.as_deref()) else {
             return;
         };
-        for spell_id in script.take_cancel_aura_requests() {
-            let _ = net.0.send(ClientCommand::CancelAura { spell_id });
+        edits.push(crate::creature_anim::UnitEdit::EndPrecast {
+            entity,
+            spell_id: Some(spell_id),
+            tail: true,
+        });
+        edits.push(crate::creature_anim::UnitEdit::StopSpellKits { entity, spell_id });
+    }
+
+    /// The far-sight gate (`0x6e7083`-`0x6e70b4`): a spell with `AttributesEx` 0x2000 and without
+    /// 0x4 stops the cancel with no player, or else runs `UpdateFarSight` (`0x5ee290`, at
+    /// `0x6e70ad`, [`crate::player::FarSight::update`]), which toggles the view and tells the
+    /// server, and stops the cancel when it answers nonzero: unless `PLAYER_FARSIGHT` names an
+    /// object the client does not hold (`0x5ee32b` → `0x5ee360`). Whether the cancel goes on to
+    /// its event and packet.
+    pub(crate) fn passes_far_sight(&self, spell_id: u32) -> bool {
+        let ex = self
+            .spells
+            .as_deref()
+            .and_then(|s| s.catalog.get(spell_id))
+            .map_or(0, |d| d.attributes_ex);
+        if ex & ATTR_EX_FAR_SIGHT == 0 || ex & ATTR_EX_CHANNELED != 0 {
+            return true;
         }
-    })
+        let Ok((_, store)) = self.me.single() else {
+            return false;
+        };
+        let field = store.0.player_farsight();
+        let held = |guid: u64| {
+            self.index
+                .as_deref()
+                .is_some_and(|index| index.0.contains_key(&guid))
+        };
+        match self.far_sight.as_deref() {
+            Some(far_sight) => !far_sight.update(field, held, &self.net),
+            // No machine: its answer alone.
+            None => field.is_some_and(|guid| !held(guid)),
+        }
+    }
+
+    /// `CMSG_CANCEL_AURA` (`0x6e70eb`), the spell's id.
+    pub(crate) fn send(&self, spell_id: u32) {
+        let _ = self.net.0.send(ClientCommand::CancelAura { spell_id });
+    }
+
+    /// `0x6e7040(spell)` outside a script call, the healer scan's (`0x492201`): its event fired
+    /// into `script`, if given.
+    pub(crate) fn cancel(&self, script: Option<&mut UiScript>, spell_id: u32) {
+        self.end_on_player(spell_id);
+        if !self.passes_far_sight(spell_id) {
+            return;
+        }
+        if spell_id == crate::ui_dialog_verbs::AREA_SPIRIT_HEALER_AURA {
+            if let Some(script) = script {
+                script.fire_event("AREA_SPIRIT_HEALER_OUT_OF_RANGE", vec![]);
+            }
+        }
+        self.send(spell_id);
+    }
+
+    /// `0x6e7040(spell)` from a packet handler, the time packet's scan (`0x492296` → `0x492201`),
+    /// whose signals go on the notice lane at the packet's place: the halves, the gate and the
+    /// packet here, the event left to the lane. Whether the area spirit healer aura's event is
+    /// owed.
+    pub(crate) fn cancel_at_packet(&self, spell_id: u32) -> bool {
+        self.end_on_player(spell_id);
+        if !self.passes_far_sight(spell_id) {
+            return false;
+        }
+        self.send(spell_id);
+        spell_id == crate::ui_dialog_verbs::AREA_SPIRIT_HEALER_AURA
+    }
 }
 
 #[cfg(test)]
@@ -983,7 +1298,6 @@ mod tests {
             .push(CachedAura {
                 slot: 32, // the first harmful slot, a debuff
                 spell_id: 11976,
-                appeared_at: 10.0,
                 flags: 0x8,
                 level: 60,
                 stacks: 1,
@@ -1024,14 +1338,20 @@ mod tests {
             elapsed: Duration::from_millis(100_016),
         });
         app.update();
-        let left: f64 = app
+        // The pair the lent host maps the stamp through: `GetTime` 100 at the stamps' 100.
+        let (script_now, stamp_now) = app
             .world()
-            .non_send_resource::<UiScript>()
-            .eval("return GetPlayerBuffTimeLeft(GetPlayerBuff(0, \"HARMFUL\"))")
-            .unwrap();
+            .resource::<AuraFeedMemory>()
+            .clock
+            .expect("the feed kept the pair");
+        let expiry = app
+            .world()
+            .resource::<AuraDurations>()
+            .expiry(32, stamp_now, script_now);
         assert!(
-            (left - 290.0).abs() < 1.0e-9,
-            "290 s left at GetTime 100 for an expiry at 390 s on the stamps' clock, not {left}"
+            (expiry - script_now - 290.0).abs() < 1.0e-9,
+            "290 s left at GetTime 100 for an expiry at 390 s on the stamps' clock, not {}",
+            expiry - script_now
         );
     }
 
@@ -1047,7 +1367,7 @@ mod tests {
         assert_eq!(
             app.world().resource::<PlayerAuraCache>().auras.len(),
             1,
-            "the display cache survives the gap — its `appeared_at` is the freshness gate's anchor"
+            "the display cache survives the gap"
         );
         assert!(
             app.world()
@@ -1192,34 +1512,17 @@ mod tests {
         // The level and the flags stay as the record was made (`0x4e433b`-`0x4e434a`).
         assert_eq!(cache[1].level, 60);
         assert_eq!(cache[1].flags, AURA_FLAG_CANCELABLE | 0x8);
-        assert_eq!(cache[0].appeared_at, 1.0, "appeared_at is not disturbed");
     }
 
     #[test]
-    fn a_duration_is_joined_only_when_it_is_no_older_than_the_aura() {
-        // Received at t=100 for an aura that appeared at t=200: a previous occupant's.
-        let stale = DurationStamp {
-            total: 30.0,
-            expires_at: 130.0,
-            received_at: 100.0,
-        };
-        assert_eq!(
-            join_duration(Some(&stale), 200.0, 200.0, 5000.0),
-            (0.0, 0.0),
-            "a stamp seconds older than the aura is rejected — no timer, not a wrong one"
-        );
-        // Received just before the aura: joined, and rebased onto the script clock.
-        let fresh = DurationStamp {
+    fn a_duration_is_rebased_onto_the_script_clock() {
+        let stamp = DurationStamp {
             total: 30.0,
             expires_at: 230.0,
-            received_at: 199.9,
         };
-        assert_eq!(
-            join_duration(Some(&fresh), 200.0, 200.0, 5000.0),
-            (30.0, 5030.0)
-        );
+        assert_eq!(join_duration(Some(&stamp), 200.0, 5000.0), (30.0, 5030.0));
         // No stamp: a permanent aura, which gets no packet.
-        assert_eq!(join_duration(None, 200.0, 200.0, 5000.0), (0.0, 0.0));
+        assert_eq!(join_duration(None, 200.0, 5000.0), (0.0, 0.0));
     }
 
     /// The span is a signed dword that the reference adds to its clock (`0x4e4390`) and reads back
@@ -1229,47 +1532,47 @@ mod tests {
     fn a_negative_span_leaves_the_slot_reading_zero_and_drops_its_last_timer() {
         let mut durations = AuraDurations::default();
         durations.set(0, 300_000, 15.0);
-        let live = join_duration(durations.by_slot.get(&0), 15.0, 15.0, 900.0);
+        let live = join_duration(durations.by_slot.get(&0), 15.0, 900.0);
         assert_eq!(live.0, 300.0, "control: a positive span joins");
 
         durations.set(0, -1, 16.0);
         assert_eq!(
-            join_duration(durations.by_slot.get(&0), 15.0, 16.0, 901.0),
+            join_duration(durations.by_slot.get(&0), 16.0, 901.0),
             (0.0, 0.0),
             "-1 is not 4,294,967 seconds, and not the earlier 300"
         );
         // The one negative the client's wrapped sign test reads as time left (`0x4e4472`).
         durations.set(1, i32::MIN, 16.0);
-        let (total, _) = join_duration(durations.by_slot.get(&1), 15.0, 16.0, 901.0);
+        let (total, _) = join_duration(durations.by_slot.get(&1), 16.0, 901.0);
         assert_eq!(total, 2_147_483.648, "i32::MIN reads as 2^31 ms");
         durations.set(2, 0, 16.0);
         assert!(durations.by_slot.contains_key(&2), "0 ms is a stamp, now");
     }
 
-    /// The duration packet arrives about a frame before the delta that fills its slot.
+    /// A login's durations go out while the server loads the character (vmangos `_LoadAuras`,
+    /// `Player.cpp:15579`, through `SpellAuraHolder::UpdateAuraDuration`), seconds before the
+    /// in-game UI reads the auras. The reference stores `now + duration` (`0x4e4390`) and its
+    /// reader returns `expiry - now` (`0x4e4450`) with no freshness test, so the stamp still joins.
     #[test]
-    fn a_stamp_that_arrives_one_frame_before_its_aura_still_joins_it() {
+    fn a_stamp_that_arrives_seconds_before_its_aura_still_joins_it() {
         let mut durations = AuraDurations::default();
-        // t = 15.10: the packet lands while slot 0 is still empty.
-        durations.set(0, 300_000, 15.10);
+        // The live measurement: the stamp at 15.49, the aura at 36.44.
+        durations.set(0, 300_000, 15.49);
         let mut cache = Vec::new();
-        assert!(cache.is_empty());
-        // t = 15.15: the next frame's descriptor delta fills slot 0.
-        reconcile(&mut cache, &[slot(0, 1126)], 15.15);
-
-        let (total, expiry) = join_duration(
-            durations.by_slot.get(&0),
-            cache[0].appeared_at,
-            15.15,
-            900.0,
+        reconcile(&mut cache, &[slot(0, 1126)], 36.44);
+        let list = player_list(&cache, None, None);
+        assert_eq!(
+            list[0].slot, 0,
+            "the record names the slot the stamp is read by"
         );
-        assert_eq!(total, 300.0, "the stamp survived the gap");
-        // Script clock 900 plus the 300 s that began 50 ms ago, at the packet, not the delta.
+        // 300 s from 15.49 leave 279.05 at 36.44: script clock 900 plus that.
+        let expiry = durations.expiry(list[0].slot, 36.44, 900.0);
         assert!(
-            (expiry - 1199.95).abs() < 1e-9,
+            (expiry - 1179.05).abs() < 1e-9,
             "expiry rebased onto the script clock, got {expiry}"
         );
     }
+
     // == `UnitBuff`'s unit-level gate (`0x519500`) ==
     // A stealthed Ridge Stalker carries 5916 in a positive slot and 22766 in a negative one; the
     // reference draws only 22766, as `UnitBuff` lists no hostile creature's buffs.
@@ -1481,40 +1784,38 @@ mod tests {
         let area = spell([0x23, 0, 0]);
 
         // Clause 1: the duration row decides, cancelable or not.
-        assert!(!until_cancelled(
-            Some(&ordinary),
-            Some(&timed_row),
-            true,
-            0.0
-        ));
-        assert!(!until_cancelled(
-            Some(&ordinary),
-            Some(&timed_row),
-            false,
-            0.0
-        ));
-        assert!(until_cancelled(
-            Some(&ordinary),
-            Some(&permanent_row),
-            true,
-            0.0
-        ));
-        assert!(
-            !until_cancelled(Some(&ordinary), Some(&scaling_row), true, 0.0),
+        assert_eq!(
+            until_cancelled(Some(&ordinary), Some(&timed_row), true),
+            Some(false)
+        );
+        assert_eq!(
+            until_cancelled(Some(&ordinary), Some(&timed_row), false),
+            Some(false)
+        );
+        assert_eq!(
+            until_cancelled(Some(&ordinary), Some(&permanent_row), true),
+            Some(true)
+        );
+        assert_eq!(
+            until_cancelled(Some(&ordinary), Some(&scaling_row), true),
+            Some(false),
             "a negative base with a positive per-level term is a SCALING duration, not permanence"
         );
         // No row: permanent (`0x4e4580`).
-        assert!(until_cancelled(Some(&ordinary), None, true, 0.0));
+        assert_eq!(until_cancelled(Some(&ordinary), None, true), Some(true));
 
         // Clause 2: the area-aura override applies only to a non-cancelable aura (`0x4e4588`).
-        assert!(until_cancelled(Some(&area), Some(&timed_row), false, 0.0));
-        assert!(
-            !until_cancelled(Some(&area), Some(&timed_row), true, 0.0),
+        assert_eq!(
+            until_cancelled(Some(&area), Some(&timed_row), false),
+            Some(true)
+        );
+        assert_eq!(
+            until_cancelled(Some(&area), Some(&timed_row), true),
+            Some(false),
             "a CANCELABLE aura skips the effect scan entirely"
         );
 
-        // A catalog miss answers from the joined expiry.
-        assert!(until_cancelled(None, None, false, 0.0));
-        assert!(!until_cancelled(None, None, false, 1234.0));
+        // A catalog miss reads the expiry at the call.
+        assert_eq!(until_cancelled(None, None, false), None);
     }
 }
