@@ -59,6 +59,7 @@ impl super::UiScript {
     }
 
     /// The `Stuck()` calls a harness's VM kept, each one cast of spell 7355.
+    #[cfg(test)]
     pub fn take_stuck_casts(&mut self) -> u32 {
         self.take_calls_like(&super::ScriptCall::GmTicket(GmTicketCall::Stuck)) as u32
     }
@@ -100,6 +101,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             lua.create_function(move |lua, ()| {
                 if needs_player
                     && !super::battlefield_queue::player_exists(
+                        lua,
                         &lua.app_data_ref::<Model>().expect("model app_data"),
                     )
                 {
@@ -129,6 +131,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 // With no active player the binding calls nothing (`0x48ca29`-`0x48ca30`,
                 // `0x48cab9`-`0x48cac0`).
                 if !super::battlefield_queue::player_exists(
+                    lua,
                     &lua.app_data_ref::<Model>().expect("model app_data"),
                 ) {
                     return Ok(());

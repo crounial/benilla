@@ -5,7 +5,6 @@
 //! their calls. A bag click sells through [`crate::ui_items`].
 
 use benilla_protocol::messages::{buy_result, sell_result, VendorItem};
-use benilla_world::interact::WorldRightPress;
 use bevy::prelude::*;
 
 use benilla_ui::script::{ItemStatsHead, MerchantItem, UiScript};
@@ -46,10 +45,13 @@ pub(crate) struct MerchantOpen {
     /// counts one (`0x4faf23`), each answer one down (`0x4fb0f9`), and a list starts it at 0
     /// (`0x4fad88`).
     pub(crate) pending: u32,
+    /// The cascade's reset, owed from its item's push ([`MerchantOpen::settle_world_reset`]).
+    pub(crate) world_reset: crate::ui_world_enter::OwedReset,
 }
 
 impl MerchantOpen {
     pub(crate) fn open(&mut self, vendor: u64, items: Vec<VendorItem>) {
+        self.settle_world_reset();
         self.vendor = Some(vendor);
         self.listed = Some(vendor);
         self.items = items;
@@ -97,6 +99,7 @@ impl MerchantOpen {
         self.clear();
         self.listed = None;
         self.items.clear();
+        self.world_reset = Default::default();
     }
 }
 
@@ -436,6 +439,36 @@ impl LatchedWindow for MerchantOpen {
     }
 }
 
+impl MerchantOpen {
+    /// The world-enter cascade's merchant reset (`0x4909b0` → `0x4fac50`), which signals nothing:
+    /// the vendor and its rows zeroed (`0x4fac61`-`0x4fac7a`), the list cache's guid kept. The
+    /// buy-back watch it registers (`0x4fac8d`) is the field watchers' standing one, and the list
+    /// it rebuilds (`0x4fafd0`) is read off the player's fields at each call. Owed from the
+    /// cascade's push, it runs at the cascade's place or ahead of a later packet's write
+    /// ([`crate::ui_world_enter::OwedReset`]).
+    pub(crate) fn settle_world_reset(&mut self) {
+        if self.world_reset.take() {
+            self.vendor = None;
+            self.items.clear();
+        }
+    }
+}
+
+/// The merchant reset in the cascade's place, unless a later packet ran it first: the engine's
+/// vendor and rows, then the VM's vendor.
+pub(crate) fn reset_on_world_enter(
+    mut vm: crate::script_calls::VmWith<Option<ResMut<'static, MerchantOpen>>>,
+) {
+    if let Some(mut open) = vm.own() {
+        open.settle_world_reset();
+    }
+    vm.run(|script| {
+        if let Some(script) = script {
+            script.set_merchant(None);
+        }
+    });
+}
+
 /// The close core `0x4fadf0`, every close's: with a vendor open, the latch release (`0x4fae04`),
 /// the cell cleared, `MERCHANT_CLOSED` (`0x4fae2c`), then the tail ([`close_tail`]).
 /// The leave-world sweep's leg (`0x490ada` → `0x4facc0`) calls it as it is.
@@ -443,10 +476,9 @@ pub(crate) fn close_core(world: &mut World) {
     let Some(vendor) = world.resource::<MerchantOpen>().vendor else {
         return;
     };
-    lane::behind_lane(world, |world| {
+    crate::lanes::step(world, |world| {
         crate::ui_session::release(world, vendor);
         world.resource_mut::<MerchantOpen>().clear();
-        crate::ui_session::note_closed(world, NpcWindow::Merchant);
         crate::ui_session::fire(world, |script| {
             script.fire_event("MERCHANT_CLOSED", vec![]);
             close_tail(script);
@@ -456,7 +488,8 @@ pub(crate) fn close_core(world: &mut World) {
 
 /// `SMSG_LIST_INVENTORY` opens the window on the vendor's rows (`0x4facf0`): the old rows' record
 /// callbacks cancelled while the window holds rows (`0x4fad01`-`0x4fad1b`), which a close zeroes
-/// (`0x4fae22`), so a list after a close leaves the waits standing; then the latch, registered
+/// (`0x4fae22`), so a list after a close leaves the waits standing; the Vendors tutorial, on every
+/// list (`0x4fad32`); then the latch, registered
 /// with no test of its own cell (`0x4fad40`), so a list from the open vendor closes it and opens
 /// it again, the cell (`0x4fad4b`), the rows, the wait count at 0 (`0x4fad88`) and
 /// `MERCHANT_SHOW` (`0x4fad92`).
@@ -467,6 +500,9 @@ pub(crate) fn open_merchant(world: &mut World, vendor: u64, items: Vec<VendorIte
         .is_some_and(|open| open.vendor.is_some() && !open.items.is_empty());
     if let (true, Some(cache)) = (held, world.get_resource::<Items>()) {
         cache.cancel_waits(crate::items::RecordCallback::Merchant);
+    }
+    if let Some(tutorials) = world.get_resource::<crate::tutorial::Tutorials>() {
+        tutorials.trigger_now(crate::tutorial::id::VENDORS);
     }
     crate::ui_session::register(world, vendor);
     world.resource_mut::<MerchantOpen>().open(vendor, items);
@@ -489,18 +525,11 @@ pub(crate) fn close_tail(script: &mut UiScript) {
     script.end_repair_mode();
 }
 
-/// A right mouse-down in the world ends repair mode: the WorldFrame hook `0x492c20` resets the
-/// Repair base mode to Point (`0x492c68`) and consumes nothing. A held payload pre-empts the hook
-/// (`0x492b50`), and a press over a UI frame never reaches it.
-pub(crate) fn end_repair_mode_on_right_press(
-    mut presses: MessageReader<WorldRightPress>,
-    payload_held: Res<crate::ui_script::CursorPayloadHeld>,
-    mut hosted_vm: crate::script_calls::HostedVm,
-) {
+/// The world frame's right-press hook's last leg (`0x492c20`, `0x492c59`-`0x492c72`): a Repair
+/// base mode returns to Point (`0x492c68`). It tests no payload and consumes nothing
+/// ([`crate::target::right_press_hook`]).
+pub(crate) fn end_repair_mode_on_right_press(mut hosted_vm: crate::script_calls::HostedVm) {
     hosted_vm.run(|script| {
-        if presses.read().last().is_none() || payload_held.0 {
-            return;
-        }
         if let Some(script) = script {
             script.end_repair_mode();
         }

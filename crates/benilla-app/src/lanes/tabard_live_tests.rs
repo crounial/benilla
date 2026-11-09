@@ -7,7 +7,7 @@ use benilla_protocol::SessionEvent;
 use benilla_ui::script::{TabardHost, UiScript, UnitState};
 use bevy::prelude::*;
 
-use crate::ui_tabard::{TabardEvent, TabardLane, TabardOpen};
+use crate::ui_tabard::{TabardLane, TabardOpen};
 
 const VENDOR: u64 = 0xF130_0000_0000_0042;
 /// `PLAYER_GUILDID`, absolute.
@@ -17,6 +17,10 @@ const GUILD_ID: u16 = 191;
 /// record is: its spy notes each designer event and message line.
 fn client() -> App {
     let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
+    // In the world with the interface up, so the dispatch fires each packet's lanes.
+    app.insert_resource(bevy::prelude::State::new(
+        crate::client_state::ClientState::InWorld,
+    ));
     let (tx, _rx) = crossbeam_channel::unbounded();
     app.insert_resource(crate::net::NetCommands(tx));
     let world = app.world_mut();
@@ -89,44 +93,70 @@ fn can_save_reads_the_record_and_the_latch_through_the_host() {
 }
 
 /// The activate's `OPEN_TABARD_FRAME` and the failed save reply's line and `TABARD_SAVE_PENDING`
-/// sit on the tabard lane at their handler's place, and fire there in the drain.
+/// fire inside their packet's dispatch, as a handler signals inside itself (`0x703e50`) ahead of
+/// the next packet's (`0x537ae5`).
 #[test]
-fn the_open_and_the_reply_fire_on_the_lane_at_their_handlers() {
+fn the_open_and_the_reply_fire_inside_their_dispatch() {
     let mut app = client();
     let handled = |app: &mut App, ev: SessionEvent| {
-        let before = crate::lanes::stamp();
         crate::net::handlers::dispatch(app.world_mut(), vec![ev]);
         app.world_mut().flush();
-        let after = crate::lanes::stamp();
-        let stamped = app.world().resource::<TabardLane>().stamped();
         assert!(
-            stamped.iter().all(|(at, _)| before < *at && *at < after),
-            "stamped inside the handler"
+            app.world().resource::<TabardLane>().stamped().is_empty(),
+            "fired inside the dispatch"
         );
-        let heard: Vec<String> = eval(app, false, "return Seen");
-        assert!(heard.is_empty(), "on the lane: {heard:?}");
-        crate::lanes::fire_in_order(app.world_mut());
-        let heard: Vec<String> = eval(app, false, "local s = Seen Seen = {} return s");
-        (
-            stamped.into_iter().map(|(_, e)| e).collect::<Vec<_>>(),
-            heard,
-        )
+        eval::<Vec<String>>(app, false, "local s = Seen Seen = {} return s")
     };
-    let (items, heard) = handled(&mut app, SessionEvent::TabardVendorActivate(VENDOR));
-    assert_eq!(items, [TabardEvent::Open]);
+    let heard = handled(&mut app, SessionEvent::TabardVendorActivate(VENDOR));
     assert_eq!(heard, ["OPEN_TABARD_FRAME:nil"]);
     assert_eq!(app.world().resource::<TabardOpen>().npc(), Some(VENDOR));
 
-    let (items, heard) = handled(&mut app, SessionEvent::SaveGuildEmblemResult(3));
-    assert_eq!(
-        items,
-        [
-            TabardEvent::Line("ERR_GUILDEMBLEM_NOTGUILDMASTER"),
-            TabardEvent::SavePending
-        ]
-    );
+    let heard = handled(&mut app, SessionEvent::SaveGuildEmblemResult(3));
     assert_eq!(
         heard,
         ["UI_ERROR_MESSAGE:not master", "TABARD_SAVE_PENDING:nil"]
+    );
+}
+
+/// A close in the open's own frame runs after the open: the open's listener starts the preview
+/// (`TabardFrame.lua`, `InitializeTabardColors`) and the close core's undo (`0x4f58ce` →
+/// `0x5e0830`) comes after it, ahead of `CLOSE_TABARD_FRAME` (`0x4f58f8`), so no preview is left
+/// on the body with no designer open.
+#[test]
+fn a_close_after_the_open_ends_the_preview_the_open_started() {
+    let mut app = client();
+    eval::<()>(
+        &mut app,
+        false,
+        r#"
+        Order = {}
+        local g = CreateFrame("Frame")
+        g:RegisterEvent("OPEN_TABARD_FRAME")
+        g:RegisterEvent("CLOSE_TABARD_FRAME")
+        g:SetScript("OnEvent", function()
+            table.insert(Order, event)
+            if event == "OPEN_TABARD_FRAME" then TM:InitializeTabardColors() end
+        end)
+        "#,
+    );
+    let preview = |app: &App| app.world().non_send_resource::<UiScript>().tabard_design();
+    crate::net::handlers::dispatch(
+        app.world_mut(),
+        vec![SessionEvent::TabardVendorActivate(VENDOR)],
+    );
+    app.world_mut().flush();
+    // Another window's open takes the latch in the same frame, which closes the designer
+    // (`0x493310`).
+    crate::ui_session::register(app.world_mut(), 0xF130_0000_0000_0043);
+    app.world_mut().flush();
+    assert_eq!(app.world().resource::<TabardOpen>().npc(), None, "closed");
+    assert_eq!(preview(&app), None, "the close ended the open's preview");
+    crate::lanes::fire_in_order(app.world_mut());
+    let order: Vec<String> = eval(&mut app, false, "return Order");
+    assert_eq!(order, ["OPEN_TABARD_FRAME", "CLOSE_TABARD_FRAME"]);
+    assert_eq!(
+        preview(&app),
+        None,
+        "the open's preview ended with the close"
     );
 }

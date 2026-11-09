@@ -237,10 +237,9 @@ pub(crate) fn close_core(world: &mut World) {
     let Some(npc) = world.resource::<GossipState>().npc else {
         return;
     };
-    lane::behind_lane(world, |world| {
+    crate::lanes::step(world, |world| {
         crate::ui_session::release(world, npc);
         world.resource_mut::<GossipState>().npc = None;
-        crate::ui_session::note_closed(world, NpcWindow::Gossip);
         crate::ui_session::fire(world, |script| {
             script.fire_event("GOSSIP_CLOSED", vec![]);
         });

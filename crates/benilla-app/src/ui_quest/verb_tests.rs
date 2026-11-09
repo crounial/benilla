@@ -52,6 +52,10 @@ impl Client {
     /// [`Self::new`], with `NPC` streamed with `npc_flags`, or not at all for `None`.
     pub(crate) fn streaming(npc_flags: Option<u32>) -> Self {
         let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
+        // In the world with the interface up, so the dispatch fires each packet's lanes.
+        app.insert_resource(bevy::prelude::State::new(
+            crate::client_state::ClientState::InWorld,
+        ));
         let (tx, rx) = crossbeam_channel::unbounded();
         app.insert_resource(NetCommands(tx));
         let world = app.world_mut();
@@ -334,9 +338,6 @@ fn the_escort_confirm_is_on_the_wire_before_the_next_line() {
                 },
             )],
         );
-        world
-            .run_system_cached(crate::ui_quest_share::feed_quest_share)
-            .expect("the feed runs");
     }
     c.sent();
     c.run("ConfirmAcceptQuest() RandomRoll(1, 100)").unwrap();

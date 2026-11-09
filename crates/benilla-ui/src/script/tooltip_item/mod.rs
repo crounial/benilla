@@ -26,12 +26,15 @@ use build::{build_item, InFlight, ItemBuild};
 use names::quality_color;
 use render::BuilderFlags;
 
-/// The cached template; a miss records the ask and waits for its answer (`0x52b716`).
+/// The cached template as the build reads it at the call, its spell lines expanded and its
+/// reputation line gendered against the player as it stands (`0x5075f0` at `0x52da24`,
+/// `0x52d80f`); a miss is noted for the build, which asks it with the tooltip as the cookie
+/// inside its call and waits for its answer (`0x52b716`, [`build::ask_tooltip_records`]).
 fn view_of(lua: &Lua, item_id: u32) -> Option<ItemTemplateView> {
+    let live = crate::script::item_stats::live_record(lua, item_id);
     let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-    let v = model.item_templates.get(&item_id).cloned();
+    let v = live.unwrap_or_else(|| model.item_templates.get(&item_id).cloned());
     if v.is_none() && item_id != 0 {
-        model.item_stat_asks.insert(item_id);
         build::note_miss(&mut model, build::CacheWait::Template(item_id));
     }
     v
@@ -178,11 +181,22 @@ pub(super) fn owned_instance(
             .find(held_copy)
             .map(|s| slot_instance(s, false))
     };
+    // The worn slots now, by live id (`0x6228a0`): the doll's keys, and a slot's view read once,
+    // only where its item is this one.
+    let keys = crate::script::worn::worn_keys(lua, model);
+    let views: [std::cell::OnceCell<Option<crate::script::InvSlotView>>;
+        crate::script::INVENTORY_SLOT_COUNT] = Default::default();
+    let worn_view = |i: usize| -> Option<&crate::script::InvSlotView> {
+        keys.get(i)
+            .copied()
+            .flatten()
+            .filter(|&(_, id)| id == item_id)?;
+        views[i]
+            .get_or_init(|| crate::script::worn::worn_slot(lua, model, i))
+            .as_ref()
+    };
     let worn = |i: usize| {
-        model
-            .inventory_slots
-            .get(i)
-            .and_then(Option::as_ref)
+        worn_view(i)
             .filter(worn_copy)
             .map(|s| worn_instance(s, true))
     };
@@ -199,7 +213,7 @@ pub(super) fn owned_instance(
     if !summed {
         return Some(found);
     }
-    let worn_charges = model.inventory_slots.iter().skip(1).take(23).flatten();
+    let worn_charges = (1..crate::script::INVENTORY_SLOT_COUNT).filter_map(worn_view);
     let held_charges = bags
         .iter()
         .filter(|(b, _, _)| (0..=4).contains(b) || *b == super::char_stats::KEYRING_CONTAINER)
@@ -738,13 +752,15 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
                     .filter(|&n| n < super::trade::TRADE_SLOTS);
                 let source = {
                     let model = lua.app_data_ref::<Model>().expect("model app_data");
-                    let trade = model.trade.as_ref();
-                    let side = trade.map(|t| if player_side { &t.player } else { &t.target });
+                    // The slot as the getters read it at the call.
+                    let row =
+                        cell.and_then(|n| super::trade::slot_now(lua, &model, n + 1, player_side));
                     // The seventh slot alone proposes the spell cast on it (`0x534391`,
                     // `0x534598`, the block's `+0x40c`).
-                    let proposed = side
+                    let proposed = row
+                        .as_ref()
                         .filter(|_| slot0 == 6)
-                        .and_then(|s| s.slots[6].as_ref()?.enchantment.clone());
+                        .and_then(|s| s.enchantment.clone());
                     match player_side {
                         // The object's flags, creator and giver reach the LOCKED, wrapped and
                         // maker reads (`0x52bdb3`, `0x52b789`, `0x52e247`); the block's charges
@@ -763,25 +779,22 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
                         // The block carries the partner's lock id (`0x534563`), wrapped word
                         // (`0x534559`), gift creator (`0x534574`), creator (`0x53454f`), charges
                         // (`0x534595`) and durability (`0x5345b4`, `0x5345c0`).
-                        false => cell
-                            .and_then(|n| side?.slots[n].clone())
-                            .filter(|i| i.item_id != 0)
-                            .map(|item| {
-                                let inst = render::ItemInstance {
-                                    name: item.name.clone(),
-                                    block_lock_id: item.lock_id,
-                                    block_wrapped: item.wrapped,
-                                    gift_creator: item.gift_creator.clone(),
-                                    gift_creator_guid: item.gift_creator_guid,
-                                    creator: item.creator.clone(),
-                                    creator_guid: item.creator_guid,
-                                    proposed_enchant: proposed,
-                                    block_charges: Some(item.charges),
-                                    block_durability: item.durability,
-                                    ..Default::default()
-                                };
-                                (item.item_id, item.quality, inst)
-                            }),
+                        false => row.filter(|i| i.item_id != 0).map(|item| {
+                            let inst = render::ItemInstance {
+                                name: item.name.clone(),
+                                block_lock_id: item.lock_id,
+                                block_wrapped: item.wrapped,
+                                gift_creator: item.gift_creator.clone(),
+                                gift_creator_guid: item.gift_creator_guid,
+                                creator: item.creator.clone(),
+                                creator_guid: item.creator_guid,
+                                proposed_enchant: proposed,
+                                block_charges: Some(item.charges),
+                                block_durability: item.durability,
+                                ..Default::default()
+                            };
+                            (item.item_id, item.quality, inst)
+                        }),
                     }
                 };
                 let Some((item_id, quality, inst)) = source else {
@@ -817,13 +830,11 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
             // `is-number` else the client's `Invalid loot slot in SetInventoryItem`, its text
             // naming the other method (`0x855310`, `0x533528`).
             let slot = binding_abi::index_arg(lua, slot, "Invalid loot slot in SetInventoryItem")?;
+            // The row as the window holds it at the call (`0x533551`, `0x4c22a0`).
             let row = {
-                let model = lua.app_data_mut::<Model>().expect("model app_data");
-                model
-                    .loot
-                    .as_ref()
-                    .and_then(|l| slot.checked_sub(1).and_then(|n| l.rows.get(n)))
-                    .and_then(|r| r.clone())
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                super::loot::slot_now(lua, &model, slot)
+                    .flatten()
                     .filter(|r| !r.is_coin && r.item_id != 0)
             };
             let Some(row) = row else {
@@ -972,16 +983,11 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
             // (`0x855584`, `0x53559e`).
             let h = frame_handle_of(lua, &this)?;
             let index = binding_abi::index_arg(lua, index, "Usage: SetInboxItem(index)")?;
+            // `ftol(n) - 1` compared unsigned (`0x5355ce`, `0x5355d1`): 0 names no row. The row
+            // as the session holds it at the call.
             let row = {
-                let model = lua.app_data_mut::<Model>().expect("model app_data");
-                let Some(mail) = &model.mail else {
-                    return Ok(Value::Nil);
-                };
-                // `ftol(n) - 1` compared unsigned (`0x5355ce`, `0x5355d1`): 0 names no row.
-                index
-                    .checked_sub(1)
-                    .and_then(|i| mail.inbox.get(i))
-                    .cloned()
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                super::mail::row_now(lua, &model, index)
             };
             let Some(row) = row.filter(|r| r.item_id != 0) else {
                 return Ok(Value::Nil);
@@ -1023,23 +1029,20 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
                 binding_abi::string_arg(lua, kind, r#"Usage: SetAuctionItem("type", index)"#)?;
             let index =
                 binding_abi::index_arg(lua, index, r#"Usage: SetAuctionItem("type", index)"#)?;
-            let (item_id, roll, name, charges) = {
-                let model = lua.app_data_mut::<Model>().expect("model app_data");
-                let Some(auction) = &model.auction else {
-                    return Ok(Value::Nil);
-                };
-                let Some(list) = super::auction::list_index_of(&kind) else {
-                    return Ok(Value::Nil);
-                };
-                // `ftol(n) - 1` compared unsigned (`0x535933`, `0x535944`): 0 names no row.
-                match index
-                    .checked_sub(1)
-                    .and_then(|i| auction.lists[list].rows.get(i))
-                {
-                    Some(r) => (r.item_id, r.random_property_id, r.name.clone(), r.charges),
-                    None => (0, 0, None, -1),
-                }
+            let held = {
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                model.auction.is_some()
             };
+            let Some(list) = super::auction::list_index_of(&kind).filter(|_| held) else {
+                return Ok(Value::Nil);
+            };
+            // `ftol(n) - 1` compared unsigned (`0x535933`, `0x535944`): 0 names no row. The
+            // record is read at the call, as the getters read it.
+            let (item_id, roll, name, charges) =
+                match super::auction_live::live_row_at(lua, list, index) {
+                    Some(r) => (r.item_id, r.random_property_id, r.name, r.charges),
+                    None => (0, 0, None, -1),
+                };
             if item_id == 0 {
                 return Ok(Value::Nil);
             }

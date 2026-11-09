@@ -480,19 +480,26 @@ fn client(window: Window) -> Client {
 /// Wherever the frame's snapshots are current, every item getter answers the same off the cache
 /// and the objects as off the snapshot, across the bags, the bank, the worn slots, the trade and
 /// the mail: the fields the snapshots hold are the ones the live read derives
-/// ([`crate::ui_items::live::LiveItem`]). The inspected slots have no snapshot pushed, and read
-/// the visible block live ([`crate::ui_inspect::InspectLive`]); nor have the bags, which read
-/// nothing off the VM alone.
+/// ([`crate::ui_items::live::LiveItem`]). The worn slots have no snapshot pushed in game, and the
+/// test seats one ([`crate::ui_char::seat_doll_once`]). The inspected slots have none, and read
+/// the visible block live ([`crate::ui_inspect::InspectLive`]); nor have the bags, the trade or
+/// the mail ([`crate::ui_trade::TradeLive`], [`crate::ui_mail::MailLive`]), which read nothing off
+/// the VM alone.
 #[test]
 fn every_item_getter_answers_the_same_live_as_off_the_snapshot() {
     let mut c = client(Window::Trade);
+    // The doll's copy, which no feed pushes in game, seated for the host-less answer.
+    crate::ui_char::seat_doll_once(c.app.world_mut());
     let (mut snapshot, mut live) = (c.answers(false), c.answers(true));
     let mut c = client(Window::Mail);
+    crate::ui_char::seat_doll_once(c.app.world_mut());
     snapshot.extend(c.answers(false));
     live.extend(c.answers(true));
     // The fixture shows what it means to on every surface.
     let rolled = format!("Hitem:25:{ENCHANT}:{ROLL}:{SUFFIX}|h[Item 25 of the Bear]");
-    let bag = |l: &str| l.starts_with("GetContainerItem");
+    let bag = |l: &str| {
+        l.starts_with("GetContainerItem") || l.starts_with("GetTrade") || l.starts_with("GetInbox")
+    };
     for want in [
         "GetContainerItemInfo 0:1 Interface\\Icons\\INV_Sword_04,17,1,-1,nil",
         "GetContainerItemInfo 0:2 Interface\\Icons\\INV_Sword_04,2,1,-1,1",
@@ -526,9 +533,12 @@ fn every_item_getter_answers_the_same_live_as_off_the_snapshot() {
             "{at} links the roll: {read:#?}"
         );
     }
-    // Off the VM alone a bag getter returns nothing: no bag view stands in for the bags.
+    // Off the VM alone a bag, trade or inbox getter returns nothing: no view stands in for them.
     assert!(
-        snapshot.iter().filter(|l| bag(l)).all(|l| l.ends_with(' ')),
+        snapshot
+            .iter()
+            .filter(|l| bag(l))
+            .all(|l| l.ends_with(' ') || l.contains(" nil,nil,0,0,nil")),
         "{snapshot:#?}"
     );
     for want in [
@@ -554,8 +564,8 @@ fn every_item_getter_answers_the_same_live_as_off_the_snapshot() {
 }
 
 /// A stack a packet changed after the frame's pushes, and a record that landed after them, read
-/// as the object and the cache hold them now, through the host; the trade's snapshot still holds
-/// the push, the bags have none, and the live hit asks for nothing.
+/// as the object and the cache hold them now, through the host; off the VM alone the bags and the
+/// trade read none, and the live hit asks for nothing.
 #[test]
 fn an_item_getter_reads_the_object_and_the_cache_as_it_runs() {
     let mut c = client(Window::Trade);
@@ -572,7 +582,7 @@ fn an_item_getter_reads_the_object_and_the_cache_as_it_runs() {
     assert_eq!(live, (3, 3, Some("Item 99999".into())));
     assert!(c.item_queries().is_empty(), "a cached record asks nothing");
     let snapshot: (Option<i64>, i64, Option<String>) = c.eval(false, chunk);
-    assert_eq!(snapshot, (None, 17, None));
+    assert_eq!(snapshot, (None, 0, None));
 }
 
 /// The bag getters' per-call cost: 10k `GetContainerItemInfo` calls over the three filled backpack

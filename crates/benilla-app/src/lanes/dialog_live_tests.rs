@@ -15,7 +15,6 @@ use crossbeam_channel::{Receiver, Sender};
 
 use super::unit_view_tests::{created, wire_packets};
 use crate::net::ClientCommand;
-use crate::ui_dialog_verbs::DialogSignal;
 
 const ME: u64 = 0x7;
 /// An innkeeper, a pet trainer and a talent trainer in one, standing on us.
@@ -226,9 +225,9 @@ fn the_dialog_getters_read_the_world_through_the_host() {
     );
 }
 
-/// Each dialog's event goes on its lane at its handler, stamped there: a frame's packets fire in
-/// their order across the lanes, the talent trainer's notice between them, and a boot's line
-/// ahead of its stop (`0x5e4914`).
+/// Each dialog's event fires inside its packet's dispatch, with no frame after it: a frame's
+/// packets fire in their order across the lanes, the talent trainer's notice between them, and a
+/// boot's line ahead of its stop (`0x5e4914`).
 #[test]
 fn the_dialog_events_fire_at_their_packets() {
     let mut c = client();
@@ -244,31 +243,20 @@ fn the_dialog_events_fire_at_their_packets() {
         },
         SessionEvent::BinderConfirm { binder: NPC },
     ]);
-    let dialogs = c
+    assert!(c
         .app
         .world_mut()
         .resource_mut::<crate::ui_dialog_verbs::DialogLane>()
-        .take_stamped();
-    let notices: Vec<_> = c
-        .app
-        .world_mut()
-        .resource_mut::<crate::field_watch::NoticeLane>()
-        .drain_stamped()
-        .collect();
-    assert_eq!(dialogs.len(), 2);
+        .take_stamped()
+        .is_empty());
     assert_eq!(
-        dialogs[0].1,
-        DialogSignal::Event("CONFIRM_SUMMON".into(), vec![])
-    );
-    assert_eq!(
-        dialogs[1].1,
-        DialogSignal::ConfirmBinder { leaf: None },
-        "named by the area under the player"
-    );
-    assert_eq!(notices.len(), 1);
-    assert!(
-        dialogs[0].0 < notices[0].0 && notices[0].0 < dialogs[1].0,
-        "each stamped at its handler"
+        c.seen(),
+        [
+            "CONFIRM_SUMMON:nil",
+            "CONFIRM_TALENT_WIPE:100",
+            "CONFIRM_BINDER:your inn",
+        ],
+        "each inside its packet's dispatch, the binder named by the area under the player"
     );
 
     c.frame(vec![
@@ -348,14 +336,105 @@ fn the_unlearn_question_drops_past_the_range_gate() {
     );
 }
 
+/// Walking away from an innkeeper, a pet trainer or a talent trainer with its question open closes
+/// nothing: no engine path clears the latches (`0xc4d7c0`, `0xc4d7b0`, `0xc4d7a0`, written only
+/// at `0x5dfe64`, `0x5dfc41`, `0x5dfa21`), and each poll tests the latched NPC's range at the
+/// call (`0x5dff50`, `0x5dfd30`, `0x5dfb10`), so the stock `OnUpdate` hides the dialog
+/// (`StaticPopup.lua:1297`, `1313`, `1329`). Out of range the Accept sends nothing; back in range
+/// the poll holds again and the Accept answers the latched NPC (`0x5dfdc0`, `0x5dfba0`, `0x5df980`
+/// with a zero guid).
+#[test]
+fn walking_away_keeps_the_service_latches_and_the_polls_test_the_range() {
+    use crate::net::ClientCommand as C;
+    let mut c = client();
+    c.frame(vec![
+        vec![SessionEvent::BinderConfirm { binder: NPC }],
+        vec![SessionEvent::PetUnlearnConfirm {
+            trainer: NPC,
+            cost: 0,
+        }],
+        vec![SessionEvent::TalentWipeConfirm {
+            trainer: NPC,
+            cost: 0,
+        }],
+    ]);
+    assert_eq!(
+        c.seen(),
+        [
+            "CONFIRM_BINDER:your inn",
+            "CONFIRM_PET_UNLEARN:0",
+            "CONFIRM_TALENT_WIPE:0"
+        ]
+    );
+    const POLLS: &str =
+        "return CheckBinderDist(), CheckPetUntrainerDist(), CheckTalentMasterDist()";
+    type Polls = (Option<i64>, Option<i64>, Option<i64>);
+    assert_eq!(c.eval::<Polls>(true, POLLS), (Some(1), Some(1), Some(1)));
+    let latched = |c: &Client| {
+        let w = c.app.world();
+        (
+            w.resource::<crate::ui_binder::BinderState>().pending(),
+            w.resource::<crate::ui_dialog_verbs::PetUnlearnState>()
+                .pending(),
+            w.resource::<crate::ui_talent_wipe::TalentWipeState>()
+                .pending(),
+        )
+    };
+    let place = |c: &mut Client, x: f32| {
+        let npc = c.app.world().resource::<crate::net::GuidIndex>().0[&NPC];
+        c.app
+            .world_mut()
+            .get_mut::<Transform>(npc)
+            .unwrap()
+            .translation
+            .x = x;
+    };
+    let accept = |c: &mut Client| -> Vec<String> {
+        let _: () = c.eval(
+            true,
+            "ConfirmBinder() ConfirmPetUnlearn() ConfirmTalentWipe()",
+        );
+        c._sent
+            .try_iter()
+            .filter(|s| {
+                matches!(
+                    s,
+                    C::BinderActivate { .. } | C::PetUnlearn { .. } | C::TalentWipeConfirm { .. }
+                )
+            })
+            .map(|s| format!("{s:?}"))
+            .collect()
+    };
+
+    place(&mut c, 6.0);
+    c.frame(vec![]);
+    assert_eq!(
+        latched(&c),
+        (Some(NPC), Some(NPC), Some(NPC)),
+        "nothing closes"
+    );
+    assert_eq!(c.eval::<Polls>(true, POLLS), (None, None, None));
+    assert!(accept(&mut c).is_empty(), "out of range, no Accept sends");
+
+    place(&mut c, 5.0);
+    c.frame(vec![]);
+    assert_eq!(c.eval::<Polls>(true, POLLS), (Some(1), Some(1), Some(1)));
+    assert_eq!(
+        accept(&mut c),
+        [
+            format!("{:?}", C::BinderActivate { binder: NPC }),
+            format!("{:?}", C::PetUnlearn { trainer: NPC }),
+            format!("{:?}", C::TalentWipeConfirm { trainer: NPC }),
+        ]
+    );
+}
+
 /// A world-enter cascade and a `0x295` in one frame: the reset is the create's, ahead of the
 /// frame's later packets, so the rebuild stands (`0x4908c0` inside `0x5dea50`, then `0x4ca385`).
 #[test]
 fn a_rebuild_in_the_cascades_frame_stands() {
     let mut c = client();
-    c.app
-        .world_mut()
-        .write_message(crate::net::WorldEnterCascadeMessage);
+    crate::ui_world_enter::push_arrival(c.app.world_mut());
     c.frame(vec![vec![SessionEvent::MeetingStoneSetQueue {
         area: STORMWIND,
         status: 1,

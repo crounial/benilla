@@ -191,10 +191,10 @@ fn the_gossip_getters_read_the_world_at_the_call() {
     );
 }
 
-/// The draw's `GOSSIP_SHOW` sits on the gossip lane at the text's handler, between the stamps of
-/// the handlers before and after it.
+/// The draw's `GOSSIP_SHOW` fires inside the text's dispatch, with no frame after it: the
+/// handler's signal runs every listener before the next packet's handler (`0x537ae5`, `0x703e50`).
 #[test]
-fn the_show_is_stamped_at_its_handler() {
+fn the_show_fires_inside_its_dispatch() {
     let mut c = client();
     c.handle(vec![menu(7, "Browse")]);
     assert!(c
@@ -203,18 +203,18 @@ fn the_show_is_stamped_at_its_handler() {
         .resource::<crate::ui_gossip::GossipLane>()
         .stamped()
         .is_empty());
-    let before = crate::lanes::stamp();
+    c.seen();
     c.handle(vec![greeting(7, "Hello")]);
-    let after = crate::lanes::stamp();
-    let stamped = c
+    assert!(c
         .app
         .world()
         .resource::<crate::ui_gossip::GossipLane>()
-        .stamped();
-    assert_eq!(stamped.len(), 1);
-    let (at, event) = stamped[0];
-    assert_eq!(event, crate::ui_gossip::GossipEvent::Show);
-    assert!(before < at && at < after, "stamped inside the handler");
+        .stamped()
+        .is_empty());
+    assert!(
+        c.seen().iter().any(|s| s == "GOSSIP_SHOW:nil"),
+        "the show fired inside the dispatch"
+    );
 }
 
 /// A cached text shows at its message and a first visit at its text's arrival, each at its
@@ -409,5 +409,30 @@ fn stock_gossip_frame_stays_visible_through_a_first_visit_submenu() {
             "Goodbye".to_string(),
         ),
         "an in-place repaint"
+    );
+}
+
+/// `SMSG_GOSSIP_COMPLETE` closes the menu inside its handler (`0x4e1fa0` with a zero guid), whose
+/// release re-enters it (`0x4e1fc5` → `0x493310`): both `GOSSIP_CLOSED`s fire at the packet's
+/// place, after an earlier packet's chat line and ahead of a later one's, though the gossip lane
+/// holds nothing when the handler runs.
+#[test]
+fn a_server_close_fires_at_its_packet() {
+    let mut c = client();
+    c.frame(vec![vec![greeting(7, "Hello")], vec![menu(7, "Browse")]]);
+    assert_eq!(c.seen(), ["GOSSIP_SHOW:nil"]);
+    c.frame(vec![
+        vec![boar_says("a")],
+        vec![SessionEvent::GossipComplete],
+        vec![boar_says("b")],
+    ]);
+    assert_eq!(
+        c.seen(),
+        [
+            "CHAT_MSG_MONSTER_SAY:a",
+            "GOSSIP_CLOSED:nil",
+            "GOSSIP_CLOSED:nil",
+            "CHAT_MSG_MONSTER_SAY:b",
+        ]
     );
 }

@@ -1,30 +1,21 @@
 //! `MouselookStart`/`MouselookStop` against the look session: the latch and the session run as the
 //! frame runs them, with the VM's calls in between.
 
-use benilla_ui::script::{PlateGeometry, PlateState, UiScript};
+use benilla_ui::script::{BindingInput, HeldInput, UiScript};
 use bevy::ecs::system::RunSystemOnce;
 use bevy::math::DVec2;
+use bevy::window::PrimaryWindow;
+
+use crate::bindings::{BindingsState, Input};
 
 use super::super::camera_dynamics::{CameraOptions, SubjectState};
 use super::*;
 
-/// The app clock [`run_look_session`] reads. A release inside 200 ms is a click however far the
-/// mouse travelled, so a drag test has to step this past that window.
-#[derive(Resource)]
-struct LookNow(f32);
-
-impl Default for LookNow {
-    fn default() -> Self {
-        Self(0.0)
-    }
-}
-
-/// What the session's caller keeps between frames: the facing and the two click tests.
+/// What the session's caller keeps between frames: the facing and the armed click.
 #[derive(Resource, Default)]
 struct Hand {
     face_yaw: f32,
-    left: Option<PressGesture>,
-    right: Option<PressGesture>,
+    arm: crate::target::ClickArm,
     /// The session's answer: a motion reached the body's hand-off.
     handed: bool,
 }
@@ -35,15 +26,14 @@ fn look_frame(
     mut rig: ResMut<CameraControl>,
     cam: Single<&mut FlyCam>,
     window: Single<(&mut Window, &mut CursorOptions), With<PrimaryWindow>>,
-    mut clicks: (MessageWriter<WorldClick>, MessageWriter<WorldRightClick>),
     mut hand: ResMut<Hand>,
-    now: Res<LookNow>,
+    binds: Option<Res<BindingsState>>,
 ) {
     let (mut window, mut opts) = window.into_inner();
     let focused = window.focused;
     let mut cam = cam.into_inner();
     let hand = &mut *hand;
-    let both = rig.world_mouse.both();
+    let primaries = binds.as_deref().map(Primaries::of).unwrap_or_default();
     let dynamics = DynamicsInput {
         options: CameraOptions::default(),
         smooth_style: FollowStyle::default(),
@@ -54,22 +44,21 @@ fn look_frame(
     };
     hand.handed = run_look_session(
         &motion,
-        both,
         &mut rig,
         &mut cam,
         &mut hand.face_yaw,
         &mut window,
         &mut opts,
         false,
-        false,
-        &mut clicks.0,
-        &mut clicks.1,
-        &mut hand.left,
-        &mut hand.right,
+        &mut hand.arm,
         LookConfig::default(),
         &dynamics,
-        now.0,
         focused,
+        primaries,
+        binds
+            .as_deref()
+            .is_some_and(|b| super::super::input::command_word(b) != 0),
+        0.0,
     );
 }
 
@@ -81,9 +70,6 @@ fn world(over_ui: bool) -> World {
     world.insert_resource(crate::ui_script::PointerOverUi(over_ui));
     world.init_resource::<CameraControl>();
     world.init_resource::<Hand>();
-    world.init_resource::<LookNow>();
-    world.init_resource::<Messages<WorldClick>>();
-    world.init_resource::<Messages<WorldRightClick>>();
     world.spawn((
         Camera::default(),
         FlyCam {
@@ -95,9 +81,29 @@ fn world(over_ui: bool) -> World {
     let mut window = Window::default();
     window.set_physical_cursor_position(Some(DVec2::new(100.0, 100.0)));
     world.spawn((window, CursorOptions::default(), PrimaryWindow));
-    world.insert_non_send_resource(UiScript::new().unwrap());
+    // The interface: the `WorldFrame` under everything and, `over_ui`, a frame under the cursor.
+    let mut script = UiScript::new().unwrap();
+    script.set_screen_size(1024.0, 768.0);
+    script
+        .run(r#"WorldFrame = CreateFrame("WorldFrame", "WorldFrame") WorldFrame:SetAllPoints()"#)
+        .unwrap();
+    if over_ui {
+        script
+            .run(
+                r#"F = CreateFrame("Frame", "F")
+                F:SetPoint("BOTTOMLEFT", 50, 50) F:SetWidth(100) F:SetHeight(100) F:EnableMouse(true)"#,
+            )
+            .unwrap();
+    }
+    script.resolve();
+    script.mouse_move(AT.0, AT.1);
+    world.insert_non_send_resource(script);
+    world.init_resource::<BindingsState>();
     world
 }
+
+/// The cursor in the interface's units.
+const AT: (f32, f32) = (100.0, 100.0);
 
 /// One frame with the mouse moved by `dx` pixels: the latch, then the session, then the input
 /// planes age as bevy's do.
@@ -105,7 +111,9 @@ fn frame(world: &mut World, dx: f32) {
     world.resource_mut::<AccumulatedMouseMotion>().delta = Vec2::new(dx, 0.0);
     world.run_system_once(latch_world_mouse).unwrap();
     world.run_system_once(look_frame).unwrap();
+    world.run_system_once(focus_on_look_edges).unwrap();
     world.resource_mut::<ButtonInput<MouseButton>>().clear();
+    world.resource_mut::<BindingsState>().next_frame_for_test();
 }
 
 /// The OS gives the window focus or takes it.
@@ -142,12 +150,28 @@ fn looking(world: &World) -> bool {
     world.resource::<CameraControl>().is_looking()
 }
 
-fn is_mouselooking(world: &World) -> bool {
-    world
-        .non_send_resource::<UiScript>()
-        .eval::<Option<i64>>("return IsMouselooking()")
-        .unwrap()
-        == Some(1)
+/// `f` on the VM with the look's live reads lent, as the host lends them: the bindings' bit and
+/// the camera's freelook.
+fn with_look_reads<R>(world: &mut World, f: impl FnOnce(&mut UiScript) -> R) -> R {
+    struct Lent<'a, 'w>(&'a mut super::LookLive<'w>);
+    impl benilla_ui::script::LiveReader for Lent<'_, '_> {
+        fn read_live(&mut self, ask: &mut benilla_ui::script::live::LiveAsk<'_>) -> bool {
+            crate::script_calls::live::LiveFamily::answer(self.0, ask)
+        }
+    }
+    let mut script = world.remove_non_send_resource::<UiScript>().expect("a VM");
+    let mut state = bevy::ecs::system::SystemState::<super::LookLive>::new(world);
+    let mut live = state.get(world);
+    let r = script.reading(&mut Lent(&mut live), f);
+    world.insert_non_send_resource(script);
+    r
+}
+
+/// `IsMouselooking()` as a script reads it: the bindings' bit.
+fn is_mouselooking(world: &mut World) -> bool {
+    with_look_reads(world, |s| {
+        s.eval::<Option<i64>>("return IsMouselooking()").unwrap()
+    }) == Some(1)
 }
 
 fn yaw(world: &mut World) -> f32 {
@@ -162,12 +186,115 @@ fn cursor(world: &mut World) -> CursorOptions {
         .clone()
 }
 
-fn press(world: &mut World, b: MouseButton) {
-    world.resource_mut::<ButtonInput<MouseButton>>().press(b);
+/// The stock binding of a button run as the world frame's slot runs it, with no host lent: `BUTTON1`
+/// runs `CAMERAORSELECTORMOVE`, `BUTTON2` `TURNORACTION`, and the bodies' calls reach the bindings'
+/// state as the dispatch's tail hands them over.
+fn bound(world: &mut World, b: MouseButton, down: bool) {
+    let body = match (b, down) {
+        (MouseButton::Left, true) => "CameraOrSelectOrMoveStart()",
+        (MouseButton::Left, false) => "CameraOrSelectOrMoveStop()",
+        (_, true) => "TurnOrActionStart()",
+        (_, false) => "TurnOrActionStop()",
+    };
+    let inputs = {
+        let mut script = world.non_send_resource_mut::<UiScript>();
+        script.run_binding(body).unwrap();
+        script.take_binding_input()
+    };
+    let mut binds = world.resource_mut::<BindingsState>();
+    for input in inputs {
+        binds.apply_unhosted(input);
+    }
 }
 
+/// The interface's walk of a button record at the cursor, as the input records' feed runs it:
+/// where it went ([`benilla_ui::script::PointerTarget`]).
+fn walk(world: &mut World, b: MouseButton, down: bool) -> benilla_ui::script::PointerTarget {
+    let name = match b {
+        MouseButton::Left => "LeftButton",
+        _ => "RightButton",
+    };
+    with_look_reads(world, |s| s.mouse_button_to(AT.0, AT.1, name, down))
+}
+
+/// The buttons whose press ran the stock binding, as the dispatch latches them.
+#[derive(Resource, Default)]
+struct Latched(Vec<MouseButton>);
+
+/// A button goes down, the interface walks it, and the world frame runs the stock binding with no
+/// host lent when the press went to it: the press's target, the frame holding a button else the
+/// hover (`0x76637f`), or in freelook the world frame (`0x492bd9`). A press the feed consumed
+/// ahead of the walk (`PlayerUiPressConsumed`) runs nothing.
+fn press(world: &mut World, b: MouseButton) {
+    use benilla_ui::script::PointerTarget;
+    world.resource_mut::<ButtonInput<MouseButton>>().press(b);
+    let consumed = world
+        .get_resource::<crate::ui_script::PlayerUiPressConsumed>()
+        .is_some_and(|c| c.0);
+    let target = walk(world, b, true);
+    if !consumed && target == PointerTarget::World {
+        bound(world, b, true);
+        world.get_resource_or_init::<Latched>().0.push(b);
+    }
+}
+
+/// A button comes up, the interface walks it, and the stock binding's up-half runs as the
+/// dispatch runs it: for a press it latched unless a frame took the release, and for none when
+/// the release went to the world frame, in freelook through the hook (`0x492be5`).
 fn release(world: &mut World, b: MouseButton) {
+    use benilla_ui::script::PointerTarget;
     world.resource_mut::<ButtonInput<MouseButton>>().release(b);
+    let target = walk(world, b, false);
+    let latched = {
+        let mut latched = world.get_resource_or_init::<Latched>();
+        let was = latched.0.contains(&b);
+        latched.0.retain(|&l| l != b);
+        was
+    };
+    if target != PointerTarget::Ui && (latched || target == PointerTarget::World) {
+        bound(world, b, false);
+    }
+}
+
+/// A mouse turn sets mode bit 6 (`0x50fee9`), which a session with no motion leaves clear.
+#[test]
+fn a_mouse_turn_marks_the_camera_moved() {
+    let mut w = world(false);
+    lua(&mut w, "MouselookStart()");
+    frame(&mut w, 0.0);
+    assert!(w.resource::<CameraControl>().is_looking());
+    assert!(!w.resource::<CameraControl>().view_moved);
+    frame(&mut w, 40.0);
+    assert!(w.resource::<CameraControl>().view_moved);
+}
+
+/// Freelook's entry and its leave stop a view's pitch, yaw and bias (`0x50fe90`-`0x50fecd`,
+/// `0x50f978`-`0x50f984`), and a release out of freelook still does (`0x514c48`, `0x50fddb`).
+#[test]
+fn freelook_stops_a_views_flights() {
+    let arm = |rig: &mut CameraControl| {
+        rig.view_blend.arm_pitch_for_test();
+        rig.follow.arm_view(0.0, 1.0, 180.0);
+        rig.smart_pivot.ease_for_test();
+        assert!(rig.view_blend.pitch_in_flight(), "the pitch armed");
+        assert!(rig.follow.target_offset().is_some(), "the yaw armed");
+        assert!(rig.smart_pivot.easing_for_test(), "the bias armed");
+    };
+    let stopped = |rig: &CameraControl| {
+        !rig.view_blend.pitch_in_flight()
+            && rig.follow.target_offset().is_none()
+            && !rig.smart_pivot.easing_for_test()
+    };
+    let mut rig = CameraControl::default();
+    arm(&mut rig);
+    assert!(rig.enter_in_place(LookButton::Right));
+    assert!(stopped(&rig), "the entry");
+    arm(&mut rig);
+    assert!(rig.leave_in_place(false));
+    assert!(stopped(&rig), "the leave");
+    arm(&mut rig);
+    assert!(!rig.leave_in_place(false));
+    assert!(stopped(&rig), "out of freelook");
 }
 
 /// The right button's session, entered with no button: the mouse turns the camera and the body
@@ -176,7 +303,7 @@ fn release(world: &mut World, b: MouseButton) {
 fn mouselook_start_turns_the_camera_and_the_character_with_no_button_held() {
     let mut w = world(false);
     frame(&mut w, 0.0);
-    assert!(!is_mouselooking(&w));
+    assert!(!is_mouselooking(&mut w));
 
     lua(&mut w, "MouselookStart()");
     frame(&mut w, 40.0);
@@ -186,7 +313,6 @@ fn mouselook_start_turns_the_camera_and_the_character_with_no_button_held() {
         Some(LookButton::Right),
         "the right button's session"
     );
-    assert!(rig.freelook);
     let turned = yaw(&mut w);
     assert!(turned < 0.0, "the mouse turns the camera: {turned}");
     assert_eq!(
@@ -197,12 +323,40 @@ fn mouselook_start_turns_the_camera_and_the_character_with_no_button_held() {
     let c = cursor(&mut w);
     assert_eq!(c.grab_mode, CursorGrabMode::Locked);
     assert!(!c.visible);
-    assert!(is_mouselooking(&w));
+    assert!(is_mouselooking(&mut w));
 
     // It holds with no button while the mouse keeps moving.
     frame(&mut w, 40.0);
     assert!(yaw(&mut w) < turned);
     assert!(w.resource::<CameraControl>().is_looking());
+}
+
+/// A freelook the session enters outside any call, a `MouselookStart` made with no host lent,
+/// moves the mouse focus to the world frame right after it (`0x493085`), and its leave has the
+/// hover picked again (`0x4930a0`), so the VM's next update gives it back.
+#[test]
+fn a_freelook_entered_at_the_frame_moves_the_mouse_focus_and_its_leave_gives_it_back() {
+    let mut w = world(true);
+    let focus = |w: &mut World| {
+        w.non_send_resource::<UiScript>()
+            .eval::<String>("return GetMouseFocus():GetName()")
+            .unwrap()
+    };
+    assert_eq!(focus(&mut w), "F");
+    lua(&mut w, "MouselookStart()");
+    assert_eq!(
+        focus(&mut w),
+        "F",
+        "the call made no entry with no host lent"
+    );
+    frame(&mut w, 0.0);
+    assert!(looking(&w));
+    assert_eq!(focus(&mut w), "WorldFrame");
+    lua(&mut w, "MouselookStop()");
+    frame(&mut w, 0.0);
+    assert!(!looking(&w));
+    w.non_send_resource_mut::<UiScript>().tick(0.0);
+    assert_eq!(focus(&mut w), "F");
 }
 
 /// A right press over bare world that the UI consumed, as a layout-mode Alt press is
@@ -258,7 +412,108 @@ fn mouselook_stop_ends_the_session() {
     let c = cursor(&mut w);
     assert_eq!(c.grab_mode, CursorGrabMode::None);
     assert!(c.visible);
-    assert!(!is_mouselooking(&w));
+    assert!(!is_mouselooking(&mut w));
+}
+
+/// A freelook a call enters and leaves inside it ([`LookSteps::call`]) hands the OS cursor at the
+/// frames after: the session locks and hides it, then frees it and puts it back where the look
+/// began.
+#[test]
+fn a_freelook_left_inside_its_call_gives_the_cursor_back_at_the_frame() {
+    use benilla_ui::script::LookCall;
+    let call = |w: &mut World, c: LookCall| {
+        w.run_system_once(move |mut steps: LookSteps| steps.call(c))
+            .unwrap()
+    };
+    let mut w = world(false);
+    let began = pointer(&mut w);
+    assert!(call(&mut w, LookCall::Mouselook(true)).entered);
+    frame(&mut w, 0.0);
+    let c = cursor(&mut w);
+    assert_eq!(c.grab_mode, CursorGrabMode::Locked);
+    assert!(!c.visible);
+    w.query::<&mut Window>()
+        .single_mut(&mut w)
+        .unwrap()
+        .set_cursor_position(Some(Vec2::new(10.0, 10.0)));
+
+    call(&mut w, LookCall::Mouselook(false));
+    assert!(!looking(&w), "left inside the call");
+    frame(&mut w, 0.0);
+    let c = cursor(&mut w);
+    assert_eq!(c.grab_mode, CursorGrabMode::None);
+    assert!(c.visible);
+    assert_eq!(pointer(&mut w), began, "back where the look began");
+}
+
+/// A key bound to `TurnOrAction` holds the bit with no button down: the freelook its press entered
+/// inside its call ([`LookSteps::bound`]) lasts through the frame's session while the binding holds
+/// the bit (`[InputControl+4] & 1`), and ends with its release.
+#[test]
+fn a_freelook_a_bound_key_holds_lasts_with_no_button_down() {
+    let mut w = world(false);
+    w.insert_resource(BindingsState::after_calls(
+        vec![],
+        vec![BindingInput::Start(HeldInput::TurnOrAction)],
+    ));
+    let entered = w
+        .run_system_once(|mut steps: LookSteps| {
+            let start = BindingInput::Start(HeldInput::TurnOrAction);
+            steps.bound(start, PrimaryBits::default(), None)
+        })
+        .unwrap()
+        .entered;
+    assert!(entered);
+    // The session takes the cursor, then the mouse turns the camera.
+    frame(&mut w, 0.0);
+    frame(&mut w, 40.0);
+    assert!(looking(&w), "the bound bit holds the session");
+    assert_ne!(yaw(&mut w), 0.0, "and the mouse turns the camera");
+
+    w.insert_resource(BindingsState::after_calls(
+        vec![BindingInput::Start(HeldInput::TurnOrAction)],
+        vec![BindingInput::Stop(HeldInput::TurnOrAction)],
+    ));
+    frame(&mut w, 0.0);
+    assert!(!looking(&w), "its release ends it");
+}
+
+/// Deviation: a binding start that names a nameplate marks the look, and a second primary spends
+/// the click.
+#[test]
+fn a_plate_press_marks_the_look_and_a_second_primary_spends_it() {
+    let mut w = world(false);
+    let looked = w
+        .run_system_once(|mut steps: LookSteps| {
+            steps.bound(
+                BindingInput::Start(HeldInput::CameraOrSelectOrMove),
+                PrimaryBits::default(),
+                Some(0x31),
+            )
+        })
+        .unwrap();
+    assert!(looked.entered);
+    assert!(looked.keep_plate_mouse);
+    let rig = w.resource::<CameraControl>();
+    assert!(rig.plate_orbit);
+    assert_eq!(rig.plate_key, Some(0x31));
+    assert!(!rig.plate_drag);
+
+    w.run_system_once(|mut steps: LookSteps| {
+        steps.bound(
+            BindingInput::Start(HeldInput::TurnOrAction),
+            PrimaryBits {
+                any: true,
+                this: false,
+            },
+            Some(0x31),
+        );
+    })
+    .unwrap();
+    let rig = w.resource::<CameraControl>();
+    assert!(rig.plate_drag);
+    assert!(rig.plate_key.is_none());
+    assert!(rig.plate_orbit);
 }
 
 /// CustomNameplates' steer: a right press a plate took calls `MouselookStart`, and the button's
@@ -277,28 +532,116 @@ fn the_right_release_ends_a_mouselook_its_press_started_on_the_ui() {
     lua(&mut w, "MouselookStart()");
     frame(&mut w, 40.0);
     assert_eq!(w.resource::<CameraControl>().look, Some(LookButton::Right));
-    assert!(is_mouselooking(&w));
+    assert!(is_mouselooking(&mut w));
 
     release(&mut w, MouseButton::Right);
     frame(&mut w, 0.0);
     assert_eq!(w.resource::<CameraControl>().look, None);
-    assert!(!is_mouselooking(&w));
+    assert!(!is_mouselooking(&mut w));
     assert!(
-        w.resource::<Messages<WorldRightClick>>().is_empty(),
-        "no click was armed"
+        left_click_arms(&mut w),
+        "the release freed the command's bit"
     );
 }
 
-/// The loading cover's world enter clears the whole word (`0x5144c0`).
+/// The interface under the cursor changes: `chunk` runs, and the hover walks the cursor again.
+fn reshape(world: &mut World, chunk: &str) {
+    let mut script = world.non_send_resource_mut::<UiScript>();
+    script.run(chunk).unwrap();
+    script.resolve();
+    script.mouse_move(AT.0, AT.1);
+}
+
+/// A right drag's bit outlives a frame appearing under the locked cursor, and the chord's second
+/// button joins the drag there: the world frame holds the press, so the left press goes to it
+/// (`0x76637f`), not to the frame under the cursor, and runs its binding, the both-button run.
+#[test]
+fn a_frame_appearing_under_a_drag_neither_ends_it_nor_takes_the_chord() {
+    let mut w = world(false);
+    press(&mut w, MouseButton::Right);
+    frame(&mut w, 0.0);
+    assert_eq!(w.resource::<CameraControl>().look, Some(LookButton::Right));
+    reshape(
+        &mut w,
+        r#"PRESSED = 0
+        F = CreateFrame("Frame", "F")
+        F:SetPoint("BOTTOMLEFT", 50, 50) F:SetWidth(100) F:SetHeight(100) F:EnableMouse(true)
+        F:SetScript("OnMouseDown", function() PRESSED = PRESSED + 1 end)"#,
+    );
+    frame(&mut w, 40.0);
+    frame(&mut w, 40.0);
+    assert!(looking(&w), "the drag outlives the frame");
+    assert!(w.resource::<BindingsState>().pressed(Input::TurnOrAction));
+    press(&mut w, MouseButton::Left);
+    frame(&mut w, 0.0);
+    assert!(
+        w.resource::<BindingsState>().steering(),
+        "the chord joined the drag"
+    );
+    let pressed = w
+        .non_send_resource::<UiScript>()
+        .eval::<i64>("return PRESSED")
+        .unwrap();
+    assert_eq!(pressed, 0, "the frame under the cursor saw no press");
+}
+
+/// A press while a frame holds a button goes to that frame (`0x76637f`), wherever the cursor is:
+/// a right press over the world after a left press went to a frame runs no binding.
+#[test]
+fn a_press_while_a_frame_holds_a_button_goes_to_that_frame() {
+    let mut w = world(true);
+    press(&mut w, MouseButton::Left);
+    reshape(
+        &mut w,
+        "F:ClearAllPoints() F:SetPoint(\"BOTTOMLEFT\", 500, 500)",
+    );
+    press(&mut w, MouseButton::Right);
+    frame(&mut w, 40.0);
+    assert!(!looking(&w));
+    assert!(!w.resource::<BindingsState>().pressed(Input::TurnOrAction));
+}
+
+/// Whether a left press's `CameraOrSelectOrMoveStart` arms a world click, which it does only with
+/// neither primary bit held (`0x51481a`).
+fn left_click_arms(w: &mut World) -> bool {
+    use benilla_ui::script::{ClickCall, ClickMode};
+    let mut script = w.non_send_resource_mut::<UiScript>();
+    script.take_click_calls();
+    script
+        .run_binding("CameraOrSelectOrMoveStart() CameraOrSelectOrMoveStop()")
+        .unwrap();
+    script.take_click_calls().first() == Some(&ClickCall::Arm(ClickMode::Select))
+}
+
+/// The loading cover's world enter clears the whole word (`0x5144c0`): the look session and the
+/// commands' bits, so a left click after it clicks.
 #[test]
 fn the_cover_ends_a_scripted_mouselook() {
     let mut w = world(false);
     lua(&mut w, "MouselookStart()");
     frame(&mut w, 0.0);
+    assert!(!left_click_arms(&mut w), "the mouselook holds the bit");
     w.insert_resource(crate::loading_screen::LoadingScreen::test_covering());
     frame(&mut w, 0.0);
     assert_eq!(w.resource::<CameraControl>().look, None);
-    assert!(!is_mouselooking(&w));
+    assert!(!is_mouselooking(&mut w));
+    assert!(left_click_arms(&mut w), "the cover cleared the bit");
+}
+
+/// A right button held across a zone: the cover clears its command's bit, so a left click after
+/// the zone clicks though the right release never came.
+#[test]
+fn the_cover_frees_the_clicks_of_a_right_held_across_a_zone() {
+    let mut w = world(false);
+    press(&mut w, MouseButton::Right);
+    binding(&mut w, "TurnOrActionStart()");
+    frame(&mut w, 0.0);
+    assert!(!left_click_arms(&mut w), "the right command holds its bit");
+    w.insert_resource(crate::loading_screen::LoadingScreen::test_covering());
+    frame(&mut w, 0.0);
+    w.remove_resource::<crate::loading_screen::LoadingScreen>();
+    frame(&mut w, 0.0);
+    assert!(left_click_arms(&mut w), "the cover cleared the bit");
 }
 
 /// A session across a focus loss: the look state stays as the deactivate leaves it (`0x514490`
@@ -318,7 +661,7 @@ fn a_session_survives_focus_loss(start: impl Fn(&mut World)) {
         Some(LookButton::Right),
         "the session outlives the focus"
     );
-    assert!(is_mouselooking(&w));
+    assert!(is_mouselooking(&mut w));
     let c = cursor(&mut w);
     assert_eq!(c.grab_mode, CursorGrabMode::None, "the OS pointer is free");
     assert!(c.visible);
@@ -342,7 +685,7 @@ fn a_session_survives_focus_loss(start: impl Fn(&mut World)) {
     );
     frame(&mut w, 40.0);
     assert!(yaw(&mut w) < before, "and the mouse turns the view again");
-    assert!(is_mouselooking(&w));
+    assert!(is_mouselooking(&mut w));
 }
 
 #[test]
@@ -373,7 +716,7 @@ fn mouselook_stop_while_unfocused_ends_it_and_the_focus_takes_nothing_back() {
     lua(&mut w, "MouselookStop()");
     frame(&mut w, 0.0);
     assert_eq!(w.resource::<CameraControl>().look, None);
-    assert!(!is_mouselooking(&w));
+    assert!(!is_mouselooking(&mut w));
     assert_eq!(pointer(&mut w), Some(away), "no warp back to the stash");
 
     focus(&mut w, true);
@@ -384,60 +727,76 @@ fn mouselook_stop_while_unfocused_ends_it_and_the_focus_takes_nothing_back() {
     assert!(!w.resource::<CameraControl>().is_looking());
 }
 
-/// One bit, whoever set it: `MouselookStop` ends a right drag in flight and disarms its click, so
-/// the release after it selects nothing (`0x514810(0)`, then `0x515090(1, 0, …)`).
+/// One bit, whoever set it: `MouselookStop` ends a right drag in flight (`0x515090(1, 0, …)`); its
+/// disarm of the click is the VM's (`0x514810(0)`).
 #[test]
-fn mouselook_stop_ends_a_right_drag_and_its_release_clicks_nothing() {
+fn mouselook_stop_ends_a_right_drag() {
     let mut w = world(false);
     press(&mut w, MouseButton::Right);
     frame(&mut w, 0.0);
-    assert!(
-        w.resource::<Hand>().right.is_some(),
-        "the press armed a click"
-    );
+    assert_eq!(w.resource::<CameraControl>().look, Some(LookButton::Right));
 
     lua(&mut w, "MouselookStop()");
     frame(&mut w, 0.0);
     assert_eq!(w.resource::<CameraControl>().look, None);
-    assert!(!is_mouselooking(&w));
+    assert!(!is_mouselooking(&mut w));
     release(&mut w, MouseButton::Right);
     frame(&mut w, 0.0);
-    assert!(w.resource::<Messages<WorldRightClick>>().is_empty());
-    assert!(!is_mouselooking(&w));
-
-    // The control: the same press and release with no stop is a click.
-    let mut w = world(false);
-    press(&mut w, MouseButton::Right);
-    frame(&mut w, 0.0);
-    release(&mut w, MouseButton::Right);
-    frame(&mut w, 0.0);
-    assert_eq!(w.resource::<Messages<WorldRightClick>>().len(), 1);
+    assert!(!is_mouselooking(&mut w));
 }
 
-/// `MouselookStart` under a left drag sets the other primary channel: the both-button run, its
-/// rise, and the left click disarmed; the left release hands the session to the mouselook.
+/// The right drag's bit is the one `MouselookStop` and `ToggleMouseMove` act on, inside their
+/// calls, with `BUTTON2` bound to `TURNORACTION`: the stop clears it and leaves (`0x514240` →
+/// `0x514b70` → `0x514c48`), and a toggle leaves with the bit still held. Neither is entered again
+/// while the button stays down: only the first primary press enters (`0x51490a`).
+#[test]
+fn a_right_drag_left_inside_a_call_is_not_entered_again_while_held() {
+    use benilla_ui::script::LookCall;
+    let call = |w: &mut World, c: LookCall| {
+        w.run_system_once(move |mut steps: LookSteps| steps.call(c))
+            .unwrap()
+    };
+    for leave in [LookCall::Mouselook(false), LookCall::ToggleMouseMove] {
+        let mut w = world(false);
+        press(&mut w, MouseButton::Right);
+        frame(&mut w, 0.0);
+        assert!(looking(&w), "{leave:?}: the drag entered");
+
+        assert!(call(&mut w, leave).left, "{leave:?}: left inside the call");
+        frame(&mut w, 40.0);
+        frame(&mut w, 40.0);
+        assert!(!looking(&w), "{leave:?}: the held button enters nothing");
+        release(&mut w, MouseButton::Right);
+        frame(&mut w, 0.0);
+        press(&mut w, MouseButton::Right);
+        frame(&mut w, 0.0);
+        assert!(looking(&w), "{leave:?}: the next press enters");
+    }
+}
+
+/// `MouselookStart` under a left drag sets the other primary channel: the both-button run and its
+/// rise; the left release hands the session to the mouselook. The left click's disarm is the
+/// VM's (`0x514ac1`).
 #[test]
 fn mouselook_start_under_a_left_drag_is_the_both_button_run() {
     let mut w = world(false);
     press(&mut w, MouseButton::Left);
     frame(&mut w, 0.0);
     assert_eq!(w.resource::<CameraControl>().look, Some(LookButton::Left));
-    assert!(w.resource::<Hand>().left.is_some());
 
     lua(&mut w, "MouselookStart()");
     w.resource_mut::<AccumulatedMouseMotion>().delta = Vec2::new(40.0, 0.0);
     w.run_system_once(latch_world_mouse).unwrap();
     {
-        let wm = &w.resource::<CameraControl>().world_mouse;
-        assert!(wm.both(), "both channels held");
-        assert!(wm.rose(), "the transition into the run (0x514a73)");
+        let binds = w.resource::<BindingsState>();
+        assert!(binds.steering(), "both primary bits held");
+        assert!(
+            binds.steering_began(),
+            "the transition into the run (0x514a73)"
+        );
     }
     w.run_system_once(look_frame).unwrap();
     w.resource_mut::<ButtonInput<MouseButton>>().clear();
-    assert!(
-        w.resource::<Hand>().left.is_none(),
-        "the left click disarmed"
-    );
     let cam_yaw = yaw(&mut w);
     assert!(cam_yaw < 0.0);
     assert_eq!(
@@ -449,338 +808,53 @@ fn mouselook_start_under_a_left_drag_is_the_both_button_run() {
     release(&mut w, MouseButton::Left);
     frame(&mut w, 0.0);
     assert_eq!(w.resource::<CameraControl>().look, Some(LookButton::Right));
-    assert!(w.resource::<Messages<WorldClick>>().is_empty());
 }
 
-/// The unit a plate stands for. A hash would hide the value the orbit must keep.
-const PLATE_UNIT: u64 = 0x00F1_3000_0000_0045;
-
-/// `PointerOverUi` with a live plate under the cursor, as the arbiter and the widget layer leave
-/// them on the press frame.
-fn nameplate(over_ui: bool) -> World {
-    let mut world = world(over_ui);
-    let mut script = world.non_send_resource_mut::<UiScript>();
-    script.set_screen_size(1024.0, 768.0);
-    script
-        .run(r#"WorldFrame = CreateFrame("WorldFrame", "WorldFrame") WorldFrame:SetAllPoints()"#)
-        .unwrap();
-    script.resolve();
-    script.sync_nameplates(
-        PlateGeometry {
-            width: 128.0,
-            height: 32.0,
-            bar_off_x: 4.0,
-            bar_off_y: 4.0,
-            bar_width: 103.0,
-            bar_height: 9.0,
-            level_off_x: 11.8,
-            level_off_y: 9.1,
-            skull_size: 12.8,
-            raid_size: 25.6,
-            name_height: 12.8,
-            level_height: 11.0,
-            shadow_offset: 1.0,
-        },
-        &[PlateState {
-            key: PLATE_UNIT,
-            top_centre: (500.0, 400.0),
-            health: 30.0,
-            max_health: 40.0,
-            bar_colour: [1.0, 0.0, 0.0],
-            name: "Wolf".into(),
-            level: Some(12),
-            skull: false,
-            level_colour: [1.0, 1.0, 0.0],
-            raid_icon: None,
-            alpha: 255,
-            lit: false,
-            hovered: false,
-        }],
-    );
-    script.resolve();
-    // The plate hangs below its top centre; this is its middle.
-    script.mouse_move(500.0, 384.0);
-    assert_eq!(
-        script.hovered_nameplate(),
-        Some(PLATE_UNIT),
-        "the fixture must actually be hovering the plate"
-    );
-    world
-}
-
-fn at(world: &mut World, secs: f32) {
-    world.resource_mut::<LookNow>().0 = secs;
-}
-
-/// A left press on a nameplate orbits. Moving the mouse turns the camera, and the release is not
-/// a world click (that ray would miss the plate and deselect). Past the click window the plate's
-/// unit is not selected either.
+/// A new camera's mode word holds no freelook bit (`0x50c156`), so a `ToggleMouseMove` session,
+/// which no button holds, ends at a `/reload`: the leave shows the cursor (`0x490bb6`) and the
+/// frame's teardown drops the relative mouse (`0x481d4d`).
 #[test]
-fn a_left_drag_from_a_nameplate_orbits_without_a_world_click() {
-    let mut w = nameplate(true);
-    press(&mut w, MouseButton::Left);
-    at(&mut w, 0.0);
-    frame(&mut w, 0.0);
-    assert_eq!(
-        w.resource::<CameraControl>().look,
-        Some(LookButton::Left),
-        "the press starts the orbit even though the plate owns the pointer"
-    );
-
-    // Off the plate before the release: the unit is the one under the press, not the release.
-    w.non_send_resource_mut::<UiScript>().mouse_move(1.0, 1.0);
-    at(&mut w, 0.25);
-    frame(&mut w, 40.0);
-    assert!(
-        yaw(&mut w) < 0.0,
-        "dragging turns the camera: {}",
-        yaw(&mut w)
-    );
-
-    // The widget records the mouse-up before the orbit classifies it. A drag must not keep it.
-    {
-        let mut script = w.non_send_resource_mut::<UiScript>();
-        script.mouse_button(500.0, 384.0, "LeftButton", true);
-        script.mouse_button(500.0, 384.0, "LeftButton", false);
-    }
-    release(&mut w, MouseButton::Left);
-    at(&mut w, 0.50);
-    frame(&mut w, 0.0);
-    assert!(w.resource::<Messages<WorldClick>>().is_empty());
-    assert!(
-        w.resource::<CameraControl>().plate_select.is_empty(),
-        "a drag past the click window does not select the plate"
-    );
-    assert!(w.resource::<CameraControl>().suppress_plate_click);
-    w.non_send_resource_mut::<UiScript>()
-        .drop_nameplate_left_clicks();
-    assert!(
-        w.non_send_resource_mut::<UiScript>()
-            .take_nameplate_clicks()
-            .is_empty(),
-        "the widget's mouse-up does not select after a drag"
-    );
-    assert_eq!(w.resource::<CameraControl>().look, None);
-}
-
-/// The plate widget recorded the click on its own. The orbit must not queue a second select.
-#[test]
-fn a_nameplate_click_the_widget_recorded_is_not_queued_again() {
-    let mut w = nameplate(true);
-    press(&mut w, MouseButton::Left);
-    at(&mut w, 0.0);
-    frame(&mut w, 0.0);
-    {
-        let mut script = w.non_send_resource_mut::<UiScript>();
-        script.mouse_button(500.0, 384.0, "LeftButton", true);
-        script.mouse_button(500.0, 384.0, "LeftButton", false);
-    }
-    release(&mut w, MouseButton::Left);
-    at(&mut w, 0.05);
-    frame(&mut w, 0.0);
-    assert!(
-        w.resource::<CameraControl>().plate_select.is_empty(),
-        "the widget click is the one select"
-    );
-    let clicks = w
-        .non_send_resource_mut::<UiScript>()
-        .take_nameplate_clicks();
-    assert_eq!(clicks.len(), 1);
-    assert_eq!(clicks[0].key, PLATE_UNIT);
-    assert!(w.resource::<Messages<WorldClick>>().is_empty());
-}
-
-/// A left press and release on a nameplate, with the mouse still, names that unit and does not
-/// emit a world click.
-#[test]
-fn a_left_click_on_a_nameplate_selects_its_unit() {
-    let mut w = nameplate(true);
-    press(&mut w, MouseButton::Left);
-    at(&mut w, 0.0);
-    frame(&mut w, 0.0);
-    w.non_send_resource_mut::<UiScript>().mouse_move(1.0, 1.0);
-
-    release(&mut w, MouseButton::Left);
-    at(&mut w, 0.05);
-    frame(&mut w, 0.0);
-    assert_eq!(w.resource::<CameraControl>().plate_select, vec![PLATE_UNIT]);
-    assert!(w.resource::<Messages<WorldClick>>().is_empty());
-    assert_eq!(yaw(&mut w), 0.0, "a still click does not turn the camera");
-}
-
-/// The same left press in empty world still selects through the world click.
-#[test]
-fn a_left_click_in_the_world_still_emits_a_world_click() {
+fn a_reload_ends_a_toggled_session_and_gives_the_cursor_back() {
     let mut w = world(false);
-    press(&mut w, MouseButton::Left);
+    lua(&mut w, "ToggleMouseMove()");
     frame(&mut w, 0.0);
-    release(&mut w, MouseButton::Left);
-    at(&mut w, 0.05);
+    assert!(looking(&w));
+    assert_eq!(cursor(&mut w).grab_mode, CursorGrabMode::Locked);
+    crate::player::rebuild_camera(&mut w);
+    assert!(!looking(&w));
+    assert!(!w.resource::<CameraControl>().toggled);
     frame(&mut w, 0.0);
-    assert_eq!(w.resource::<Messages<WorldClick>>().len(), 1);
-    assert!(w.resource::<CameraControl>().plate_select.is_empty());
-}
-
-/// A right press on a nameplate turns. Moving the mouse turns the camera and the body, and the
-/// release is not a world right-click. Past the click window the plate's own right-click is
-/// dropped too.
-#[test]
-fn a_right_drag_from_a_nameplate_turns_without_a_world_right_click() {
-    let mut w = nameplate(true);
-    press(&mut w, MouseButton::Right);
-    at(&mut w, 0.0);
-    frame(&mut w, 0.0);
-    assert_eq!(
-        w.resource::<CameraControl>().look,
-        Some(LookButton::Right),
-        "the press starts the turn even though the plate owns the pointer"
-    );
-    assert!(
-        w.resource::<CameraControl>().plate_orbit,
-        "the turn began on the plate, so the plate keeps the mouse until it is a drag"
-    );
-
-    w.non_send_resource_mut::<UiScript>().mouse_move(1.0, 1.0);
-    at(&mut w, 0.25);
-    frame(&mut w, 40.0);
-    let turned = yaw(&mut w);
-    assert!(turned < 0.0, "dragging turns the camera: {turned}");
-    assert_eq!(
-        w.resource::<Hand>().face_yaw,
-        turned,
-        "a right drag turns the body with the camera"
-    );
-    assert!(
-        w.resource::<CameraControl>().plate_drag,
-        "past the click window the plate gives the mouse up"
-    );
-
-    {
-        let mut script = w.non_send_resource_mut::<UiScript>();
-        script.mouse_button(500.0, 384.0, "RightButton", true);
-        script.mouse_button(500.0, 384.0, "RightButton", false);
-    }
-    release(&mut w, MouseButton::Right);
-    at(&mut w, 0.50);
-    frame(&mut w, 0.0);
-    assert!(w.resource::<Messages<WorldRightClick>>().is_empty());
-    assert!(
-        w.resource::<CameraControl>().suppress_plate_right_click,
-        "a drag past the click window does not act on the plate"
-    );
-    w.non_send_resource_mut::<UiScript>()
-        .drop_nameplate_right_clicks();
-    assert!(
-        w.non_send_resource_mut::<UiScript>()
-            .take_nameplate_clicks()
-            .is_empty(),
-        "the widget's mouse-up does not act after a drag"
-    );
-    assert_eq!(w.resource::<CameraControl>().look, None);
-}
-
-/// The plate widget recorded the right-click. The turn must not also emit a world right-click.
-#[test]
-fn a_right_click_the_widget_recorded_is_not_also_a_world_right_click() {
-    let mut w = nameplate(true);
-    press(&mut w, MouseButton::Right);
-    at(&mut w, 0.0);
-    frame(&mut w, 0.0);
-    {
-        let mut script = w.non_send_resource_mut::<UiScript>();
-        script.mouse_button(500.0, 384.0, "RightButton", true);
-        script.mouse_button(500.0, 384.0, "RightButton", false);
-    }
-    release(&mut w, MouseButton::Right);
-    at(&mut w, 0.05);
-    frame(&mut w, 0.0);
-    assert!(
-        w.resource::<Messages<WorldRightClick>>().is_empty(),
-        "the widget click is the one right-click"
-    );
-    let clicks = w
-        .non_send_resource_mut::<UiScript>()
-        .take_nameplate_clicks();
-    assert_eq!(clicks.len(), 1);
-    assert_eq!(clicks[0].key, PLATE_UNIT);
-    assert_eq!(clicks[0].button, "RightButton");
-}
-
-/// A right press and release on a nameplate, with the mouse still and the widget missing the
-/// mouse-up, still emits the world right-click the plate's action reads.
-#[test]
-fn a_right_click_on_a_nameplate_the_widget_missed_still_acts() {
-    let mut w = nameplate(true);
-    press(&mut w, MouseButton::Right);
-    at(&mut w, 0.0);
-    frame(&mut w, 0.0);
-    w.non_send_resource_mut::<UiScript>().mouse_move(1.0, 1.0);
-
-    release(&mut w, MouseButton::Right);
-    at(&mut w, 0.05);
-    frame(&mut w, 0.0);
-    assert_eq!(w.resource::<Messages<WorldRightClick>>().len(), 1);
-    assert!(w.resource::<CameraControl>().plate_select.is_empty());
-    assert_eq!(yaw(&mut w), 0.0, "a still click does not turn the camera");
-}
-
-/// A panel and the dev overlay still take both buttons.
-#[test]
-fn a_panel_and_the_dev_overlay_still_take_the_press() {
-    let mut panel = world(true);
-    press(&mut panel, MouseButton::Left);
-    frame(&mut panel, 40.0);
-    assert_eq!(
-        panel.resource::<CameraControl>().look,
-        None,
-        "a panel still eats the left press"
-    );
-
-    let mut panel_right = world(true);
-    press(&mut panel_right, MouseButton::Right);
-    frame(&mut panel_right, 40.0);
-    assert_eq!(
-        panel_right.resource::<CameraControl>().look,
-        None,
-        "a panel still eats the right press"
-    );
-
-    let mut covered = nameplate(true);
-    covered.insert_resource(crate::ui_script::EguiPointerOver(true));
-    press(&mut covered, MouseButton::Left);
-    frame(&mut covered, 40.0);
-    assert_eq!(
-        covered.resource::<CameraControl>().look,
-        None,
-        "the dev overlay stays above the plate"
-    );
-
-    let mut covered_right = nameplate(true);
-    covered_right.insert_resource(crate::ui_script::EguiPointerOver(true));
-    press(&mut covered_right, MouseButton::Right);
-    frame(&mut covered_right, 40.0);
-    assert_eq!(
-        covered_right.resource::<CameraControl>().look,
-        None,
-        "the dev overlay stays above a right press on the plate"
-    );
+    assert!(!looking(&w), "no button brings it back");
+    assert_eq!(cursor(&mut w).grab_mode, CursorGrabMode::None);
+    assert!(cursor(&mut w).visible);
 }
 
 /// `ToggleMouseMove` with no button enters mouselook (`0x50f910` → `0x50f930`): the cursor locks,
-/// the mouse turns the camera and not the body, since the hand-off wants the TurnOrAction bit
-/// (`0x5145e0`), and `IsMouselooking` still answers nil. It lasts with no button until the next
-/// call leaves it (`0x50f940(0)`).
+/// and `IsMouselooking` still answers nil. With nothing held the command word is empty, and the
+/// motion handler turns nothing (`0x51440c`); a key held, W here, gives the word a bit, and the
+/// mouse turns the camera and not the body, since the hand-off wants the TurnOrAction bit
+/// (`0x5145e0`). It lasts with no button until the next call leaves it (`0x50f940(0)`).
 #[test]
-fn toggle_mouse_move_turns_the_camera_alone_until_toggled_back() {
+fn toggle_mouse_move_turns_the_camera_alone_under_a_held_command_until_toggled_back() {
     let mut w = world(false);
     lua(&mut w, "ToggleMouseMove()");
     frame(&mut w, 0.0);
     assert!(looking(&w));
     assert_eq!(cursor(&mut w).grab_mode, CursorGrabMode::Locked);
     frame(&mut w, 100.0);
-    assert!(yaw(&mut w) != 0.0, "the camera turns");
+    assert_eq!(yaw(&mut w), 0.0, "an empty command word turns nothing");
+    let held = {
+        let mut script = w.non_send_resource_mut::<UiScript>();
+        script.run_binding("MoveForwardStart()").unwrap();
+        script.take_binding_input()
+    };
+    for input in held {
+        w.resource_mut::<BindingsState>().apply_unhosted(input);
+    }
+    frame(&mut w, 100.0);
+    assert!(yaw(&mut w) != 0.0, "W held, the camera turns");
     assert_eq!(w.resource::<Hand>().face_yaw, 0.0, "the body does not");
-    assert!(!is_mouselooking(&w));
+    assert!(!is_mouselooking(&mut w));
     frame(&mut w, 0.0);
     assert!(looking(&w), "no button is needed to stay");
     lua(&mut w, "ToggleMouseMove()");
@@ -869,10 +943,11 @@ fn a_mouselook_start_after_the_latch_reaches_the_frames_controller() {
     w.run_system_once(look_frame).unwrap();
     lua(&mut w, "MouselookStart()");
     w.run_system_once(apply_late_look_calls).unwrap();
-    let wm = &w.resource::<CameraControl>().world_mouse;
+    let binds = w.resource::<BindingsState>();
     assert!(
-        wm.turn() && wm.rose() && wm.late_rise(),
-        "the controller reads the channel risen after its session"
+        binds.just_pressed(Input::TurnOrAction)
+            && w.resource::<CameraControl>().world_mouse.late_rise(),
+        "the controller reads the bit risen after its session"
     );
     w.resource_mut::<ButtonInput<MouseButton>>().clear();
     frame(&mut w, 40.0);
@@ -893,4 +968,65 @@ fn a_toggle_after_the_session_reaches_the_next_one() {
     w.resource_mut::<ButtonInput<MouseButton>>().clear();
     frame(&mut w, 0.0);
     assert!(looking(&w), "the toggle entered mouselook");
+}
+
+/// A left orbit is freelook as a right drag is (`[cam+0x90] & 1`, `0x50fe41`): its entry hands the
+/// ground's lean into the pitch (`0x50fe72`, `0x50fe79`) and its leave takes it back (`0x50fde6`,
+/// `0x50fded`), so the view holds still across both.
+#[test]
+fn a_left_orbit_hands_the_ground_lean_into_the_pitch_and_back() {
+    let mut w = world(false);
+    frame(&mut w, 0.0);
+    let options = CameraOptions {
+        terrain_tilt: true,
+        ..CameraOptions::default()
+    };
+    let moving = SubjectState {
+        move_flags: crate::creature_anim::move_flags::FORWARD,
+        ..SubjectState::default()
+    };
+    {
+        let mut rig = w.resource_mut::<CameraControl>();
+        for _ in 0..900 {
+            rig.terrain_tilt.advance(
+                || 0.5,
+                true,
+                &moving,
+                FollowStyle::Smart,
+                &options,
+                1.0 / 60.0,
+            );
+        }
+    }
+    let lean = w.resource::<CameraControl>().terrain_tilt.pitch();
+    assert!(lean > 0.0, "uphill leans the view: {lean}");
+    let pitch = |w: &mut World| w.query::<&FlyCam>().single(w).unwrap().pitch;
+    let hand_off = |w: &mut World| {
+        w.resource_scope(|w, mut rig: Mut<CameraControl>| {
+            let mut cam = w.query::<&mut FlyCam>().single_mut(w).unwrap();
+            rig.hand_off_ground_pitch(&mut cam);
+        });
+    };
+    hand_off(&mut w);
+    let level = pitch(&mut w);
+
+    press(&mut w, MouseButton::Left);
+    frame(&mut w, 0.0);
+    assert_eq!(w.resource::<CameraControl>().look, Some(LookButton::Left));
+    hand_off(&mut w);
+    assert!(
+        (pitch(&mut w) - (level + lean)).abs() < 1.0e-6,
+        "the entry pushes the lean into the pitch"
+    );
+    assert_eq!(w.resource::<CameraControl>().terrain_tilt.pitch(), 0.0);
+
+    release(&mut w, MouseButton::Left);
+    frame(&mut w, 0.0);
+    assert_eq!(w.resource::<CameraControl>().look, None);
+    hand_off(&mut w);
+    assert!(
+        (pitch(&mut w) - level).abs() < 1.0e-6,
+        "the leave pops it back out"
+    );
+    assert_eq!(w.resource::<CameraControl>().terrain_tilt.pitch(), lean);
 }
