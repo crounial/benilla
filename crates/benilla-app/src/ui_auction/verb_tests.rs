@@ -62,6 +62,10 @@ impl House {
 
     fn new(money: u32) -> Self {
         let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
+        // In the world with the interface up, so the dispatch fires each packet's lanes.
+        app.insert_resource(bevy::prelude::State::new(
+            crate::client_state::ClientState::InWorld,
+        ));
         let (tx, rx) = crossbeam_channel::unbounded();
         app.insert_resource(NetCommands(tx));
         let world = app.world_mut();
@@ -475,11 +479,11 @@ fn a_damaged_items_start_is_refused_inside_the_call() {
 /// `0x4cc460` shows a placed bid's line (`0x4cc507`) before it removes the outbid pair
 /// (`0x4cc517`), arms the bidder flag (`0x4cc522`) and sends the bidder request (`0x4cc528`), so
 /// the line's `CHAT_MSG_SYSTEM` listener calls `GetBidderAuctionItems` on the house as it stood:
-/// the flag the hello armed, both pairs, the offset 0. Here the handlers run first and send in
-/// their own order, the next packet's handler reading what the first wrote; the listener's call
-/// then sends at its page with both ids, and its offset stands after the frame.
+/// the flag the hello armed, both pairs, the offset 0. Its request goes first, at its page with
+/// both ids; the handler's own then reads the offset the listener saved (`0x4cc51c`), and the
+/// second bid's finds the flag spent and its own request the house's last pair gone (#2426).
 #[test]
-fn a_placed_bids_line_listener_reads_the_requests_as_its_handler_found_them() {
+fn a_placed_bids_line_listener_sends_ahead_of_its_handler() {
     use benilla_protocol::messages::{auction_action, auction_error, AuctionCommandTail};
     let mut h = House::new(1_000_000);
     h.house().outbid = vec![(1, 7), (1, 9)];
@@ -508,11 +512,11 @@ fn a_placed_bids_line_listener_reads_the_requests_as_its_handler_found_them() {
     assert_eq!(
         text(h.sent()),
         text([
-            bidder(0, vec![9]),
-            wave(),
-            bidder(0, vec![]),
-            wave(),
             bidder(100, vec![7, 9]),
+            bidder(100, vec![9]),
+            wave(),
+            bidder(100, vec![]),
+            wave(),
         ])
     );
     let house = h.house();
@@ -527,8 +531,8 @@ fn a_placed_bids_line_listener_reads_the_requests_as_its_handler_found_them() {
 }
 
 /// A started auction's line (`0x4cc4c7`) comes before the owner request (`0x4cc4da`,
-/// `0x4cc4e0`), which spends the flag: its listener's `GetOwnerAuctionItems` finds the flag the
-/// hello armed and sends at its page, whose offset then stands.
+/// `0x4cc4e0`): its listener's `GetOwnerAuctionItems` finds the flag the hello armed and sends at
+/// its page first, and the handler's request then goes at the offset it saved (`0x4cc4d1`).
 #[test]
 fn a_started_auctions_line_listener_reads_the_owner_flag_before_its_request() {
     use benilla_protocol::messages::{auction_action, auction_error, AuctionCommandTail};
@@ -555,7 +559,7 @@ fn a_started_auctions_line_listener_reads_the_owner_flag_before_its_request() {
         auctioneer: AUCTIONEER,
         list_from,
     };
-    assert_eq!(text(h.sent()), text([owner(0), owner(50)]));
+    assert_eq!(text(h.sent()), text([owner(50), owner(50)]));
     let house = h.house();
     assert_eq!((house.owner_armed, house.owner_offset), (false, 50));
 }

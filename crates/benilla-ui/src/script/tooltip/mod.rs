@@ -207,13 +207,19 @@ fn clear_content(model: &mut Model, h: FrameHandle) {
         t.wrapped[..used].fill(false);
         t.num_lines = 0;
         t.min_width = 0.0;
-        // Clear drops the subject and unregisters its health watcher (`0x5300ad`, `0x53007c`).
+        // Clear drops the subject and unregisters its health watcher (`0x5300ad`, `0x53007c`),
+        // and drops the game object and the corpse it kept (`0x5300b9`, `0x5300d1`).
         t.unit_guid = None;
+        t.object_guid = None;
+        t.corpse_guid = None;
     }
+    model.unit_watches.unlink_tooltip(h);
     // New content replaces a spell render still waiting on its view.
     model.spell_tooltip_waits.remove(&h);
-    // The clear zeroes the kept item entry (`0x5300dd`), so a cache answer rebuilds nothing.
+    // The clear zeroes the kept item entry (`0x5300dd`) and spell (`0x5300e3`), so a cache answer
+    // rebuilds nothing.
     model.item_builds.remove(&h);
+    model.spell_builds.remove(&h);
 }
 
 /// The tooltip's `<name>StatusBar` health bar (`[+0x348]`), if it has one.
@@ -264,9 +270,9 @@ pub(super) fn fire_cleared(lua: &Lua, h: FrameHandle) {
 /// remembered item id (`0x5300dd`) that the cache callback `0x52e530` needs (`0x52e55e`), so the
 /// plate stays down until the next hover.
 ///
-/// A spell render still waiting on its view ([`Model::spell_tooltip_waits`], filled by the host
-/// ahead of a hover) is the one exception: the reference reads spells synchronously and has no
-/// such state. That plate takes the base hide, keeping its owner and its wait, so the view's
+/// A spell render still waiting on its view ([`Model::spell_tooltip_waits`], with no host to build
+/// it at the call) is the one exception: the reference reads spells synchronously and has no such
+/// state. That plate takes the base hide, keeping its owner and its wait, so the view's
 /// arrival renders it in place.
 pub(super) fn show_or_hide_empty(lua: &Lua, h: FrameHandle) {
     let waiting = {

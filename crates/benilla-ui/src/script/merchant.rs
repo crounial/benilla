@@ -339,21 +339,6 @@ fn submit(lua: &Lua, call: MerchantCall) -> mlua::Result<()> {
     super::calls::submit(lua, super::ScriptCall::Merchant(call))
 }
 
-/// Hand the host the buys the drop verb just made (`Model::merchant_drops`), before the verb
-/// returns, as the reference sends from the drop itself.
-pub(super) fn submit_slot_buys(lua: &Lua) -> mlua::Result<()> {
-    let buys = std::mem::take(
-        &mut lua
-            .app_data_mut::<Model>()
-            .expect("model app_data")
-            .merchant_drops,
-    );
-    for call in buys {
-        submit(lua, call)?;
-    }
-    Ok(())
-}
-
 /// 1 or nil, as the client pushes a usable flag (`pushnumber(1.0)` / `pushnil`).
 fn usable_value(usable: bool) -> Value {
     if usable {
@@ -562,21 +547,29 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
                 row(lua, &model, row0 as usize).map(|it| (row0, it))
             });
-            // The sell fork comes first, before the argument is read. Its clear is the sale's, not
-            // `ClearCursor`: `CURSOR_UPDATE` fires and the source slot stays greyed until the
-            // server's inventory update (`0x494b60`). Every other leg reads the row, then clears.
+            // The sell fork comes first, before the argument is read: the sale goes out
+            // (`0x4fb7a7`), handed over in place, then its clear, `ClearCursor(0,1)` (`0x4fb7b3`),
+            // whose `CURSOR_UPDATE` follows the packet; the source slot stays greyed until the
+            // server's inventory update. Every other leg reads the row, then clears.
             let grab = super::tick::verb(lua, |model| {
-                match crate::script::cursor::take_cursor_item_for_sale(model) {
-                    Some(item) => Err(MerchantCall::Sell {
-                        item_guid: item.guid,
-                        count: item.count.unwrap_or(0) as u8,
-                    }),
-                    None => Ok(merchant_grab(model, grab_row)),
+                let held = match &model.cursor {
+                    Some(crate::script::cursor::CursorPayload::Item(item)) => Some(item.clone()),
+                    _ => None,
+                };
+                match held {
+                    Some(item) => {
+                        model.merchant_call_in_verb(MerchantCall::Sell {
+                            item_guid: item.guid,
+                            count: item.count.unwrap_or(0) as u8,
+                        });
+                        crate::script::cursor::take_cursor_item_for_sale(model);
+                        None
+                    }
+                    None => Some(merchant_grab(model, grab_row)),
                 }
             });
-            let grab = match grab {
-                Ok(grab) => grab,
-                Err(sale) => return submit(lua, sale),
+            let Some(grab) = grab else {
+                return Ok(());
             };
 
             // Every other leg clears with the real `ClearCursor(1,1)` (`0x4fb82d`/`0x4fb83f` on a
@@ -737,7 +730,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             // its events running first.
             {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                if model.spell_targeting || !head(lua, &model).can_repair {
+                if super::action::spell_targeting(lua) || !head(lua, &model).can_repair {
                     return Ok(());
                 }
             }
@@ -778,7 +771,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "ShowMerchantSellCursor",
         lua.create_function(|lua, index: Value| {
             // The targeting and base-mode gates come first (`0x4fbab7`-`0x4fbacc`).
-            if sell_cursor_shut(&lua.app_data_ref::<Model>().expect("model app_data")) {
+            if sell_cursor_shut(lua) {
                 return Ok(());
             }
             // `is-number` else `Usage: ShowMerchantSellCursor(index)` (`0x84dd14`, `0x4fbadf`).
@@ -793,7 +786,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "ShowBuybackSellCursor",
         lua.create_function(|lua, index: Value| {
             // The targeting and base-mode gates come first (`0x4fbbb9`-`0x4fbbce`).
-            if sell_cursor_shut(&lua.app_data_ref::<Model>().expect("model app_data")) {
+            if sell_cursor_shut(lua) {
                 return Ok(());
             }
             // `is-number` else `Usage: ShowBuybackSellCursor(index)` (`0x84dd3c`, `0x4fbbe1`).
@@ -811,8 +804,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 /// The gates every sell-cursor verb opens with, ahead of its argument reads: `IsSpellTargeting`
 /// (`0x6e48a0`), then the base cursor mode (`0x523d10`) must be 1, which the repair cursor moves
 /// (`0x4fbce3`). Either failing returns quietly; each is sticky, so a Buy would stamp it out.
-pub(super) fn sell_cursor_shut(model: &Model) -> bool {
-    model.spell_targeting || model.repair_mode
+pub(super) fn sell_cursor_shut(lua: &Lua) -> bool {
+    super::action::spell_targeting(lua)
+        || lua
+            .app_data_ref::<Model>()
+            .expect("model app_data")
+            .repair_mode
 }
 
 /// Arm the vendor hover cursor from a row's price, read at the call: Buy(3) if the player's coinage

@@ -178,8 +178,9 @@ pub(crate) struct DressKey {
     pub(crate) display_id: Option<u32>,
     /// Mainhand, offhand, ranged: the display id, model kind and folded enchant ids.
     pub(crate) held: [Option<(u32, ItemModelKind, i32)>; HELD_SLOTS],
-    /// Every placed weapon's model has built parts. Deviation: the reference copies a finished
-    /// model, ours stream in, so while false the pane keeps re-taking and a late weapon is baked.
+    /// Every placed weapon's model has built parts. Deviation: while false the pane keeps re-taking
+    /// and a late weapon is baked, because the reference copies a finished model and ours stream
+    /// in.
     pub(crate) held_ready: bool,
 }
 
@@ -1134,8 +1135,8 @@ mod tests {
         );
     }
 
-    /// A disconnect keeps our own avatar and drops the in-flight asks (`Items::clear_session`,
-    /// the guild cache's world-entry release). A slot and a crest whose ask was dropped are
+    /// A disconnect keeps our own avatar and drops the in-flight asks (the saved stores' clear in
+    /// `wdb`, the guild cache's world-entry release). A slot and a crest whose ask was dropped are
     /// unknown to the cache, so the next resolve asks again rather than waiting forever.
     #[test]
     fn a_slot_whose_ask_was_dropped_is_asked_again() {
@@ -1158,7 +1159,7 @@ mod tests {
             .any(|c| matches!(c, ClientCommand::GuildQuery { guild_id: 7 })));
         assert!(!app.world().get::<Equipment>(player).unwrap().settled);
 
-        app.world_mut().resource_mut::<Items>().clear_session();
+        crate::wdb::SavedCache::forget_asks(&mut *app.world_mut().resource_mut::<Items>());
         app.world_mut()
             .resource_mut::<crate::ui_guild::GuildState>()
             .drop_pending_for_test();

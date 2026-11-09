@@ -98,6 +98,10 @@ fn combo(n: u32) -> SessionEvent {
 /// the bag equipped, and a VM whose spy records the bag, lock, bank and money events with `arg1`.
 fn client() -> App {
     let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
+    // In the world with the interface up, so the dispatch fires each packet's lanes.
+    app.insert_resource(bevy::prelude::State::new(
+        crate::client_state::ClientState::InWorld,
+    ));
     let world = app.world_mut();
     let pairs: Vec<(u16, u32)> = seat(23, POTIONS)
         .into_iter()
@@ -127,6 +131,7 @@ fn client() -> App {
             }),
         );
     }
+    crate::ui_action::hold_for_test(world, 5, ACTION_KIND_ITEM, POTION);
     let mut script = UiScript::new().unwrap();
     script.set_action(
         5,
@@ -602,12 +607,8 @@ fn a_bag_updates_listener_reads_the_seat_its_packet_left() {
 /// logout runs it: `SMSG_LOGOUT_COMPLETE` and the disconnect through the handler table, which
 /// free the objects, then the session's end, whose shutdown signals the event with the host lent.
 fn before_and_at_logout(app: &mut App, expr: &str) -> (String, String) {
-    use bevy::ecs::system::RunSystemOnce;
     use std::cell::RefCell;
     use std::rc::Rc;
-    app.world_mut()
-        .run_system_once(crate::ui_char::feed_char)
-        .unwrap();
     let before: String = hosted_eval(app, &format!("return {expr}"));
     let seen: Rc<RefCell<Vec<String>>> = Rc::default();
     let sink = seen.clone();
@@ -704,6 +705,41 @@ fn the_logouts_shutdown_reads_no_inventory_but_the_name() {
     assert!(before.starts_with("|c"), "{before}");
     assert!(before.ends_with(" Onehunter 70"), "{before}");
     assert_eq!(at, "nil Onehunter 0");
+}
+
+/// `OffhandHasWeapon` looks the active player up first (`0x4c9578` → `0x468460`) and pushes nil
+/// when none is held (`0x4c9590`, `je 0x4c95c4`): at `PLAYER_LOGOUT`, after the object manager is
+/// gone (`0x467700`, `0x46771e`), a weapon in the off hand still reads nil.
+#[test]
+fn the_logouts_shutdown_finds_no_off_hand_weapon() {
+    const SWORD: u64 = 0x4000_0000_0000_0049;
+    let mut app = client();
+    app.world_mut()
+        .resource_mut::<crate::items::Items>()
+        .insert_template(
+            25,
+            Some(benilla_protocol::messages::ItemInfo {
+                class: 2,
+                ..crate::items::test_template("Sword")
+            }),
+        );
+    // The VM's record copy, which the snapshot getter reads once the objects are gone.
+    app.world_mut()
+        .non_send_resource_mut::<UiScript>()
+        .set_item_template(
+            25,
+            benilla_ui::script::ItemTemplateView {
+                class: 2,
+                ..Default::default()
+            },
+        );
+    frame(
+        &mut app,
+        vec![item(SWORD, 25, ME), values(ME, &seat(16, SWORD))],
+    );
+    let (before, at) = before_and_at_logout(&mut app, "tostring(OffhandHasWeapon())");
+    assert_eq!(before, "1");
+    assert_eq!(at, "nil");
 }
 
 /// A spy on `PLAYER_COMBO_POINTS` that records `chunk`'s answer at each firing, as text.

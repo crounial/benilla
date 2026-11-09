@@ -8,7 +8,8 @@
 //! word and a `CMSG_PET_ACTION` instead.
 //!
 //! Deviation: `BOOKTYPE_SPELL`/`BOOKTYPE_PET` are engine globals here, where the reference defines
-//! them in `SpellBookFrame.lua:5-6`, so this module's tests run without the stock file.
+//! them in `SpellBookFrame.lua:5-6`, because that way this module's tests run without the stock
+//! file.
 
 use std::borrow::Cow;
 
@@ -124,6 +125,15 @@ pub struct PetBookState {
 pub struct SpellBookState {
     pub tabs: Vec<SpellTabView>,
     pub slots: Vec<SpellSlotView>,
+}
+
+/// Whether the targeting word clears against the unit held under the guid, its range included, as
+/// `SpellCanTargetObject` (`0x6e6460`, checkRange 1) judges it at the call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpellCanTargetQuery(pub u64);
+
+impl LiveQuery for SpellCanTargetQuery {
+    type Answer = bool;
 }
 
 /// The player's book slot, 0-based, as it stands: `0xb700f0`'s spell and its record, read at the
@@ -248,8 +258,9 @@ impl super::UiScript {
             .is_empty()
     }
 
-    /// Whether the spell-targeting cursor is up, for `SpellIsTargeting()` and
-    /// `SpellStopTargeting()`; pushed each frame before the input pass runs the ESC chain. Arming
+    /// Whether the spell-targeting cursor is up, for `SpellIsTargeting()`, `SpellStopTargeting()`
+    /// and the other tests of the word with no host to ask ([`super::CastViewNow`]); pushed each
+    /// frame before the input pass runs the ESC chain. Arming
     /// ends repair mode, as `HideRepairCursor` does: the targeting arm writes the Cast base mode
     /// over Repair (`0x6e50b0`), and its end restores Point (`0x6e49f5`, `0x6e554c`), never Repair.
     pub fn set_spell_targeting(&mut self, targeting: bool) {
@@ -818,11 +829,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let may_stop = protected::gate(lua, Tag::CAST);
             // `0x6e6e80` reads only the auto-repeat key `0xceac30` and the in-flight id
             // `0xceca88`, which is 0 mid-channel, as the call that cast last left them.
-            let stoppable = lua
-                .app_data_ref::<Model>()
-                .expect("model app_data")
-                .cast_view
-                .stoppable();
+            let stoppable = super::action::cast_view(lua).stoppable();
             if may_stop && stoppable {
                 super::calls::submit(lua, ScriptCall::SpellStopCasting)?;
                 Ok(Value::Integer(1))
@@ -835,16 +842,14 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // SpellIsTargeting() (`0x6e6cd0`): 1 while the targeting cursor is up, else nil.
     g.set(
         "SpellIsTargeting",
-        lua.create_function(|lua, ()| {
-            let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(flag(model.spell_targeting))
-        })?,
+        lua.create_function(|lua, ()| Ok(flag(super::action::spell_targeting(lua))))?,
     )?;
 
     // SpellCanTargetUnit("unit") (`0x6e6d00`): the argument is a string or a number (`0x6e6d0e`,
     // else `Usage:`), resolved through `0x515970` (`0x6e6d3a`), which raises for a token it does
     // not know; a token naming nobody answers nil (`0x6e6d43`), and a guid asks `0x6e6460`'s unit
-    // leg whether the standing word clears against it, answering 1 or nil.
+    // leg, with the range, whether the standing word clears against it at the call
+    // ([`SpellCanTargetQuery`]), answering 1 or nil.
     g.set(
         "SpellCanTargetUnit",
         lua.create_function(|lua, unit: Value| {
@@ -853,9 +858,16 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 unit,
                 r#"Usage: SpellCanTargetUnit("unit")"#,
             )?;
-            let model = lua.app_data_ref::<Model>().expect("model app_data");
-            let can = crate::script::unit::guid_of(lua, &model, &token)?
-                .is_some_and(|guid| model.spell_targetable_units.contains(&guid));
+            let guid = {
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                crate::script::unit::guid_of(lua, &model, &token)?
+            };
+            let can = guid.is_some_and(|guid| {
+                ask(lua, &SpellCanTargetQuery(guid)).unwrap_or_else(|| {
+                    let model = lua.app_data_ref::<Model>().expect("model app_data");
+                    model.spell_targetable_units.contains(&guid)
+                })
+            });
             Ok(flag(can))
         })?,
     )?;
@@ -868,11 +880,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, ()| {
             // The gate's tag 2 opens the function (`0x6e6e38`); a refusal answers nil (`0x6e6e69`).
             let may_stop = protected::gate(lua, Tag::CAST);
-            let targeting = lua
-                .app_data_ref::<Model>()
-                .expect("model app_data")
-                .spell_targeting;
-            if may_stop && targeting {
+            if may_stop && super::action::spell_targeting(lua) {
                 super::calls::submit(lua, ScriptCall::SpellStopTargeting)?;
                 Ok(Value::Integer(1))
             } else {

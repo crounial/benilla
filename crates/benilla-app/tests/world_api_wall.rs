@@ -99,6 +99,7 @@ const PUBLISHED: &[(&str, &str)] = &[
     ("doodad_anim::DoodadAnimHost", "record"),
     ("doodad_anim::MatAnim", "record"),
     ("doodad_anim::MatAnimTick", "record"),
+    ("doodad_anim::Stage1Loops", "record"),
     ("doodad_anim::TintLoop", "record"),
     ("doodad_anim::UvLoops", "record"),
     ("doodad_anim::clocked_twin", "record"),
@@ -140,6 +141,8 @@ const PUBLISHED: &[(&str, &str)] = &[
     ("model_render::ModelKind", "record"),
     ("model_render::ModelPart", "record"),
     ("model_render::lazy::realize", "record"),
+    ("model_render::order::NoDepthFill", "wall"),
+    ("model_render::order::SortInstance", "wall"),
     ("modkeys::SyntheticHold", "wall"),
     ("particles::ParticleTuning", "record"),
     ("particles::ViewThrottled", "record"),
@@ -151,6 +154,7 @@ const PUBLISHED: &[(&str, &str)] = &[
     ("rig_anim::PosePost", "wall"),
     ("rig_anim::RigAnchor", "wall"),
     ("rig_anim::RigFrame", "wall"),
+    ("rig_anim::RigModelPass", "wall"),
     ("rig_anim::RigPose", "wall"),
     ("rig_anim::SceneClock", "record"),
     ("rig_palette::RigPalettes", "record"),
@@ -215,9 +219,6 @@ const SORTED_LEAKS: &[(&str, &str)] = &[
     ("instance_tint::IDENTITY", "CLOSE/absorb"),
     ("instance_tint::pack", "CLOSE/absorb"),
     ("interact::PickBox", "CLOSE/absorb"),
-    ("interact::WorldClick", "CLOSE/move-game"),
-    ("interact::WorldRightClick", "CLOSE/move-game"),
-    ("interact::WorldRightPress", "CLOSE/move-game"),
     ("interact::cast_pick_ray_inflated", "CLOSE/absorb"),
     ("interior::BodyBakeCenter", "CLOSE/absorb"),
     ("interior::ContainmentAttach", "CLOSE/absorb"),
@@ -292,7 +293,7 @@ const SORTED_LEAKS: &[(&str, &str)] = &[
     ),
     ("terrain_stream::point_light", "CLOSE/absorb"),
     ("terrain_stream::spawn_model_entities", "CLOSE/move-engine"),
-    ("view::CAM_FOVY", "CLOSE/absorb"),
+    ("view::FovZoom", "CLOSE/absorb"),
     ("view::FARCLIP_RANGE", "CLOSE/absorb"),
     ("view::NEARCLIP_DEFAULT", "CLOSE/absorb"),
     ("wmo_portal::UnitWmoRoom", "CLOSE/absorb"),
@@ -754,7 +755,7 @@ fn expand(s: &str) -> Vec<String> {
                 break;
             }
             let tail = &after[2..];
-            // `interact::{WorldClick, WorldRightClick}`: a group hanging off a walked path.
+            // `interact::{CreaturePickPart, GoPickPart}`: a group hanging off a walked path.
             if tail.trim_start().starts_with('{') {
                 let head = out;
                 return expand(tail)

@@ -47,9 +47,11 @@ tree.
 
 `run_with` remains the path when a piece should stay a plugin outside the client. A client
 started through `run_with` says `extended` in its build line, so its reports read apart from
-this fork's. The crate keeps its own settings, never rows in the CVar table, which every addon
-reads, and its files go under `benilla_app::config_dir()`, its own `benilla-config/`: an addon
-it ships is written into that folder's `AddOns/` and loads as any addon does.
+this fork's. Its build script calls `benilla_buildstamp::emit()`, which stamps the commit that
+line names and gives its binary the 8 MB main-thread stack the app needs on Windows. The crate
+keeps its own settings, never rows in the CVar table, which every addon reads, and its files go
+under `benilla_app::config_dir()`, its own `benilla-config/`: an addon it ships is written into
+that folder's `AddOns/` and loads as any addon does.
 
 Past `run_with` and that folder, the client opens a piece of itself to such a crate only when
 its own 1.12.1 work creates that piece, never for the crate alone, and promises no stable API:
@@ -201,7 +203,10 @@ scope under "What does not" stops there.
   crate's tests, the quickest loop. `scripts/check.sh` verifies a round of work: the crates your
   branch changed against main and their dependents, so on a clean clone it has nothing to check; `scripts/gates.sh` is the full chain, and it opens a window for the engine boot
   checks, so it needs a display. `WOW_STOCK_UI=1` boots a dev build on the stock interface
-  alone, without benilla's layer. Work on a branch.
+  alone, without benilla's layer. A dev build panics when a script call or an engine turn sends a
+  packet, or writes an item's lock or the cursor, while an event handler it raised has yet to
+  run, which 1.12.1 runs first (`crates/benilla-ui/src/script/census.rs`);
+  `BENILLA_SEND_CENSUS_PANIC=0` turns that off. Work on a branch.
 
 ## Reporting a bug
 

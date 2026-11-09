@@ -11,9 +11,17 @@ mod live;
 pub(crate) use lane::{add_dialog_lane, DialogLane, DialogSignal};
 pub(crate) use live::DialogLive;
 
-/// The service dialogs' arrival gate, inline in `0x5dfdc0` and `0x5dfba0`: the NPC's unit looked up
-/// (`0x5dfdf5`, `0x5dfbde`) and held within `d² <= [0xc4c28c]` of the player (`0x5dfe3c`,
-/// `0x5dfc2d`, `je`: equality and a NaN pass); with no unit or out of range the dialog drops.
+/// The service dialogs' range to the NPC, read at the call. The question and the Accept test it
+/// inline in `0x5df980`, `0x5dfba0` and `0x5dfdc0`: the NPC's unit looked up (`0x5df9b5`,
+/// `0x5dfbd5`, `0x5dfdf5`) and held within `d² <= [0xc4c28c]` of the player (`0x5dfa0d`,
+/// `0x5dfc2d`, `0x5dfe4d`, `je`: equality and a NaN pass); with no unit or out of range the call
+/// does nothing ([`Self::holds`]). The interface's polls `CheckTalentMasterDist`,
+/// `CheckPetUntrainerDist` and `CheckBinderDist` (`0x48d194`, `0x48d1e4`, `0x48d234`) call the
+/// same test on the latched guid (`0x5dfb10`, `0x5dfd30`, `0x5dff50`), whose `jp` fails a NaN
+/// ([`Self::polled`]). No engine path clears the three latches (`0xc4d7a0`, `0xc4d7b0`,
+/// `0xc4d7c0`, written only at `0x5dfa21`, `0x5dfc41`, `0x5dfe64`), and none tests their range
+/// outside these calls: walking away hides the dialog through the stock `OnUpdate`
+/// (`StaticPopup.lua:1297`, `1313`, `1329`).
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct DialogReach<'w, 's> {
     index: Res<'w, crate::net::GuidIndex>,
@@ -22,15 +30,28 @@ pub(crate) struct DialogReach<'w, 's> {
 }
 
 impl DialogReach<'_, '_> {
-    /// Whether `npc` passes the gate.
+    /// `npc`'s squared distance from the player, `None` with no unit for it or no player.
+    fn dist_sq(&self, npc: u64) -> Option<f32> {
+        let at = self
+            .index
+            .0
+            .get(&npc)
+            .and_then(|&e| self.units.get(e).ok())?;
+        let me = self.me.iter().next()?;
+        Some(at.translation.distance_squared(me.translation))
+    }
+
+    /// Whether `npc` passes the question's and the Accept's gate, where a NaN passes.
     pub(crate) fn holds(&self, npc: u64) -> bool {
-        let at = self.index.0.get(&npc).and_then(|&e| self.units.get(e).ok());
-        at.zip(self.me.iter().next()).is_some_and(|(at, me)| {
-            at.translation
-                .distance_squared(me.translation)
-                .partial_cmp(&crate::target::SERVICE_RANGE_SQ)
-                != Some(std::cmp::Ordering::Greater)
+        self.dist_sq(npc).is_some_and(|d| {
+            d.partial_cmp(&crate::target::SERVICE_RANGE_SQ) != Some(std::cmp::Ordering::Greater)
         })
+    }
+
+    /// Whether `npc` passes the interface's poll, where a NaN fails.
+    pub(crate) fn polled(&self, npc: u64) -> bool {
+        self.dist_sq(npc)
+            .is_some_and(|d| d <= crate::target::SERVICE_RANGE_SQ)
     }
 }
 
@@ -44,13 +65,10 @@ use crate::area::AreaTableRes;
 use crate::creature_anim::spell_visual::{meeting_stone_join_fx, SpellKitFx, SpellVisuals};
 use crate::names::NameCache;
 
-use crate::net::{
-    ClientCommand, NetCommands, ObjectStore, SelfGuid, SelfPlayer, WorldEnterCascadeMessage,
-};
+use crate::net::{ClientCommand, NetCommands, ObjectStore, SelfGuid, SelfPlayer};
 use crate::query_cache::Ask;
 use crate::ui_party::GroupState;
-use crate::ui_script::{SweepApp, SweepLeg, UiFeed, UiTick};
-use crate::ui_session::{close_npc_session_out_of_range, NpcSession};
+use crate::ui_script::{SweepApp, SweepLeg, UiTick};
 
 /// The pet trainer's pending question: the latch (`0xc4d7b0/b4`) and the cost (`0xc4d7b8`).
 #[derive(Resource, Default)]
@@ -68,16 +86,6 @@ impl PetUnlearnState {
 
     pub(crate) fn pending(&self) -> Option<u64> {
         self.npc
-    }
-}
-
-impl NpcSession for PetUnlearnState {
-    fn npc(&self) -> Option<u64> {
-        self.npc
-    }
-    fn close(&mut self) {
-        self.npc = None;
-        self.cost = 0;
     }
 }
 
@@ -344,18 +352,24 @@ pub(crate) struct MeetingStone {
     /// `0x299` guids whose name has not resolved yet, each waiting on the name cache's callback
     /// `0x4ca510` (`0x4ca4b2`).
     pending_members: Vec<u64>,
-    /// A `0x295` rebuilt the text in this frame's packets, which the world entry's reset, ordered
-    /// ahead of them as our own create's cascade is (`0x4908c0` inside `0x5dea50`), leaves.
-    rebuilt: bool,
+    /// Where the last `0x295` rebuilt the text, by the clock: one after our own create's place,
+    /// which the world entry's reset runs ahead of (`0x4908c0` inside `0x5dea50`), keeps its text
+    /// past the reset the arrival lane fires later in the frame.
+    rebuilt_at: Option<crate::lanes::Mark>,
 }
 
 impl MeetingStone {
+    /// The teardown's free of the member lines' callbacks `0x4ca510`, running none (`0x55f990`).
+    pub(crate) fn free_store_callbacks(&mut self) {
+        self.pending_members.clear();
+    }
+
     /// `SMSG 0x295` (`0x4ca230`): the old area remembered, the new one stored (`0x4ca24a`), the text
     /// rebuilt (`0x4ca385`); the old area, for the line.
     pub(crate) fn apply(&mut self, area: u32) -> u32 {
         let old = std::mem::replace(&mut self.area, area);
         self.text = StoneText::Built;
-        self.rebuilt = true;
+        self.rebuilt_at = Some(crate::lanes::mark());
         old
     }
 
@@ -448,7 +462,7 @@ pub(crate) struct MeetingStoneInputs<'w, 's> {
     visuals: Option<Res<'w, SpellVisuals>>,
     fx: MessageWriter<'w, SpellKitFx>,
     self_q: Query<'w, 's, Entity, With<SelfPlayer>>,
-    tutorials: Option<MessageWriter<'w, crate::tutorial::TutorialEvent>>,
+    tutorials: Option<Res<'w, crate::tutorial::Tutorials>>,
 }
 
 /// `SMSG 0x295` (`0x4ca230`): the area stored, the line for the status (`0x4ca3a4`), status 1's
@@ -474,10 +488,8 @@ fn stone_set_queue(
                 inputs.fx.write(fx);
             }
         }
-        if let Some(t) = inputs.tutorials.as_mut() {
-            t.write(crate::tutorial::TutorialEvent::trigger(
-                crate::tutorial::id::MEETING_STONES,
-            ));
+        if let Some(t) = inputs.tutorials.as_deref() {
+            t.trigger_now(crate::tutorial::id::MEETING_STONES);
         }
     }
     lane.event("MEETINGSTONE_CHANGED", vec![]);
@@ -520,14 +532,18 @@ fn stone_notice(
 /// it (`0x55f426`): each meeting-stone member line waiting on the name (`0x4ca510`), which a
 /// refusal spends silently, and the duel's held challenge ([`crate::ui_duel`]).
 #[derive(bevy::ecs::system::SystemParam)]
-pub(crate) struct DialogNameAnswers<'w> {
+pub(crate) struct DialogNameAnswers<'w, 's> {
     /// Each absent in a harness without the dialogs.
     lane: Option<ResMut<'w, DialogLane>>,
     stone: Option<ResMut<'w, MeetingStone>>,
     duel: Option<ResMut<'w, crate::ui_duel::DuelState>>,
+    /// The resurrect offer whose caster's name it waited on, and the active player its show
+    /// tests.
+    death: Option<ResMut<'w, crate::death::DeathNet>>,
+    me: Query<'w, 's, &'static ObjectStore, With<crate::net::SelfPlayer>>,
 }
 
-impl DialogNameAnswers<'_> {
+impl DialogNameAnswers<'_, '_> {
     /// `guid`'s answer just filed in `names`.
     pub(crate) fn answered(&mut self, guid: u64, names: &NameCache) {
         let Some(lane) = self.lane.as_deref_mut() else {
@@ -547,27 +563,32 @@ impl DialogNameAnswers<'_> {
         if let Some(duel) = self.duel.as_deref_mut() {
             crate::ui_duel::name_answered(duel, lane, guid, name);
         }
+        if let Some(death) = self.death.as_deref_mut() {
+            crate::death::net::resurrecter_named(death, self.me.single().ok(), lane, guid, name);
+        }
     }
 }
 
 /// The world-enter cascade's meeting-stone leg (`0x490a14` → `0x4c9f40`), after the battlefield
-/// status: the text reset, then the empty `CMSG 0x296` (`0x4ca1c0`). The cascade runs at login,
-/// after every cross-map worldport and on every `/reload`; until the reply fires
-/// `MEETINGSTONE_CHANGED` (`0x4ca38f`) the minimap icon is hidden, as in the reference. The
-/// queued area survives.
+/// status, in the cascade's place ([`crate::ui_world_enter`]): the text reset, then the empty
+/// `CMSG 0x296` (`0x4ca1c0`). The cascade runs at login, after every cross-map worldport and on
+/// every `/reload`; until the reply fires `MEETINGSTONE_CHANGED` (`0x4ca38f`) the minimap icon is
+/// hidden, as in the reference. The queued area survives.
 pub(crate) fn meeting_stone_enter_world(
-    mut cascades: MessageReader<WorldEnterCascadeMessage>,
-    mut stone: ResMut<MeetingStone>,
+    mut stone: Option<ResMut<MeetingStone>>,
     commands: Res<NetCommands>,
 ) {
-    let rebuilt = std::mem::take(&mut stone.rebuilt);
-    if cascades.read().next().is_none() {
-        return;
-    }
-    // The reset is the create's, ahead of the frame's later packets: a `0x295` among them keeps
-    // its rebuild.
-    if !rebuilt {
-        stone.enter_world();
+    if let Some(stone) = stone.as_deref_mut() {
+        // The reset is the create's, ahead of the frame's later packets: a `0x295` among them
+        // keeps its rebuild.
+        let at = crate::lanes::firing_now();
+        let later = stone
+            .rebuilt_at
+            .take()
+            .is_some_and(|m| at.is_some_and(|at| !at.since(m)));
+        if !later {
+            stone.enter_world();
+        }
     }
     let _ = commands.0.send(ClientCommand::MeetingStoneStatusQuery);
 }
@@ -637,8 +658,8 @@ const MEETING_STONE_PARTY_CAP: usize = 4;
 
 /// The join drain: the meeting stone's use slot, run with the click's guid.
 fn drain_meeting_stone_joins(
-    mut hosted_vm: crate::script_calls::HostedVm,
-    mut uses: MessageReader<MeetingStoneUse>,
+    // The click's uses, which the call host's click writes: read before the host is lent.
+    mut vm: crate::script_calls::VmWith<MessageReader<'static, 'static, MeetingStoneUse>>,
     group: Option<Res<GroupState>>,
     self_guid: Res<SelfGuid>,
     templates: Res<crate::go_templates::GameObjectTemplates>,
@@ -647,14 +668,14 @@ fn drain_meeting_stone_joins(
     commands: Res<NetCommands>,
     mut sink: crate::ui_action::MessageSink,
 ) {
-    hosted_vm.run(|script| {
+    let uses: Vec<MeetingStoneUse> = vm.own().read().copied().collect();
+    vm.run(|script| {
         let Some(script) = script else {
-            uses.clear();
             return;
         };
         let level = self_q.single().ok().and_then(|s| s.0.unit_level());
         let mut lines = Vec::new();
-        for &MeetingStoneUse { go_guid } in uses.read() {
+        for &MeetingStoneUse { go_guid } in &uses {
             let stone = templates
                 .of_guid(&objects, go_guid)
                 .and_then(|t| t.meeting_stone);
@@ -706,19 +727,18 @@ fn area_spirit_healer_leave_world(mut spirit: ResMut<AreaSpiritHealer>) {
 pub(crate) struct PetUnlearnSteps<'w, 's> {
     /// Absent in a harness without the pet trainer's latch.
     pet: Option<Res<'w, PetUnlearnState>>,
-    me: Query<'w, 's, (&'static ObjectStore, &'static Transform), With<SelfPlayer>>,
-    index: Res<'w, crate::net::GuidIndex>,
-    units: Query<'w, 's, &'static Transform>,
+    me: Query<'w, 's, &'static ObjectStore, With<SelfPlayer>>,
+    reach: DialogReach<'w, 's>,
     net: Res<'w, NetCommands>,
     sink: crate::ui_action::MessageSink<'w>,
 }
 
 impl PetUnlearnSteps<'_, '_> {
     /// `PetUnlearnDialog(0, 0)` (`0x5dfba0`) on the remembered trainer (`[0xc4d7b0]`): the trainer
-    /// looked up (`0x5dfbd5`) and tested within the interaction range at the call (`0x5dfc1c`,
-    /// `d² <= [0xc4c28c]`), else nothing, the trainer still remembered; then a cost above the
-    /// player's money shows `ERR_NOT_ENOUGH_MONEY` (`0x5dfca3`) and sends nothing, and otherwise
-    /// `CMSG_PET_UNLEARN` goes to the trainer (`0x2F0`).
+    /// looked up (`0x5dfbd5`) and tested within the interaction range at the call
+    /// ([`DialogReach::holds`], `0x5dfc2d`), else nothing, the trainer still remembered; then a
+    /// cost above the player's money shows `ERR_NOT_ENOUGH_MONEY` (`0x5dfca3`) and sends nothing,
+    /// and otherwise `CMSG_PET_UNLEARN` goes to the trainer (`0x2F0`).
     pub(crate) fn confirm(&mut self, script: &mut UiScript) {
         let Some((npc, cost)) = self
             .pet
@@ -727,19 +747,15 @@ impl PetUnlearnSteps<'_, '_> {
         else {
             return;
         };
-        let Some(trainer) = self.index.0.get(&npc).and_then(|&e| self.units.get(e).ok()) else {
-            return;
-        };
-        let me = self.me.single().ok();
-        let in_range = me.is_some_and(|(_, at)| {
-            at.translation.distance_squared(trainer.translation) <= crate::target::SERVICE_RANGE_SQ
-        });
-        if !in_range {
-            debug!("pet unlearn: trainer {npc:#x} out of range at the confirm — nothing sent");
+        if !self.reach.holds(npc) {
+            debug!("pet unlearn: trainer {npc:#x} missing or out of range at the confirm");
             return;
         }
-        let money = me
-            .and_then(|(store, _)| store.0.player_money())
+        let money = self
+            .me
+            .single()
+            .ok()
+            .and_then(|store| store.0.player_money())
             .unwrap_or(0);
         if cost > money {
             let input = script.input_events();
@@ -1042,17 +1058,10 @@ impl Plugin for UiDialogVerbsPlugin {
             .init_resource::<BattlefieldQueue>()
             .init_resource::<MeetingStone>()
             .add_message::<MeetingStoneUse>()
-            .add_message::<WorldEnterCascadeMessage>()
             .add_sweep_leg(SweepLeg::MeetingStone, meeting_stone_leave_world)
             .add_systems(
                 Update,
                 (
-                    // In the frame time, after the drain that despawns the NPC and before the pass
-                    // resumes: `CheckPetUntrainerDist` and `ConfirmPetUnlearn`'s call read the
-                    // latch.
-                    close_npc_session_out_of_range::<PetUnlearnState>
-                        .after(benilla_world::schedule::WorldStage::Net)
-                        .before(crate::vm_pass::VmPass::Resume),
                     // After the mouse pick, the reference's order: `CGWorldFrame`'s OnUpdate picks
                     // at `0x48184a`, then polls at `0x4818ca`. Gating is safe: the poll is
                     // level-triggered and re-derives the cache every frame.
@@ -1060,11 +1069,6 @@ impl Plugin for UiDialogVerbsPlugin {
                         .after(crate::target::TargetUpdate)
                         .run_if(crate::ui_script::ingame_ui_up)
                         .in_set(crate::client_state::InWorldGated),
-                    // The cascade's order: the battlefield status, then this (`0x4909fb`,
-                    // `0x490a14`), so `CMSG 0x296` follows `CMSG 0x2D3` on the wire.
-                    meeting_stone_enter_world
-                        .in_set(UiFeed)
-                        .after(crate::ui_battlefield::reset_on_world_enter),
                     // After the target chain, which writes `MeetingStoneUse`, so the join leaves
                     // on the click's own frame.
                     drain_meeting_stone_joins
@@ -1646,17 +1650,8 @@ mod tests {
         let mut app = App::new();
         app.init_resource::<MeetingStone>()
             .insert_resource(NetCommands(tx))
-            .add_message::<crate::net::WorldportMessage>()
-            .add_message::<WorldEnterCascadeMessage>()
-            .add_sweep_leg(SweepLeg::MeetingStone, meeting_stone_leave_world)
-            .add_systems(
-                Update,
-                (
-                    crate::ui_script::sweep_on_worldport,
-                    meeting_stone_enter_world,
-                )
-                    .chain(),
-            );
+            .add_sweep_leg(SweepLeg::MeetingStone, meeting_stone_leave_world);
+        crate::ui_script::add_worldport_sweep(&mut app);
         app.world_mut()
             .resource_mut::<crate::ui_script::LeavingWorldArmed>()
             .arm();
@@ -1673,21 +1668,31 @@ mod tests {
     fn answered(app: &mut App, area: u32) {
         let mut stone = app.world_mut().resource_mut::<MeetingStone>();
         stone.apply(area);
-        stone.rebuilt = false;
+        stone.rebuilt_at = None;
+    }
+
+    /// The cascade's meeting-stone leg, as the arrival lane runs it.
+    fn enter(app: &mut App) {
+        app.world_mut()
+            .run_system_cached(meeting_stone_enter_world)
+            .expect("the stone's leg runs");
     }
 
     fn stone_text(app: &App) -> StoneText {
         app.world().resource::<MeetingStone>().text
     }
 
-    fn stone_port(needs_ack: bool) -> crate::net::WorldportMessage {
-        crate::net::WorldportMessage {
-            map_id: 1,
-            position: [0.0; 3],
-            orientation: 0.0,
-            needs_ack,
-            transport_entry: None,
+    /// A frame with a load posted when `needs_ack`, which the objects' leg (absent here) takes.
+    fn stone_port(app: &mut App, needs_ack: bool) {
+        if needs_ack {
+            app.world_mut()
+                .resource_mut::<crate::net::PendingWorldports>()
+                .post_for_test();
         }
+        app.update();
+        app.world_mut()
+            .resource_mut::<crate::net::PendingWorldports>()
+            .take_for_test();
     }
 
     /// Each world-enter cascade (`0x490a14` → `0x4c9f40`) resets the text to the bare `UNKNOWN`
@@ -1704,8 +1709,7 @@ mod tests {
             "a second worldport's",
         ] {
             answered(&mut app, 1519);
-            app.world_mut().write_message(WorldEnterCascadeMessage);
-            app.update();
+            enter(&mut app);
             assert_eq!(stone_queries(&rx), 1, "{entry} asks the server");
             assert_eq!(
                 stone_text(&app),
@@ -1728,16 +1732,13 @@ mod tests {
     #[test]
     fn a_cross_map_worldport_drops_the_text_and_the_login_map_does_not() {
         let (mut app, rx) = stone_app();
-        app.world_mut().write_message(WorldEnterCascadeMessage);
-        app.update();
+        enter(&mut app);
         answered(&mut app, 1519);
 
-        app.world_mut().write_message(stone_port(false));
-        app.update();
+        stone_port(&mut app, false);
         assert_eq!(stone_text(&app), StoneText::Built, "an arrival keeps it");
 
-        app.world_mut().write_message(stone_port(true));
-        app.update();
+        stone_port(&mut app, true);
         assert_eq!(
             stone_text(&app),
             StoneText::None,
@@ -1757,14 +1758,12 @@ mod tests {
     #[test]
     fn a_reload_drops_the_text_then_resets_it_and_asks_again() {
         let (mut app, rx) = stone_app();
-        app.world_mut().write_message(WorldEnterCascadeMessage);
-        app.update();
+        enter(&mut app);
         assert_eq!(stone_queries(&rx), 1);
         answered(&mut app, 1519);
 
         assert!(crate::ui_script::run_leave_world_sweep(app.world_mut()));
-        app.world_mut().write_message(WorldEnterCascadeMessage);
-        app.update();
+        enter(&mut app);
         assert_eq!(stone_queries(&rx), 1, "the reload re-asks the server");
         assert_eq!(
             stone_text(&app),
@@ -2023,16 +2022,6 @@ mod tests {
             Some("Looking for more for Unknown"),
             "no row names it UNKNOWN"
         );
-    }
-
-    #[test]
-    fn the_pet_question_latches_and_closes_like_the_talent_wipe() {
-        let mut pet = PetUnlearnState::default();
-        pet.ask(0x2b, 10_000);
-        assert_eq!(pet.pending(), Some(0x2b));
-        pet.close();
-        assert_eq!(pet.pending(), None);
-        assert_eq!(pet.cost, 0);
     }
 
     #[test]

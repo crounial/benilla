@@ -55,21 +55,35 @@ pub(crate) struct StableOpen {
     pub(crate) pets: Vec<StabledPet>,
     /// One step per list, which the VM's copy carries ([`benilla_ui::script::StableQuery`]).
     pub(crate) list: u64,
+    /// The cascade's reset, owed from its item's push ([`StableOpen::settle_world_reset`]).
+    pub(crate) world_reset: crate::ui_world_enter::OwedReset,
 }
 
 impl StableOpen {
     pub(crate) fn open(&mut self, npc: u64, num_stable_slots: u8, pets: Vec<StabledPet>) {
+        self.settle_world_reset();
         self.npc = Some(npc);
         self.num_stable_slots = num_stable_slots;
         self.pets = pets;
         self.list = self.list.wrapping_add(1);
     }
 
-    /// The world entry's reset (`0x4caab0`): no master, no slot bought, no pet.
+    /// The world-enter cascade's reset (`0x490a0a` → `0x4caab0`): no master, no slot bought, no
+    /// pet; the session's end runs it too.
     pub(crate) fn clear(&mut self) {
         self.npc = None;
         self.num_stable_slots = 0;
         self.pets.clear();
+        self.world_reset = Default::default();
+    }
+
+    /// The cascade's reset, owed from its push, at its place or ahead of a later stable packet
+    /// ([`crate::ui_world_enter::OwedReset`]); the close keeps the count (`0x4cae10`), so a getter
+    /// before it reads what the close left.
+    pub(crate) fn settle_world_reset(&mut self) {
+        if self.world_reset.take() {
+            self.clear();
+        }
     }
 
     /// The close core's clear of the cell (`0x4cae29`); the rows and the count stay.
@@ -96,22 +110,29 @@ impl LatchedWindow for StableOpen {
 
 /// The close core `0x4cae10`: with a stable open, the latch release (`0x4cae24`), the cell
 /// cleared, then `PET_STABLE_CLOSED` (`0x4cae3a`), held behind what the lane still holds
-/// ([`lane::behind_lane`]).
+/// ([`crate::lanes::step`]).
 pub(crate) fn close_core(world: &mut World) {
     if world.resource::<StableOpen>().npc.is_none() {
         return;
     }
-    lane::behind_lane(world, |world| {
+    crate::lanes::step(world, |world| {
         let Some(npc) = world.resource::<StableOpen>().npc else {
             return;
         };
         crate::ui_session::release(world, npc);
         world.resource_mut::<StableOpen>().close_cell();
-        crate::ui_session::note_closed(world, NpcWindow::Stable);
         crate::ui_session::fire(world, |script| {
             script.fire_event("PET_STABLE_CLOSED", vec![]);
         });
     });
+}
+
+/// The stable's reset in the cascade's place (`0x490a0a` → `0x4caab0`), unless a later stable
+/// packet ran it first.
+pub(crate) fn reset_on_world_enter(open: Option<ResMut<StableOpen>>) {
+    if let Some(mut open) = open {
+        open.settle_world_reset();
+    }
 }
 
 /// `MSG_LIST_STABLED_PETS`'s open, `0x4cadc0`: the open stable master's own list re-lists in place
@@ -319,6 +340,11 @@ pub(crate) fn ask_creature(
 }
 
 impl StableCreatureWaits {
+    /// The teardown's free of the getters' creature callbacks, running none (`0x557200`).
+    pub(crate) fn free_store_callbacks(&mut self) {
+        self.0.clear();
+    }
+
     /// The record of `entry` answered, `found` or refused: each callback waiting on it runs and
     /// goes, in the order kept, and a found record's signals `PET_STABLE_UPDATE` (`0x4cb3bf`) or
     /// `PET_STABLE_UPDATE_PAPERDOLL` (`0x4cba5f`), on the lane; a refusal's signal nothing.

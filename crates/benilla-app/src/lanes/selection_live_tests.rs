@@ -49,6 +49,8 @@ fn a_hosted_getter_reads_the_live_target_and_npc() {
     const READ: &str = r#"return UnitHealth("target"), UnitHealth("npc"),
         UnitIsUnit("target", "npc") and 1 or 0"#;
     assert_eq!(hosted::<(u32, u32, u8)>(&mut app, READ), (100, 0, 0));
+    // The VM's copies of the tokens, which no feed pushes in game, seated on the wolf.
+    crate::ui_unit::seat_tokens_once(app.world_mut());
     // The boar selected and latched, the VM told nothing.
     select(&mut app, Some(BOAR));
     app.world_mut()
@@ -233,9 +235,8 @@ fn a_reconnect_does_not_reseat_the_lost_target() {
 }
 
 /// Nothing selected and the VM told so, with a spy on the selection's change and the boar's line:
-/// each heard event, the change and the window with the target they read, `UnitHealth("target")`.
-/// The line's listener is not asked: a lane's firing reads the world the frame left until each
-/// packet's lanes fire inside the dispatch.
+/// each heard event, the change and the window with the target they read, `UnitHealth("target")`,
+/// and the line by its name alone.
 fn unselected_with_a_spy(app: &mut App) {
     select(app, None);
     frame(app, vec![]);
@@ -379,6 +380,8 @@ fn a_dead_units_loot_close_signals_its_deselect_at_the_packet() {
         .resource_mut::<crate::ui_loot::LootState>()
         .open(BOAR, 1, 0, Vec::new());
     world.resource_mut::<crate::ui_loot::LootLatch>().0 = Some(BOAR);
+    // The open stands in for its response's packet, whose event fires with it.
+    assert_eq!(frame(&mut app, vec![]), ["LOOT_OPENED:0"]);
     let release = SessionEvent::LootReleaseResponse {
         guid: BOAR,
         result: 1,

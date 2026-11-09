@@ -15,7 +15,7 @@ use super::{
 };
 use crate::creature_type::CreatureTypeSources;
 use crate::names::NameCache;
-use crate::net::{NetCommands, ObjectStore};
+use crate::net::ObjectStore;
 use crate::query_cache::Ask;
 use crate::target::{RelUnit, Relations};
 
@@ -43,8 +43,6 @@ pub(crate) fn reach_between(
 /// What a held unit's snapshot reads beside its descriptor.
 pub(super) struct HeldUnits<'a> {
     pub(super) names: &'a NameCache,
-    /// The channel a missing name is asked on; `None` reads the cache alone.
-    pub(super) commands: Option<&'a NetCommands>,
     pub(super) group: &'a crate::ui_party::GroupState,
     /// Our own descriptor, which the faction line reads.
     pub(super) self_store: Option<&'a ObjectStore>,
@@ -60,25 +58,10 @@ pub(super) struct HeldUnits<'a> {
 }
 
 impl HeldUnits<'_> {
-    /// The snapshot of the held unit `guid`, whose descriptor is `store`, as a token naming a unit
-    /// other than the player carries it, however the token spells it: `GetGuildInfo` resolves the
-    /// token and reads that object's guild (`0x4c9330`), so the guild leg is every held unit's.
-    pub(super) fn state(&self, store: &ObjectStore, guid: u64) -> UnitState {
-        // The unit's create looked its name up with a callback (`0x5dec12`); a frame asks only
-        // a name the cache holds nothing for, as one invalidated since, and a refused one waits
-        // for the next create.
-        let ask = match self.commands {
-            Some(commands) => Ask::New(commands),
-            None => Ask::Read,
-        };
-        let name = self
-            .names
-            .resolve_unit(guid, Some(store), ask)
-            .map(str::to_string);
-        self.state_named(store, guid, name)
-    }
-
-    /// [`Self::state`] under a name the caller looked up, which sends no name query.
+    /// The snapshot of the held unit `guid`, whose descriptor is `store`, under `name`, as a token
+    /// naming a unit other than the player carries it, however the token spells it:
+    /// `GetGuildInfo` resolves the token and reads that object's guild (`0x4c9330`), so the guild
+    /// leg is every held unit's.
     pub(super) fn state_named(
         &self,
         store: &ObjectStore,
@@ -152,7 +135,7 @@ pub(crate) fn traits_from_name_cache(
 mod tests {
     use super::*;
     use crate::names::CreatureRecord;
-    use crate::net::{Guid, GuidIndex, Reputations, SelfPlayer};
+    use crate::net::{Guid, GuidIndex, NetCommands, Reputations, SelfPlayer};
     use crate::target::Selection;
     use crate::ui_party::{GroupState, GROUPTYPE_RAID};
     use benilla_protocol::messages::{member_status, GroupMemberEntry};
@@ -232,8 +215,7 @@ mod tests {
     /// The world: we target `MOB`, which targets party1 (`A`), who targets `BOSS`, which targets
     /// `GONE`; raid2 (`B`) targets `ADD`, our pet `FOE`, and `C` nobody. `LONER` is held and
     /// targets `EXTRA`. The group is a raid of us, `A`, `B` and `C`, all in our subgroup, so the
-    /// three are also party slots 1 to 3. The aura feed, whose resolver inputs the chain feed
-    /// reads, and the chain feed run.
+    /// three are also party slots 1 to 3. The getters read it through the lent host.
     fn app() -> App {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = App::new();
@@ -353,10 +335,10 @@ mod tests {
         lent(app, &format!("return {expr}"))
     }
 
-    /// The getters answer for a chain through the feeds that run in the client: the aura feed's
-    /// resolver inputs name the guid, and this feed's snapshot of it answers, so `party1target`,
-    /// `raid2target` and `pettarget` read the unit at the end of the chain and any break in the
-    /// chain reads nobody. No token names `ADD` or `FOE` but a chain.
+    /// The getters answer for a chain through the lent host: the resolver names the guid at the
+    /// call, and the host builds the unit it names, so `party1target`, `raid2target` and
+    /// `pettarget` read the unit at the end of the chain and any break in the chain reads nobody.
+    /// No token names `ADD` or `FOE` but a chain.
     #[test]
     fn the_getters_answer_for_the_unit_a_chain_ends_on() {
         let mut app = app();
@@ -408,10 +390,9 @@ mod tests {
                 "UnitExists({token})"
             );
         }
-        // A group token reads its own push and nothing else: this world pushes none, so `raid1`
-        // answers nil though a chain ends on it. `target` reads the unit live, as a chain does,
-        // past a push of its own; with no host lent, the push answers.
-        assert_eq!(name(&mut app, "raid1"), None);
+        // A group token reads the unit its row names at the call, as a chain does. `target` reads
+        // the unit live too, past a push of its own; with no host lent, the push answers.
+        assert_eq!(name(&mut app, "raid1").as_deref(), Some("Alia"));
         assert_eq!(name(&mut app, "target").as_deref(), Some("Mob"));
         app.world_mut()
             .non_send_resource_mut::<UiScript>()
@@ -499,8 +480,6 @@ mod tests {
         app.init_resource::<crate::ui_chat::ChatLog>()
             .init_resource::<crate::sound::MessageSounds>();
         benilla_world::world_point::init_world_point_resources(app.world_mut());
-        app.init_resource::<crate::ui_party::PartyLane>()
-            .add_systems(Update, crate::ui_party::feed_party);
         {
             let mut script = app.world_mut().non_send_resource_mut::<UiScript>();
             script.keep_calls();
@@ -597,6 +576,10 @@ mod tests {
         let mut entries: Vec<GroupMemberEntry> =
             [A, B, C, D].into_iter().map(group_entry).collect();
         entries[3].name = "Dara".into();
+        // The name the list's lookup asked for, answered (`0x4e8477`).
+        app.world_mut()
+            .resource_mut::<NameCache>()
+            .insert_player(D, "Dara".into(), None);
         {
             let mut group = app.world_mut().resource_mut::<GroupState>();
             group.apply_list(GROUPTYPE_RAID, 0, entries, ME, None, Some(ME));
@@ -802,32 +785,5 @@ mod tests {
             let want = (Some("Probe Guild".to_string()), 2);
             assert_eq!(info(&mut app, token), want, "GetGuildInfo({token})");
         }
-    }
-
-    /// The targeting feed reads the resolver inputs the aura feed pushes in the same frame, so the
-    /// declared order puts the feed after it: read off the schedule graph.
-    #[test]
-    fn the_targeting_feed_runs_after_the_aura_feed_it_reads() {
-        use crate::game_plugins::schedule_tests::{census, headless_client, SyncPoints};
-
-        let mut app = headless_client();
-        let c = census(&mut app, Update, SyncPoints::Declared);
-        if !c.systems.values().any(|s| s.name.contains("benilla_app::")) {
-            eprintln!("skipped: this build carries no type names");
-            return;
-        }
-        let one = |suffix: &str| {
-            let mut hits = c.systems.iter().filter(|(_, s)| s.name.ends_with(suffix));
-            match (hits.next(), hits.next()) {
-                (Some((k, _)), None) => *k,
-                _ => panic!("exactly one system named `…{suffix}` in Update"),
-            }
-        };
-        let aura = one("::ui_aura::feed_auras");
-        let feed = "::targeting::feed_targeting_to_vm";
-        assert!(
-            c.dependencies.contains(&(aura, one(feed))),
-            "{feed} is declared after feed_auras"
-        );
     }
 }

@@ -470,9 +470,10 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "HasFullControl",
         lua.create_function(|lua, ()| {
+            let far_sight = super::super::live::ask(lua, &super::super::FarSightOnQuery);
             let ours = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                model.player_control && !model.far_sight_on
+                model.player_control && !far_sight.unwrap_or(model.far_sight_on)
             };
             let alive = ours
                 && with_object(lua, &Some("player".to_string()), false, |u, o| {
@@ -513,15 +514,17 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 if !exists || guid == 0 {
                     return Ok(Value::Nil);
                 }
+                // The party slots never hold the active player (`0x4e8fa0`); the raid roster does.
+                let own = roster_read::cells(lua, &model.party).own_guid;
                 let in_group = |guid: u64| {
-                    guid != 0
-                        && if raid {
-                            model.party.raid.iter().any(|m| m.guid == guid)
-                        } else {
-                            model.party.members.iter().any(|m| m.guid == guid)
-                        }
+                    let at = roster_read::membership(lua, &model.party, guid);
+                    if raid {
+                        at.raid
+                    } else {
+                        at.party && guid != own
+                    }
                 };
-                // The pets the last push resolved for the rows, else the owner's.
+                // With no host to ask, the stand-in's row pets, else the owner's.
                 let pets = if raid {
                     &model.unit_guids.raid_pets[..]
                 } else {
@@ -917,10 +920,12 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     // GetComboPoints() (`0x51a190`): `PLAYER_FIELD_BYTES` byte 1, behind two gates stock
     // `ComboFrame.lua` does not repeat: the class is rogue or druid (`0x51a1cc`), so a warrior's
     // dodge point never shows, and `PLAYER_FIELD_COMBO_TARGET` equals the current target
-    // (`0x51a205`), so the points read per target. Both are plain equality, GUID 0 included.
+    // (`0x51a205`), so the points read per target. Both are plain equality, GUID 0 included. The
+    // pair is read off the object as the call runs ([`read_self`]).
     g.set(
         "GetComboPoints",
         lua.create_function(|lua, ()| {
+            let (points, banked) = read_self(lua, |own| (own.combo_points(), own.combo_target()));
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             // No active player answers 0 (`0x51a1bd` → `0x51a261`), as class 0 does.
             let class =
@@ -929,10 +934,10 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 return Ok(0_i64);
             }
             let target = super::view(lua, &model, "target").map_or(0, |u| u.guid);
-            if model.combo_target != target {
+            if banked != target {
                 return Ok(0_i64);
             }
-            Ok(i64::from(model.combo_points))
+            Ok(i64::from(points))
         })?,
     )?;
 
@@ -1095,7 +1100,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     // DropItemOnUnit(unit) (`0x48d960`): drop the cursor's item on a unit, feeding a pet or
-    // opening a trade with a player. Only the token is queued; the app runs every gate.
+    // opening a trade with a player, inside the call; the host runs every gate.
     g.set(
         "DropItemOnUnit",
         lua.create_function(|lua, token: Value| {
@@ -1110,8 +1115,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             if token != "pet"
                 || crate::script::protected::gate(lua, crate::script::protected::Tag::CAST)
             {
-                let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-                model.drop_item_on_unit.push(token);
+                submit(lua, ScriptCall::DropItemOnUnit(token))?;
             }
             Ok(())
         })?,
@@ -1135,11 +1139,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             if !crate::script::protected::gate(lua, crate::script::protected::Tag::CAST) {
                 return Ok(());
             }
-            if !lua
-                .app_data_ref::<Model>()
-                .expect("model app_data")
-                .spell_targeting
-            {
+            if !super::super::action::spell_targeting(lua) {
                 return Ok(());
             }
             check_unit_token(&Some(token.clone()))?;

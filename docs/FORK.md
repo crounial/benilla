@@ -5,9 +5,9 @@ does that upstream does not. It is the current set, read by people and by agents
 before they change behaviour. Git holds the history. A modification adds, edits, or
 removes its row in the same change.
 
-The pin is `upstream/main` at `09c276fe` (Bag and item reads answer as of their packet;
-logout reads no player). When this tree takes new upstream commits, update the pin. Leave out
-any commit that is already on `upstream/main`.
+The pin is `upstream/main` at `e5651f0d` (nameplates: draw overhead names in the UNIT_NAME_FONT
+face). When this tree takes new upstream commits, update the pin. Leave out any commit that is
+already on `upstream/main`.
 
 A row states what 1.12.1 does, what upstream does when that differs, what this fork
 does, and the file that holds the departure. Name a companion that lives outside
@@ -46,8 +46,8 @@ it. `MAX_DIST_YD` in `crates/benilla-app/src/vplates.rs`. Chat bubbles stay on t
 ### Drag on a nameplate turns the camera
 
 1.12.1 gives a mouse-down on a nameplate to that plate (`0x7662c0`). A drag that
-starts on a plate never turns the camera. Upstream does the same:
-`PointerOverUi` is set over a plate, and the camera latch refuses the press.
+starts on a plate never turns the camera. Upstream does the same: a press a plate
+takes is the interface's, and the camera binding does not run.
 
 This fork still selects the unit on a left click of a nameplate, and a right click
 still acts on that unit. A drag that starts on a plate turns the camera. The left
@@ -58,11 +58,13 @@ plate's click, including a short press whose mouse moved. A drag past that windo
 does not. Other UI and the dev overlay still block both presses. The wheel still
 zooms over a plate.
 
-The latch and the look session are `latch_world_mouse` and `run_look_session` in
-`crates/benilla-app/src/player/camera.rs`. The left select lands in
-`select_on_plate_click` (`crates/benilla-app/src/target/click.rs`). The plate keeps
-the mouse until the gesture is a drag (`plates_take_mouse` in
-`crates/benilla-app/src/vplates.rs`).
+A press the plate took is handed to the camera binding (`feed_ui_input` in
+`crates/benilla-app/src/ui_script/input.rs`). The look starts in `LookSteps::bound`,
+and `run_look_session` spends the click once the drag passes the window, both in
+`crates/benilla-app/src/player/camera.rs`. The plate's click is `plate_click` in
+`crates/benilla-app/src/script_calls/world_click.rs`: a drag eats it, and the armed
+world click is not dispatched. The plate keeps the mouse until the gesture is a drag
+(`plates_take_mouse` in `crates/benilla-app/src/vplates.rs`).
 
 ## Repository
 

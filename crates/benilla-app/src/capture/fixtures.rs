@@ -2,6 +2,7 @@
 
 use super::*;
 use benilla_protocol::messages::trainer_spell_state;
+use benilla_ui::script::origin::{within, Origin};
 use benilla_ui::script::UiScript;
 
 /// The `vplates` fixture's wolf, the reference screenshot's subject (vmangos `creature_template`
@@ -85,9 +86,10 @@ const TRAINER_BLACKSMITH: TrainerSeed = TrainerSeed {
     ],
 };
 
-/// Seeds the fixture window's state once the scene is resident; the real feeds push it into the VM
-/// during the settle window as live wire data would. Icons resolve through the offline
-/// `ItemDisplayCatalog`, and names go straight into the caches.
+/// Seeds the fixture window's state once the scene is resident: the getters read the world it
+/// spawns through the host, and the remaining feeds push their copies into the VM during the settle
+/// window, as live wire data would. Icons resolve through the offline `ItemDisplayCatalog`, and
+/// names go straight into the caches.
 #[allow(clippy::type_complexity)] // a Bevy system's full input set
 pub(super) fn seed_ui_fixture(
     mut vm: crate::script_calls::VmWith<(
@@ -106,6 +108,8 @@ pub(super) fn seed_ui_fixture(
             ResMut<'static, crate::loading_screen::LoadingScreen>,
             ResMut<'static, crate::ui_gossip::GossipState>,
             ResMut<'static, crate::ui_quest::QuestGiver>,
+            // The quest cache, which the host's rebuild lookups ask too.
+            ResMut<'static, crate::ui_quest_log::QuestLog>,
         ),
         // The tooltip fixture's set row and its members' names, read by the set block's host.
         (
@@ -116,7 +120,6 @@ pub(super) fn seed_ui_fixture(
     mut ctx: ResMut<CaptureCtx>,
     mut commands: Commands,
     progress: Res<WorldLoadProgress>,
-    mut quest_log: ResMut<crate::ui_quest_log::QuestLog>,
     icons: Option<Res<crate::entities::ItemDisplays>>,
 ) {
     let icons = icons.as_deref();
@@ -126,7 +129,7 @@ pub(super) fn seed_ui_fixture(
     vm.turn(|script, parts| {
         let (mut loot, mut names, mut selection, mut player, store, rest, set_parts) = parts;
         let (mut item_sets, mut item_names) = set_parts;
-        let (mut actions, mut exit, mut loading, mut gossip, mut quest) = rest;
+        let (mut actions, mut exit, mut loading, mut gossip, mut quest, mut quest_log) = rest;
         let (mut items, mut index, mut home_bind) = store;
         // A glue-screen capture has no world scenario, and no glue screen opens a UI fixture.
         let Some(scenario) = ctx.scenario else {
@@ -220,14 +223,17 @@ pub(super) fn seed_ui_fixture(
 
         match fixture {
             // Nothing to open: the loaded UI and `demo_unit_feed`'s player and target are the
-            // fixture. The combo dots read the active player's class (`0x51a1cc`), so
-            // `ui-combopoints` holds one: a level-12 rogue on the demo's health, at 45 energy.
+            // fixture. The combo dots read the active player's class (`0x51a1cc`) and its two
+            // combo fields against the selection (`0x51a1f3`-`0x51a20d`), so `ui-combopoints`
+            // holds a level-12 rogue on the demo's health, at 45 energy, with four points banked
+            // on the wolf it targets.
             UiFixture::Bare => {
                 if scenario.name == "ui-combopoints" {
                     const PLAYER_GUID: u64 = 0x51;
                     names.insert_player(PLAYER_GUID, "Benilla".into(), None);
                     commands.spawn((
                         crate::net::ObjectStore(benilla_protocol::ObjectFields::from_pairs(&[
+                            (2, 0x19), // OBJECT_FIELD_TYPE: object, unit, player
                             (22, 72),  // UNIT_FIELD_HEALTH
                             (26, 45),  // UNIT_FIELD_POWER4, energy
                             (28, 100), // UNIT_FIELD_MAXHEALTH
@@ -235,10 +241,52 @@ pub(super) fn seed_ui_fixture(
                             (34, 12),  // UNIT_FIELD_LEVEL
                             // UNIT_FIELD_BYTES_0: night elf, rogue, male, energy
                             (36, 4 | (4 << 8) | (3 << 24)),
+                            // PLAYER_FIELD_COMBO_TARGET, the wolf
+                            (714, WOLF_GUID as u32),
+                            (715, (WOLF_GUID >> 32) as u32),
+                            // PLAYER_FIELD_BYTES byte 1: four combo points
+                            (1222, 4 << 8),
                         ])),
                         crate::net::SelfPlayer,
                         crate::net::Guid(PLAYER_GUID),
                     ));
+                    // The wolf, a level-3 beast on 30 of 50 health, held and selected; the
+                    // select's `PLAYER_TARGET_CHANGED` (`0x49389c`) shows the target frame and
+                    // its dots.
+                    names.insert_creature(
+                        WOLF_ENTRY,
+                        Some(crate::names::CreatureRecord {
+                            name: "Timber Wolf".into(),
+                            subname: None,
+                            creature_type: 1,
+                            pet_family: 0,
+                            rank: 0,
+                            type_flags: 0,
+                            pet_spell_list: 0,
+                            civilian: false,
+                            racial_leader: false,
+                            display_id: 0,
+                        }),
+                    );
+                    let wolf = commands
+                        .spawn((
+                            crate::net::Guid(WOLF_GUID),
+                            crate::net::ObjectStore(benilla_protocol::ObjectFields::from_pairs(
+                                &[
+                                    (2, 0x9),           // OBJECT_FIELD_TYPE: object, unit
+                                    (3, WOLF_ENTRY),    // OBJECT_FIELD_ENTRY
+                                    (22, 30),           // UNIT_FIELD_HEALTH
+                                    (28, 50),           // UNIT_FIELD_MAXHEALTH
+                                    (34, 3),            // UNIT_FIELD_LEVEL
+                                    (35, WOLF_FACTION), // UNIT_FIELD_FACTIONTEMPLATE
+                                ],
+                            )),
+                        ))
+                        .id();
+                    index.0.insert(WOLF_GUID, wolf);
+                    selection.target = Some(wolf);
+                    selection.guid = Some(WOLF_GUID);
+                    commands.queue(signal_fixture_target);
                 }
             }
             // Holds the world-entry loading screen, tip and all, over the settled scene.
@@ -651,8 +699,9 @@ pub(super) fn seed_ui_fixture(
             }
             UiFixture::QuestLog => {
                 // The log reads the self player's PLAYER_QUEST_LOG slots, so a synthetic self
-                // player carries two and `feed_quest_log` runs the real chain. A slot is id, packed
-                // 6-bit counters plus a state byte, and timer, from field 198.
+                // player carries two and the rebuild asks the cache for their records through the
+                // host, the real chain. A slot is id, packed 6-bit counters plus a state byte, and
+                // timer, from field 198.
                 use benilla_protocol::messages::{ObjectFields, QuestObjective, QuestTemplate};
                 const KOBOLD_ENTRY: u32 = 90_002;
                 names.insert_creature(
@@ -1070,8 +1119,8 @@ pub(super) fn seed_ui_fixture(
                 }));
             }
             UiFixture::Character => {
-                // A synthetic self player carrying the full stat block, which the `ui_char` feed
-                // turns into snapshots and events as live. A level-12 warrior; positive (stamina,
+                // A synthetic self player carrying the full stat block, which the stat and slot
+                // getters read through the host as live. A level-12 warrior; positive (stamina,
                 // fire) and negative (spirit) buffs exercise the green and red stat colours.
                 use benilla_protocol::messages::ObjectFields;
                 const PLAYER_GUID: u64 = 0x51;
@@ -1169,18 +1218,18 @@ pub(super) fn seed_ui_fixture(
                 items.insert_template(93_012, Some(arrows));
 
                 names.insert_player(PLAYER_GUID, "Benilla".into(), None);
-                commands.spawn((
-                    crate::net::ObjectStore(fields),
-                    crate::net::SelfPlayer,
-                    crate::net::Guid(PLAYER_GUID),
-                ));
+                // In the index, where the stat getters find the unit the token names (`0x468460`).
+                let me = commands
+                    .spawn((
+                        crate::net::ObjectStore(fields),
+                        crate::net::SelfPlayer,
+                        crate::net::Guid(PLAYER_GUID),
+                    ))
+                    .id();
+                index.0.insert(PLAYER_GUID, me);
 
-                // The C binding's path; the feed pushes over the settle window.
-                lua = Some(Box::new(move |s: &mut UiScript| {
-                    if let Err(e) = s.run("ToggleCharacter(\"PaperDollFrame\")") {
-                        warn!("capture: ui-char seed failed to open the window: {e}");
-                    }
-                }));
+                // The window opens behind the spawns ([`open_character_fixture`]).
+                commands.run_system_cached_with(open_character_fixture, PLAYER_GUID);
             }
             UiFixture::VPlates => {
                 use benilla_protocol::messages::ObjectFields;
@@ -1711,10 +1760,57 @@ pub(super) fn seed_ui_fixture(
     if let Some(lua) = lua {
         vm.run(|script| {
             if let Some(script) = script {
-                lua(script);
+                // A capture's fixture, dev tooling outside any session, signals as it seeds.
+                within(
+                    Origin::Allowed("capture::fixtures::seed_ui_fixture"),
+                    || lua(script),
+                );
             }
         });
     }
+}
+
+/// The character fixture's window by the C binding's path, run behind the seed's spawns: the doll
+/// and the stat lines read the player `me` and its items at the open, as in game, where they exist
+/// before it. Ahead of it, what a login makes: the Enter World commit's copy of the char-enum row
+/// the level line reads (`0x5abd9e`), our guid in the token resolver as the world entry seats it,
+/// which the stat getters' own-buff leg tests, and the items' creates' signal,
+/// `UNIT_INVENTORY_CHANGED` for the owner's tokens (`0x5d85ed`-`0x5d8606`), which the doll's
+/// buttons repaint on.
+fn open_character_fixture(
+    In(me): In<u64>,
+    mut vm: crate::script_calls::HostedVm,
+    names: crate::ui_unit::NameTables,
+) {
+    let names = names.get();
+    let named =
+        |pair: Option<(&str, &str)>| pair.map(|(name, file)| (name.to_string(), file.to_string()));
+    let record = benilla_ui::script::PlayerRecord {
+        name: "Benilla".into(),
+        race: named(names.race(4)),
+        class: named(names.class(1)),
+        sex: 2,
+    };
+    vm.run(|s| {
+        let open = s.map(|s| {
+            s.set_player_record(record);
+            s.seat_player_guid(me);
+            // The items' creates' signal, in place (`0x5d8606`).
+            within(
+                Origin::Allowed("capture::fixtures::open_character_fixture"),
+                || {
+                    s.fire_event(
+                        "UNIT_INVENTORY_CHANGED",
+                        vec![benilla_ui::script::ScriptValue::Str("player".into())],
+                    )
+                },
+            );
+            s.run("ToggleCharacter(\"PaperDollFrame\")")
+        });
+        if let Some(Err(e)) = open {
+            warn!("capture: ui-char seed failed to open the window: {e}");
+        }
+    });
 }
 
 /// The `GetTime()` the cooldown filmstrip pins the VM's session clock at, seconds. Large, as
@@ -1951,8 +2047,8 @@ fn seed_equipped_bags(
         };
 
     // The equipped-bag slots (inv ids 20-23, `Bag0Slot`-`Bag3Slot`) get an icon each, so each
-    // window's portrait shows its own bag through `SetBagPortaitTexture`; live, the char feed
-    // does this.
+    // window's portrait shows its own bag through `SetBagPortaitTexture`. With no player held the
+    // getters read this copy; live, they read the player's bags through the host.
     let mut inv: benilla_ui::script::InventorySlots = Default::default();
     for (id, icon_name) in [
         (20usize, "INV_Misc_Bag_08"),
