@@ -55,7 +55,9 @@ client-side modifications are made. A surface keeps stock 1.12.1 behaviour until
 replaces it on purpose.
 
 The client still reads your own 1.12.1 install and speaks the 1.12.1 protocol. There are no
-prebuilt downloads. Other expansions, other client versions, and Warden stay out of scope.
+prebuilt downloads. Other expansions, other client versions, and Warden stay out of scope. For
+Wrath of the Lich King (3.3.5a), [benilla-wotlk](https://github.com/Onixaz/benilla-wotlk) is a
+separate client built from benilla.
 
 Upstream's remaining fidelity work is tracked as
 [issues](https://github.com/samwhosung/benilla/issues).
